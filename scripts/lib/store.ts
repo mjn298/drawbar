@@ -1,4 +1,4 @@
-import { mkdirSync, existsSync, readFileSync, appendFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, existsSync, readFileSync, appendFileSync, writeFileSync, renameSync } from "node:fs";
 import { join } from "node:path";
 import { validateEntry, parseLine, type Entry } from "./schema";
 
@@ -64,6 +64,9 @@ export function archiveOlderThan(dir: string, cutoffTs: number): { archived: num
   if (old.length === 0) return { archived: 0 };
 
   for (const e of old) appendFileSync(p.archive, JSON.stringify(e) + "\n");
-  writeFileSync(p.active, keep.map((e) => JSON.stringify(e)).join("\n") + (keep.length ? "\n" : ""));
+  const contents = keep.map((e) => JSON.stringify(e)).join("\n") + (keep.length ? "\n" : "");
+  const tmp = p.active + ".tmp";
+  writeFileSync(tmp, contents);
+  renameSync(tmp, p.active);
   return { archived: old.length };
 }

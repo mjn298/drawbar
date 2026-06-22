@@ -83,4 +83,12 @@ describe("archiveOlderThan", () => {
     expect(archiveOlderThan(dir, 100).archived).toBe(0);
     expect(readEntries(dir).length).toBe(1);
   });
+
+  test("leaves no temp file behind and keeps the active file intact", () => {
+    appendEntry(dir, entry({ key: "old", ts: 10 }));
+    appendEntry(dir, entry({ key: "keep", ts: 200 }));
+    archiveOlderThan(dir, 100);
+    expect(existsSync(storePaths(dir).active + ".tmp")).toBe(false);
+    expect(readEntries(dir).map((e) => e.key)).toEqual(["keep"]);
+  });
 });
