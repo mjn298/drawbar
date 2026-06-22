@@ -59,7 +59,7 @@ drawbar/
   commands/   drawbar-{design,plan,work,learn}.md
   skills/     drawbar-knowledge/SKILL.md      # how agents use the KB
   agents/     design-reviewer.md, code-reviewer.md
-  scripts/    kb.cjs                          # add|recall|reindex|stats|archive|import
+  scripts/    kb.ts                           # add|recall|reindex|stats|archive|import (Bun)
 ```
 
 ### Per-project data
@@ -96,10 +96,11 @@ drawbar/
 - **`files`** added (optional): enables file-faceted recall.
 - Six knowledge types: `learned`, `decision`, `pattern`, `fact`, `investigation`, `deviation`.
 
-### `kb.cjs` CLI
+### `kb.ts` CLI
 
-Node script, SQLite FTS5 via Node's built-in `node:sqlite` (zero external deps;
-`better-sqlite3` as fallback if needed). JSON-output mode for agent calls.
+**Runtime: Bun.** The KB tool (`kb.ts`) uses Bun's built-in `bun:sqlite` — synchronous,
+fast, and bundles a SQLite with **FTS5**, so the tool has **zero external dependencies**.
+JSON-output mode for agent calls. (Bun is also the test runner — see Testing strategy.)
 
 | Command | Behaviour |
 |---|---|
@@ -184,7 +185,7 @@ Three concentrated ideas ported into the lean build (the rest of lavra is left b
 
 ## Testing strategy
 
-TDD the one piece that is real code — `kb.cjs`:
+TDD the one piece that is real code — `kb.ts` — using `bun test`:
 
 - `add` validates + JSON-round-trips before append.
 - `recall` ranks / filters / dedupes correctly.
@@ -204,6 +205,5 @@ feature (design → plan → work → learn end to end).
 
 ## Open questions for the implementation plan
 
-- Confirm `node:sqlite` availability in the target Node version, else `better-sqlite3`.
 - Exact Linear status names in team PCO (`Todo` / `In Progress` / `Done` vs custom states).
 - Whether session-start recall is a plugin `SessionStart` hook or invoked inline by `/drawbar-work`.
