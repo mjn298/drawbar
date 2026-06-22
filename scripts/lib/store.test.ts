@@ -2,7 +2,7 @@ import { test, expect, describe, beforeEach } from "bun:test";
 import { mkdtempSync, readFileSync, existsSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { storePaths, ensureDir, readEntries, appendEntry } from "./store";
+import { storePaths, ensureDir, readEntries, appendEntry, archiveOlderThan } from "./store";
 import type { Entry } from "./schema";
 
 let dir: string;
@@ -62,5 +62,25 @@ describe("appendEntry + readEntries", () => {
     writeFileSync(p.active, '{"bad json\n' + JSON.stringify(entry({ key: "ok" })) + "\n");
     const all = readEntries(dir);
     expect(all.map((e) => e.key)).toEqual(["ok"]);
+  });
+});
+
+describe("archiveOlderThan", () => {
+  test("moves old entries to archive and keeps recent ones active", () => {
+    appendEntry(dir, entry({ key: "old", ts: 10 }));
+    appendEntry(dir, entry({ key: "new", ts: 200 }));
+
+    const res = archiveOlderThan(dir, 100);
+    expect(res.archived).toBe(1);
+
+    expect(readEntries(dir).map((e) => e.key)).toEqual(["new"]);
+    expect(readEntries(dir, { includeArchive: true }).map((e) => e.key).sort())
+      .toEqual(["new", "old"]);
+  });
+
+  test("is a no-op when nothing is old enough", () => {
+    appendEntry(dir, entry({ key: "a", ts: 500 }));
+    expect(archiveOlderThan(dir, 100).archived).toBe(0);
+    expect(readEntries(dir).length).toBe(1);
   });
 });

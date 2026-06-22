@@ -55,3 +55,15 @@ export function appendEntry(dir: string, entry: Entry): { written: boolean } {
   appendFileSync(p.active, line + "\n");
   return { written: true };
 }
+
+export function archiveOlderThan(dir: string, cutoffTs: number): { archived: number } {
+  const p = ensureDir(dir);
+  const active = readEntries(dir); // active only
+  const old = active.filter((e) => e.ts < cutoffTs);
+  const keep = active.filter((e) => e.ts >= cutoffTs);
+  if (old.length === 0) return { archived: 0 };
+
+  for (const e of old) appendFileSync(p.archive, JSON.stringify(e) + "\n");
+  writeFileSync(p.active, keep.map((e) => JSON.stringify(e)).join("\n") + (keep.length ? "\n" : ""));
+  return { archived: old.length };
+}
