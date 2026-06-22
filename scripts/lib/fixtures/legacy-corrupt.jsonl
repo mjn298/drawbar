@@ -1,0 +1,5 @@
+{"key":"learned-a","type":"learned","content":"first lesson","source":"user","tags":["x"],"ts":1772910000,"bead":"hourly-1g0"}
+{"key":"pattern-b","type":"pattern","content":"second lesson with trailing artifact" 2>&1","source":"user","tags":[],"ts":1772910001,"bead":"hourly-bpk"}
+not json at all
+{"key":"fact-c","type":"fact","content":"third lesson","source":"user","tags":[],"ts":1772910002,"bead":"hourly-1g0.12"}
+{"hello":"world"}
