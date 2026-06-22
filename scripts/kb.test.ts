@@ -31,6 +31,14 @@ describe("run (in-process)", () => {
     // stats prints to stdout; here we just assert the exit code path.
     expect(await run(["stats", "--dir", dir, "--json"])).toBe(0);
   });
+
+  test("recall rejects a non-numeric --limit", async () => {
+    expect(await run(["recall", "x", "--dir", dir, "--limit", "abc"])).toBe(1);
+  });
+
+  test("recall rejects a negative --since", async () => {
+    expect(await run(["recall", "x", "--dir", dir, "--since", "-5"])).toBe(1);
+  });
 });
 
 describe("cli (subprocess, real stdin)", () => {

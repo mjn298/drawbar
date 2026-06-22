@@ -6,6 +6,11 @@ import type { KnowledgeType } from "./lib/schema";
 
 interface Flags { [k: string]: string | boolean; }
 
+function parseNonNegInt(raw: string): number | null {
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : null;
+}
+
 function parseFlags(args: string[]): { positionals: string[]; flags: Flags } {
   const positionals: string[] = [];
   const flags: Flags = {};
@@ -56,8 +61,16 @@ export async function run(argv: string[]): Promise<number> {
       if (typeof flags.type === "string") filters.type = flags.type as KnowledgeType;
       if (typeof flags.tag === "string") filters.tag = flags.tag;
       if (typeof flags.file === "string") filters.file = flags.file;
-      if (typeof flags.since === "string") filters.since = Number(flags.since);
-      if (typeof flags.limit === "string") filters.limit = Number(flags.limit);
+      if (typeof flags.since === "string") {
+        const n = parseNonNegInt(flags.since);
+        if (n === null) { process.stderr.write("recall: --since must be a non-negative number\n"); return 1; }
+        filters.since = n;
+      }
+      if (typeof flags.limit === "string") {
+        const n = parseNonNegInt(flags.limit);
+        if (n === null) { process.stderr.write("recall: --limit must be a non-negative number\n"); return 1; }
+        filters.limit = n;
+      }
       if (flags.all === true) filters.includeArchive = true;
       const results = recall(dir, query, filters);
       if (flags.json === true) {
@@ -92,9 +105,9 @@ export async function run(argv: string[]): Promise<number> {
       return 0;
     }
     case "import": {
-      const { importLegacy } = await import("./lib/migrate");
       const src = positionals[0];
       if (!src) { process.stderr.write("import: missing <path>\n"); return 1; }
+      const { importLegacy } = await import("./lib/migrate");
       const report = importLegacy(src, dir);
       process.stdout.write(JSON.stringify(report, null, 2) + "\n");
       return 0;
