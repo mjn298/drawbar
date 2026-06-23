@@ -39,8 +39,13 @@ rest (parallel/swarm execution, cross-command plumbing, 30-agent roster) behind.
    (Measured: beads is wired into 39/164 lavra plugin files; the genuinely valuable,
    hard-to-rebuild content is small and concentrated, so harvesting beats inheriting the
    coupling and bloat.)
-2. **Task tracking:** Linear via the Linear MCP. Sequential model — a parent issue plus
-   **ordered** sub-issues, moved through `Todo → In Progress → Done`. No dependency graph.
+2. **Task tracking:** Linear via the Linear MCP. Sequential model. A drawbar story is a
+   Linear issue — either a **leaf issue** worked directly, or the next `Todo` **child** under
+   a parent (`/drawbar-design` may produce a parent with ordered sub-issues). No dependency
+   graph. The implementing agent owns `Todo → In Progress` and then **hands off via a PR**,
+   leaving the story `In Progress` (an attached PR = "in review"). It never sets `Done` or any
+   QA/rollout/completion status — those belong to humans and vary widely by team (e.g. the PAS
+   team runs `… → Pre-QA → Ready For QA → Ready for Rollout → Rolled Out → Done`).
 3. **Spec home:** Linear-only. `/drawbar-design`'s output **is** the parent issue's
    description; stories are sub-issues underneath it.
 4. **Knowledge recall:** SQLite **FTS5** index over an append-only `knowledge.jsonl`. The
@@ -132,7 +137,7 @@ Across all commands, **Linear's comment thread is the collaboration spine**: eac
 reads any new comments left on the issue before acting and posts its own DECISIONs / findings
 back as comments.
 
-### `/drawbar-design <feature | PCO-id>` → locked spec as parent issue description
+### `/drawbar-design <feature | issue-id>` → locked spec as parent issue description
 
 1. Refine scope interactively — one question at a time.
 2. Investigate the codebase; **recall** relevant KB knowledge (prior decisions, patterns,
@@ -143,7 +148,7 @@ back as comments.
 5. Gates: scope confirm → approach pick → final lock. On lock, write the spec as the Linear
    parent issue description and log key decisions as comments.
 
-### `/drawbar-plan <PCO-id>` → ordered story sub-issues
+### `/drawbar-plan <issue-id>` → ordered story sub-issues
 
 1. Read the locked parent spec.
 2. **KB recall → MUST-CHECK constraints** for the detected stack become validation rules.
@@ -154,16 +159,21 @@ back as comments.
    criteria, MUST-CHECK coverage, and sane scope.
 5. Gate: user reviews the story list → create sub-issues in order.
 
-### `/drawbar-work <PCO-id>` → implement next story, TDD
+### `/drawbar-work <issue-id>` → implement one story, TDD
 
-1. Take the next `Todo` sub-issue **in order** (sequential; no ready-graph).
-2. **Session-start recall**: surface KB entries relevant to this story's files/topic; read new
-   Linear comments.
-3. `In Progress` → **TDD** (failing test → implement → green) → code-review subagent + fix loop.
-4. **Inline knowledge capture** as lessons emerge. Commit referencing `PCO-id`; post a summary
-   comment; set `Done`.
+1. **Pick the story (leaf-or-parent):** load the issue; if it has sub-issues, take the next
+   `Todo` child in order; if it has none, the issue *itself* is the story.
+2. **Recall**: surface KB entries relevant to this story's files/topic; read Linear comments.
+3. **Prerequisite gate:** verify any named prerequisite issues/PRs are merged/Done; stop and
+   report if not (don't build on an incomplete base).
+4. `Todo → In Progress` → **TDD** (failing test, *RED output shown*, → implement → green);
+   tests scoped per the project's CLAUDE.md (targeted + typecheck + lint, not a forced full
+   suite) → code-review subagent + fix loop.
+5. **Inline knowledge capture** as lessons emerge. Commit referencing the issue id.
+6. **Close out:** open a PR (never merge it) and **leave the story `In Progress`**; post a
+   summary comment with the PR link. Never set `Done`/QA/rollout.
 
-### `/drawbar-learn [PCO-id]` → curate lessons (also runs inline during work)
+### `/drawbar-learn [issue-id]` → curate lessons (also runs inline during work)
 
 Extract entries across the 6 types from the session's diffs/decisions; **mistakes become
 `MUST-CHECK:` entries** (feeding the compounding loop). Safe-write to the KB, tagged with
@@ -205,7 +215,7 @@ feature (design → plan → work → learn end to end).
 
 ## Open questions for the implementation plan
 
-- ~~Exact Linear status names in team PCO~~ — **Resolved:** team PCO uses `Backlog / Todo / In Progress / Done` (+ Canceled/Duplicate). Work moves `Todo → In Progress → Done`.
+- ~~Exact Linear status names~~ — **Resolved (and generalized):** status names vary by team (PCO is simple `Backlog / Todo / In Progress / Done`; PAS adds a QA/rollout pipeline `Pre-QA / Ready For QA / QA Failed / Ready for Rollout / Rolled Out / Done`). So drawbar does **not** hardcode a terminal status: `/drawbar-work` takes a story `Todo → In Progress` and hands off via a PR, leaving it `In Progress`; humans own all completion/QA/rollout transitions. (Updated after the PAS-3043 dogfooding run.)
 - ~~Session-start recall: hook or inline~~ — **Resolved:** inline. Each command recalls relevant lessons at the top of its flow; no `SessionStart` hook.
 
 ---
@@ -261,15 +271,15 @@ reads new comments on the issue before acting and posts its own decisions/findin
 3. Offer legacy import (`drawbar-kb import <path>`, show the no-silent-loss report).
 4. Confirm the Linear team/project (PCO / DRAWBAR) and MCP connectivity; report ready.
 
-### `/drawbar-design <feature | PCO-id>` → spec becomes the parent issue description
-1. Preflight. Resolve input: free text → new feature; PCO-id → `get_issue` (description + comments).
+### `/drawbar-design <feature | issue-id>` → spec becomes the parent issue description
+1. Preflight. Resolve input: free text → new feature; issue-id → `get_issue` (description + comments).
 2. **Recall** `drawbar-kb recall "<feature area>"`; read existing Linear comments.
 3. Interactive scope refinement (one question at a time) + codebase investigation → 2–3 approaches + recommendation.
 4. **Adversarial design review**: dispatch `design-reviewer` *before* lock.
 5. Gates: scope → approach → lock. On lock: write spec as the parent issue description
    (`save_issue`); log decisions as `DECISION:` comments.
 
-### `/drawbar-plan <PCO-id>` → ordered story sub-issues
+### `/drawbar-plan <issue-id>` → ordered story sub-issues
 1. Preflight. `get_issue` → the locked spec.
 2. **Recall → MUST-CHECK**: `drawbar-kb recall "MUST-CHECK <stack>"` → constraints become validation rules.
 3. Decompose into sequential stories; each sub-issue uses the template:
@@ -278,14 +288,20 @@ reads new comments on the issue before acting and posts its own decisions/findin
    MUST-CHECK coverage, sane scope.
 5. Gate: review story list → `save_issue` sub-issues under the parent, in order.
 
-### `/drawbar-work <PCO-id>` → implement next story, TDD
-1. Preflight. `list_issues parentId=<PCO-id>` → next `Todo` in order.
-2. **Recall** for the story's files/topic; read new Linear comments.
-3. `Todo → In Progress`. **TDD** (failing test → implement → green) → dispatch `code-reviewer` + fix loop.
-4. **Inline capture**: lessons → `drawbar-kb add` (stdin JSON; `issue=PCO-id`, `files=…`).
-5. Commit referencing `PCO-id`; post a summary comment; `→ Done`.
+### `/drawbar-work <issue-id>` → implement one story, TDD
+1. Preflight. **Pick the story (leaf-or-parent):** `get_issue`; if it has sub-issues, take the
+   next `Todo` child in order; if none, the issue itself is the story.
+2. **Recall** for the story's files/topic; read Linear comments.
+3. **Prerequisite gate:** verify named prerequisite issues/PRs are merged/Done; stop and report
+   if not.
+4. `Todo → In Progress`. **TDD** (failing test → *show RED output* → implement → green); test
+   scope deferred to the project's CLAUDE.md (targeted + typecheck + lint, not a forced full
+   suite) → dispatch `code-reviewer` + fix loop.
+5. **Inline capture**: lessons → `drawbar-kb add` (stdin JSON; `issue=<issue-id>`, `files=…`).
+6. **Close out:** commit referencing the issue id; open a PR (never merge); **leave the story
+   `In Progress`** (attached PR = in review); post a summary comment. Never set `Done`/QA/rollout.
 
-### `/drawbar-learn [PCO-id]` → curate lessons (also runs inline during work)
+### `/drawbar-learn [issue-id]` → curate lessons (also runs inline during work)
 Review the session's diffs/decisions; extract entries across the 6 types; **mistakes →
 `MUST-CHECK:` entries**; safe-write via `drawbar-kb add`, deduped by key.
 
