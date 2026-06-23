@@ -37,8 +37,13 @@ export function validateEntry(obj: unknown): Validated {
   if (typeof o.content !== "string" || o.content.trim() === "") {
     return { ok: false, error: "missing or empty content" };
   }
-  if (typeof o.ts !== "number" || !Number.isFinite(o.ts)) {
-    return { ok: false, error: "missing or non-numeric ts" };
+  let ts: number;
+  if (o.ts === undefined || o.ts === null) {
+    ts = Math.floor(Date.now() / 1000);
+  } else if (typeof o.ts === "number" && Number.isFinite(o.ts)) {
+    ts = o.ts;
+  } else {
+    return { ok: false, error: "ts must be a number" };
   }
 
   const entry: Entry = {
@@ -47,7 +52,7 @@ export function validateEntry(obj: unknown): Validated {
     content: o.content,
     source: typeof o.source === "string" && o.source !== "" ? o.source : "agent",
     tags: asStringArray(o.tags),
-    ts: o.ts,
+    ts,
     issue: typeof o.issue === "string" && o.issue !== "" ? o.issue : null,
     files: asStringArray(o.files),
   };

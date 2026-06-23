@@ -63,4 +63,13 @@ describe("cli (subprocess, real stdin)", () => {
     const { code } = await cli(["add", "--dir", dir], "{ not valid json");
     expect(code).not.toBe(0);
   });
+
+  test("add accepts an entry without ts (defaults it)", async () => {
+    const entry = JSON.stringify({ key: "no-ts", type: "learned", content: "works without ts" });
+    const { code } = await cli(["add", "--dir", dir], entry);
+    expect(code).toBe(0);
+    const rows = readEntries(dir);
+    expect(rows.map((e) => e.key)).toContain("no-ts");
+    expect(rows.find((e) => e.key === "no-ts")!.ts).toBeGreaterThan(0);
+  });
 });

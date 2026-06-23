@@ -38,7 +38,7 @@ echo '{"key":"<kebab-key>","type":"<type>","content":"<lesson>","source":"agent"
   | drawbar-kb add --dir "$PWD/.drawbar/memory"
 ```
 
-`drawbar-kb add` validates and dedupes by key — re-adding an identical entry is a no-op (`{"written":false}`).
+`drawbar-kb add` validates and dedupes by key+content — re-adding an identical entry is a no-op (returns `{"written":false,...}`). A new entry under the same key with *different* content appends a revision, and recall returns the most recent by timestamp.
 
 ## 4. Report
 

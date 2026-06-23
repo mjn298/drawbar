@@ -49,6 +49,20 @@ describe("validateEntry", () => {
   test("knows all six types", () => {
     expect(KNOWLEDGE_TYPES.length).toBe(6);
   });
+
+  test("defaults ts to current unix seconds when missing", () => {
+    const r = validateEntry({ key: "k", type: "fact", content: "c" });
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(typeof r.entry.ts).toBe("number");
+      expect(r.entry.ts).toBeGreaterThan(1_700_000_000); // after 2023
+    }
+  });
+
+  test("rejects a present-but-non-numeric ts", () => {
+    const r = validateEntry({ key: "k", type: "fact", content: "c", ts: "soon" });
+    expect(r.ok).toBe(false);
+  });
 });
 
 describe("parseLine", () => {
