@@ -36,7 +36,7 @@ describe("plugin manifest & bin", () => {
 });
 
 // Extended by later tasks: append command/agent base names as their files are added.
-const COMMANDS: string[] = ["drawbar-setup", "drawbar-design", "drawbar-plan", "drawbar-work"];
+const COMMANDS: string[] = ["drawbar-setup", "drawbar-design", "drawbar-plan", "drawbar-work", "drawbar-learn"];
 const AGENTS: string[] = [];
 
 describe("command frontmatter", () => {
