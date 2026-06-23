@@ -1,0 +1,11 @@
+{
+  "name": "drawbar-dev",
+  "owner": { "name": "mjn" },
+  "description": "Local marketplace for the drawbar workflow plugin.",
+  "plugins": [
+    {
+      "name": "drawbar",
+      "source": "."
+    }
+  ]
+}
