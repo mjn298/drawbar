@@ -4,7 +4,7 @@ A lean, Linear-native design → plan → work → learn workflow for Claude Cod
 
 ## Who it's for
 
-drawbar is for people who love the **Beads** way of working — atomic, traceable issues and knowledge that *compounds* across sessions instead of evaporating — but who:
+drawbar is for people who love the **[Beads](https://github.com/gastownhall/beads)** way of working — atomic, traceable issues and knowledge that *compounds* across sessions instead of evaporating — but who:
 
 - **live in Linear.** Your issues stay in Linear, human-visible to the whole team: a spec is a parent issue's description, stories are ordered sub-issues, status flows `Todo → In Progress → Done`. No separate tracker, no database to babysit.
 - **want a human in the loop, not full autonomy.** drawbar is a set of deliberate, reviewable steps — you sharpen scope, pick the approach, approve the plan, and review the work — rather than a fire-and-forget agent. Each command stops at the gates that matter and hands control back to you.
@@ -48,7 +48,7 @@ drawbar-kb stats --dir "$PWD/.drawbar/memory"
 
 drawbar stands on the shoulders of three projects:
 
-- **Beads** — the model that started it: atomic, dependency-aware issues and knowledge captured as you work so it compounds across sessions.
+- **[Beads](https://github.com/gastownhall/beads)** — the model that started it: atomic, dependency-aware issues and knowledge captured as you work so it compounds across sessions.
 - **[linear-beads](https://github.com/nikvdp/linear-beads)** by [@nikvdp](https://github.com/nikvdp) — beads-style issue tracking with Linear as the backend. The inspiration for keeping issues in Linear (human-visible) instead of a local database.
 - **[lavra](https://github.com/roberto-mello/lavra)** by [@roberto-mello](https://github.com/roberto-mello) — the design → plan → work → review → learn skill pipeline and knowledge-compounding approach that drawbar's workflow is modeled on.
 
