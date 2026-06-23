@@ -18,11 +18,13 @@ Install the plugin in Claude Code so the `/drawbar-*` commands are available.
 
 ```
 /drawbar-setup [legacy knowledge.jsonl]   # once per machine + per project
-/drawbar-design <feature | PCO-id>         # spec → Linear parent issue
-/drawbar-plan <PCO-id>                     # ordered story sub-issues
-/drawbar-work <PCO-id>                     # implement next story, TDD
-/drawbar-learn [PCO-id]                    # curate lessons into the KB
+/drawbar-design <feature | issue-id>       # spec → Linear parent issue
+/drawbar-plan <issue-id>                    # ordered story sub-issues
+/drawbar-work <issue-id>                    # implement next story, TDD
+/drawbar-learn [issue-id]                   # curate lessons into the KB
 ```
+
+`issue-id` is a Linear issue identifier (e.g. `ABC-123`) — your team's own prefix.
 
 Knowledge lives in `<project>/.drawbar/memory/` (the JSONL is committed; the SQLite index is gitignored). Query it directly anytime:
 
