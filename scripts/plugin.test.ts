@@ -58,3 +58,11 @@ describe("agent frontmatter", () => {
     });
   }
 });
+
+describe("skill", () => {
+  test("drawbar-knowledge skill has valid frontmatter", () => {
+    const fm = frontmatter(join(root, "skills/drawbar-knowledge/SKILL.md"));
+    expect(fm.name).toBe("drawbar-knowledge");
+    expect((fm.description ?? "").length).toBeGreaterThan(0);
+  });
+});
