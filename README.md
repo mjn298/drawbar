@@ -37,6 +37,8 @@ Install the plugin in Claude Code so the `/drawbar-*` commands are available.
 
 `issue-id` is a Linear issue identifier (e.g. `ABC-123`) — your team's own prefix.
 
+The `[legacy knowledge.jsonl]` argument to `/drawbar-setup` is **only** for migrating an existing **lavra** knowledge base into drawbar. If you weren't using lavra before — most people — skip it and start with a fresh, empty knowledge base.
+
 Knowledge lives in `<project>/.drawbar/memory/` (the JSONL is committed; the SQLite index is gitignored). Query it directly anytime:
 
 ```bash
