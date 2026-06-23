@@ -205,5 +205,120 @@ feature (design → plan → work → learn end to end).
 
 ## Open questions for the implementation plan
 
-- Exact Linear status names in team PCO (`Todo` / `In Progress` / `Done` vs custom states).
-- Whether session-start recall is a plugin `SessionStart` hook or invoked inline by `/drawbar-work`.
+- ~~Exact Linear status names in team PCO~~ — **Resolved:** team PCO uses `Backlog / Todo / In Progress / Done` (+ Canceled/Duplicate). Work moves `Todo → In Progress → Done`.
+- ~~Session-start recall: hook or inline~~ — **Resolved:** inline. Each command recalls relevant lessons at the top of its flow; no `SessionStart` hook.
+
+---
+
+# Plan 2 — The plugin prompt layer
+
+> Plan 1 (the `kb` tool) is built and merged. Plan 2 builds the prompt layer on top of it.
+> Status: design approved 2026-06-23; pending implementation plan.
+
+## Summary
+
+Plan 2 turns the `kb` tool into a usable Claude Code plugin: five commands, two review
+agents, a knowledge skill, and a manifest — the lean, Linear-native design→plan→work→learn
+workflow from the design above, made real.
+
+## Distribution & invocation (decided)
+
+- **`drawbar-kb` on PATH via `bin` + `bun link`.** `package.json` gains
+  `"bin": { "drawbar-kb": "scripts/kb.ts" }`; `/drawbar-setup` runs `bun link` from the
+  plugin root so `drawbar-kb` is a **live symlink to `scripts/kb.ts`** — no version drift,
+  and the user can run `drawbar-kb recall …` directly in a terminal. Commands invoke
+  `drawbar-kb …`, never the bundled path.
+- **Preflight** at the top of every command: if `drawbar-kb` is missing or
+  `<project>/.drawbar/memory/` is absent, stop with "run `/drawbar-setup`".
+- **Linear MCP absent → warn and continue**: local work and KB writes still flow; Linear
+  write-backs are skipped with a note. Never hard-block.
+
+## Plugin layout
+
+```
+drawbar/
+  .claude-plugin/plugin.json                    # manifest (commands/agents/skills auto-discovered)
+  package.json                                  # bin: { "drawbar-kb": "scripts/kb.ts" }
+  commands/  drawbar-{setup,design,plan,work,learn}.md
+  agents/    design-reviewer.md, code-reviewer.md
+  skills/    drawbar-knowledge/SKILL.md
+  scripts/   kb.ts + lib/…                       # Plan 1 (built)
+```
+
+## Command style
+
+Each command is a short, single-flow, structured prompt — a focused checklist, not lavra's
+46KB orchestrators. No swarm/parallel machinery, no cross-command brainstorm-detection
+plumbing, no `session-state.md`. Pattern: **preflight → inline KB recall → do the work →
+write back to Linear/KB**. Linear's comment thread is the collaboration spine: each command
+reads new comments on the issue before acting and posts its own decisions/findings back.
+
+## Commands
+
+### `/drawbar-setup`
+1. `command -v drawbar-kb`; if missing, `bun link` from `${CLAUDE_PLUGIN_ROOT}`, re-check.
+2. Force-create + confirm `<project>/.drawbar/memory/` (`drawbar-kb stats --dir …`).
+3. Offer legacy import (`drawbar-kb import <path>`, show the no-silent-loss report).
+4. Confirm the Linear team/project (PCO / DRAWBAR) and MCP connectivity; report ready.
+
+### `/drawbar-design <feature | PCO-id>` → spec becomes the parent issue description
+1. Preflight. Resolve input: free text → new feature; PCO-id → `get_issue` (description + comments).
+2. **Recall** `drawbar-kb recall "<feature area>"`; read existing Linear comments.
+3. Interactive scope refinement (one question at a time) + codebase investigation → 2–3 approaches + recommendation.
+4. **Adversarial design review**: dispatch `design-reviewer` *before* lock.
+5. Gates: scope → approach → lock. On lock: write spec as the parent issue description
+   (`save_issue`); log decisions as `DECISION:` comments.
+
+### `/drawbar-plan <PCO-id>` → ordered story sub-issues
+1. Preflight. `get_issue` → the locked spec.
+2. **Recall → MUST-CHECK**: `drawbar-kb recall "MUST-CHECK <stack>"` → constraints become validation rules.
+3. Decompose into sequential stories; each sub-issue uses the template:
+   `What / Context / Decisions(Locked+Discretion) / Testing / Validation / Files / Dependencies / References`.
+4. **Cross-check pass** (warning-only): all sections present, testable acceptance criteria,
+   MUST-CHECK coverage, sane scope.
+5. Gate: review story list → `save_issue` sub-issues under the parent, in order.
+
+### `/drawbar-work <PCO-id>` → implement next story, TDD
+1. Preflight. `list_issues parentId=<PCO-id>` → next `Todo` in order.
+2. **Recall** for the story's files/topic; read new Linear comments.
+3. `Todo → In Progress`. **TDD** (failing test → implement → green) → dispatch `code-reviewer` + fix loop.
+4. **Inline capture**: lessons → `drawbar-kb add` (stdin JSON; `issue=PCO-id`, `files=…`).
+5. Commit referencing `PCO-id`; post a summary comment; `→ Done`.
+
+### `/drawbar-learn [PCO-id]` → curate lessons (also runs inline during work)
+Review the session's diffs/decisions; extract entries across the 6 types; **mistakes →
+`MUST-CHECK:` entries**; safe-write via `drawbar-kb add`, deduped by key.
+
+## Agents (two thin files)
+
+- **`design-reviewer`** — adversarial critique of the proposed spec/approaches before lock.
+  Lenses: architecture soundness, simplicity/YAGNI, security. Pointed at the KB so it checks
+  the design against logged `MUST-CHECK:` entries. Returns categorized findings.
+- **`code-reviewer`** — work-phase review of the story's diff: spec-compliance vs the story's
+  acceptance criteria + code quality. Returns findings; `/drawbar-work` runs the fix loop.
+
+**Single-writer rule:** agents *return findings*; the **command owns all Linear writes**.
+Reviewers never post to Linear directly.
+
+## `drawbar-knowledge` skill
+
+The "how to drive `drawbar-kb`" reference the commands point at: the entry schema + 6 types,
+*when* to write each, the `MUST-CHECK:` convention, how to recall, dedupe-by-key.
+
+## Testing
+
+Commands/agents/skill are prompt artifacts → verified by a **smoke run** of a throwaway
+feature taken design→plan→work→learn against a scratch project + a disposable Linear issue.
+The one mechanical check: `/drawbar-setup`'s `bun link` yields a working `drawbar-kb` on PATH.
+(The tool itself already has 42 tests from Plan 1.)
+
+## Error handling
+
+- Preflight gates every command (`drawbar-kb` present? `.drawbar/memory/` exists? → else `/drawbar-setup`).
+- Linear MCP absent → warn, keep local work + KB writes flowing, skip Linear write-backs with a note.
+- KB writes already fail loudly via `drawbar-kb`'s safe-write path.
+
+## Open items for the Plan 2 implementation plan
+
+- The one-time PATH note for Bun's global bin directory (`bun pm bin -g`) so `drawbar-kb` resolves.
+- Exact `.claude-plugin/plugin.json` fields/schema for the current Claude Code version.
