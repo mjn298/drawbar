@@ -1,8 +1,9 @@
 {
   "name": "drawbar",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "private": true,
   "type": "module",
+  "bin": { "drawbar-kb": "scripts/kb.ts" },
   "scripts": {
     "test": "bun test",
     "kb": "bun run scripts/kb.ts"

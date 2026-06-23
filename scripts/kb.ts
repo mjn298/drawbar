@@ -1,3 +1,4 @@
+#!/usr/bin/env bun
 import { join } from "node:path";
 import { validateEntry } from "./lib/schema";
 import { appendEntry, readEntries, archiveOlderThan, ensureDir } from "./lib/store";
