@@ -43,3 +43,13 @@ Knowledge lives in `<project>/.drawbar/memory/` (the JSONL is committed; the SQL
 drawbar-kb recall "dynamodb tenancy" --dir "$PWD/.drawbar/memory" --json
 drawbar-kb stats --dir "$PWD/.drawbar/memory"
 ```
+
+## Credits
+
+drawbar stands on the shoulders of three projects:
+
+- **Beads** — the model that started it: atomic, dependency-aware issues and knowledge captured as you work so it compounds across sessions.
+- **[linear-beads](https://github.com/nikvdp/linear-beads)** by [@nikvdp](https://github.com/nikvdp) — beads-style issue tracking with Linear as the backend. The inspiration for keeping issues in Linear (human-visible) instead of a local database.
+- **[lavra](https://github.com/roberto-mello/lavra)** by [@roberto-mello](https://github.com/roberto-mello) — the design → plan → work → review → learn skill pipeline and knowledge-compounding approach that drawbar's workflow is modeled on.
+
+drawbar is a leaner take that combines lavra's workflow with linear-beads' Linear-first tracking, around its own knowledge base — built for human-in-the-loop work.
