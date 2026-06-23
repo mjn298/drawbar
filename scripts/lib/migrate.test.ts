@@ -1,5 +1,5 @@
 import { test, expect, describe, beforeEach } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { importLegacy } from "./migrate";
@@ -32,5 +32,47 @@ describe("importLegacy", () => {
     const byKey = Object.fromEntries(readEntries(dir).map((e) => [e.key, e]));
     expect(byKey["learned-a"]!.issue).toBe("hourly-1g0");
     expect(byKey["learned-a"]!.files).toEqual([]);
+  });
+
+  test("remaps legacy must-check type to learned with a MUST-CHECK: prefix", () => {
+    const src = join(dir, "legacy-mc.jsonl");
+    writeFileSync(
+      src,
+      JSON.stringify({
+        key: "must-check-csp",
+        type: "must-check",
+        content: "Before committing any CSP change, verify the report-only header.",
+        source: "user",
+        tags: ["security"],
+        ts: 1772910000,
+        bead: "hourly-x",
+      }) +
+        "\n" +
+        // Already-prefixed content must not be double-prefixed.
+        JSON.stringify({
+          key: "must-check-prefixed",
+          type: "must-check",
+          content: "MUST-CHECK: run the migration dry-run first",
+          source: "user",
+          tags: [],
+          ts: 1772910001,
+        }) +
+        "\n",
+    );
+
+    const report = importLegacy(src, dir);
+    expect(report.imported).toBe(2);
+    expect(report.dropped).toBe(0);
+
+    const byKey = Object.fromEntries(readEntries(dir).map((e) => [e.key, e]));
+    const a = byKey["must-check-csp"]!;
+    expect(a.type).toBe("learned");
+    expect(a.content.startsWith("MUST-CHECK: ")).toBe(true);
+    expect(a.issue).toBe("hourly-x");
+
+    const b = byKey["must-check-prefixed"]!;
+    expect(b.type).toBe("learned");
+    // not double-prefixed
+    expect(b.content).toBe("MUST-CHECK: run the migration dry-run first");
   });
 });

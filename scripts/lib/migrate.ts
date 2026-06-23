@@ -29,9 +29,23 @@ export function importLegacy(oldPath: string, dir: string): ImportReport {
       return;
     }
 
+    // Remap legacy lavra type aliases onto drawbar's schema. The lavra corpus
+    // used a `must-check` type; drawbar expresses the same thing as a `learned`
+    // entry whose content begins `MUST-CHECK:`. Preserve these — they are the
+    // constraints the planning/compounding loop depends on.
+    let { type, content } = obj as { type?: unknown; content?: unknown };
+    if (type === "must-check") {
+      type = "learned";
+      if (typeof content === "string" && !/^\s*must-check:/i.test(content)) {
+        content = "MUST-CHECK: " + content;
+      }
+    }
+
     // Map legacy bead -> issue; default files.
     const candidate = {
       ...obj,
+      type,
+      content,
       issue: obj.issue ?? obj.bead ?? null,
       files: obj.files ?? [],
     };
