@@ -2,12 +2,19 @@
 
 A lean, Linear-native design → plan → work → learn workflow for Claude Code, with a per-project compounding knowledge base.
 
+Enjoy a mix of AI generated readme, and my interjections in the text below. 
+
+## Why is it called drawbar
+I just got a **[clonewheel](https://www.crumar.it/?a=showproduct&b=39)** and am digging it, a lot. Other than that, no reason. I'm following the grand tradition of software projects with inscrutable names.  
+
 ## Who it's for
 
 drawbar is for people who love the **[Beads](https://github.com/gastownhall/beads)** way of working — atomic, traceable issues and knowledge that *compounds* across sessions instead of evaporating — but who:
 
-- **live in Linear.** Your issues stay in Linear, human-visible to the whole team: a spec is a parent issue's description, stories are ordered sub-issues, status flows `Todo → In Progress → Done`. No separate tracker, no database to babysit.
-- **want a human in the loop, not full autonomy.** drawbar is a set of deliberate, reviewable steps — you sharpen scope, pick the approach, approve the plan, and review the work — rather than a fire-and-forget agent. Each command stops at the gates that matter and hands control back to you.
+- **live in Linear.** Your issues stay in Linear, visible to the whole team: a spec is a parent issue's description, stories are ordered sub-issues, status flows `Todo → In Progress → Done`. Issues aren't stored locally. I know this makes things slower and probably wastes tokens, but this works better for my and my team.
+- **want a human in the loop, not full autonomy.** drawbar is a set of deliberate, reviewable steps — you sharpen scope, pick the approach, approve the plan, and review the work — rather than a fire-and-forget agent. If beads is meth, this is a glass of iced tea.
+
+This is really just an old-school issue tracking workflow with some glue. It is not novel but it has been working well for me. 
 
 The knowledge base is the heart of it: every lesson, decision, and "MUST-CHECK" you capture is recalled on the next design/plan/work, so the system gets sharper the more you use it.
 
