@@ -110,7 +110,7 @@ JSON-output mode for agent calls. (Bun is also the test runner — see Testing s
 | Command | Behaviour |
 |---|---|
 | `add`     | Validate + JSON-round-trip an entry **before** appending; dedupe by key. |
-| `recall`  | FTS5 BM25 ranking + filters (`--type`, `--tag`, `--file`, `--since`), recency boost, dedupe by key (latest `ts` wins). Auto-reindex if JSONL is newer than `index.db`. |
+| `recall`  | FTS5 BM25 ranking + filters (`--type`, `--tag`, `--file`, `--since`), recency boost, dedupe by key (latest `ts` wins). Auto-reindex if JSONL is newer than `index.db`, **or** if the index is empty while the store is non-empty (self-heal). |
 | `reindex` | Rebuild `index.db` from the JSONL. |
 | `stats`   | Counts by type / total / archived. |
 | `archive` | Age out old entries to `knowledge.archive.jsonl`. |
@@ -139,14 +139,23 @@ back as comments.
 
 ### `/drawbar-design <feature | issue-id>` → locked spec as parent issue description
 
-1. Refine scope interactively — one question at a time.
+1. Preflight + **recall health probe** (a non-empty store must return hits; reindex/warn if not).
 2. Investigate the codebase; **recall** relevant KB knowledge (prior decisions, patterns,
-   MUST-CHECKs for this area).
-3. Propose 2–3 approaches + a recommendation.
-4. **Adversarial design review** — one review subagent critiques architecture / simplicity /
-   security *before* lock.
-5. Gates: scope confirm → approach pick → final lock. On lock, write the spec as the Linear
-   parent issue description and log key decisions as comments.
+   MUST-CHECKs). If recall returns nothing against a non-empty store, fall back to the
+   git-tracked `knowledge.jsonl` (`git show … | grep`) and reindex.
+3. Refine scope interactively — **batch** independent decision-shaped questions (≤4 via
+   `AskUserQuestion`); one-at-a-time only for dependent/exploratory threads.
+4. Propose 2–3 approaches + a recommendation; if constraints already narrowed the space, lead
+   with the recommendation and note the discarded alternatives rather than forcing an N-way list.
+5. **Adversarial design review** (`design-reviewer`) *before* lock. A finding that contradicts a
+   user-**locked** decision is surfaced back as a question, not resolved unilaterally.
+6. Gates: scope → approach → lock. Design is **iterative** — when the user changes a constraint
+   mid-flight, re-thread the spec, fix stale `DECISION:` comments, and re-review if material.
+7. Before locking, a **consistency check** (renamed symbols, decisions vs `## Locked`, locked
+   entries vs acceptance criteria). Author the spec as a **local draft** (not a synced mirror —
+   Linear stays the source of truth) and `save_issue` it to the parent description at lock points
+   (`save_issue` overwrites wholesale); log decisions as comments. A `## Story decomposition`
+   section is welcome; per-story acceptance criteria belong to `/drawbar-plan`.
 
 ### `/drawbar-plan <issue-id>` → ordered story sub-issues
 
@@ -209,7 +218,7 @@ feature (design → plan → work → learn end to end).
 ## Error handling (cardinal rule: never silently corrupt the KB again)
 
 - KB writes validate a JSON round-trip **before** appending; failures are loud.
-- The index auto-rebuilds when `knowledge.jsonl` is newer than `index.db`.
+- The index auto-rebuilds when `knowledge.jsonl` is newer than `index.db`, or when the index is empty while the store is non-empty (self-heal — so recall never silently returns `[]` against a real store).
 - Linear MCP unavailable → warn and let local work proceed; do not hard-block.
 - `kb add` is idempotent — dedupe by key.
 
@@ -272,12 +281,11 @@ reads new comments on the issue before acting and posts its own decisions/findin
 4. Confirm the Linear team/project (PCO / DRAWBAR) and MCP connectivity; report ready.
 
 ### `/drawbar-design <feature | issue-id>` → spec becomes the parent issue description
-1. Preflight. Resolve input: free text → new feature; issue-id → `get_issue` (description + comments).
-2. **Recall** `drawbar-kb recall "<feature area>"`; read existing Linear comments.
-3. Interactive scope refinement (one question at a time) + codebase investigation → 2–3 approaches + recommendation.
-4. **Adversarial design review**: dispatch `design-reviewer` *before* lock.
-5. Gates: scope → approach → lock. On lock: write spec as the parent issue description
-   (`save_issue`); log decisions as `DECISION:` comments.
+1. Preflight + **recall health probe**. Resolve input: free text → new feature; issue-id → `get_issue` (description + comments).
+2. **Recall** `drawbar-kb recall "<feature area>"` (git-tracked-file fallback if it returns nothing against a non-empty store); read existing Linear comments.
+3. Scope refinement — **batch** independent questions (≤4); 1-at-a-time only when dependent — + codebase investigation → 2–3 approaches (lead with the recommendation when constraints already narrowed the space).
+4. **Adversarial design review**: dispatch `design-reviewer` *before* lock; a finding that contradicts a user-locked decision is surfaced back as a question.
+5. Gates: scope → approach → lock. Design is **iterative** (re-thread + fix stale DECISIONs + re-review on material change). Before lock: a **consistency check**; author as a **local draft** (not a mirror) and `save_issue` (overwrites wholesale) at lock points; log `DECISION:` comments. A `## Story decomposition` section is welcome (per-story criteria stay in `/drawbar-plan`).
 
 ### `/drawbar-plan <issue-id>` → ordered story sub-issues
 1. Preflight. `get_issue` → the locked spec.
