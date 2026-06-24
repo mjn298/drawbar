@@ -1,7 +1,7 @@
 {
-  "name": "drawbar-dev",
+  "name": "drawbar",
   "owner": { "name": "mjn" },
-  "description": "Local marketplace for the drawbar workflow plugin.",
+  "description": "Lean, Linear-native design→plan→work→learn workflow for Claude Code, with a compounding knowledge base.",
   "plugins": [
     {
       "name": "drawbar",

@@ -28,7 +28,7 @@ Plus Claude Code itself (the plugin host).
 
    ```bash
    claude plugin marketplace add mjn298/drawbar
-   claude plugin install drawbar@drawbar-dev
+   claude plugin install drawbar@drawbar
    ```
 
    Then run `/reload-plugins` (or restart) so the `/drawbar-*` commands load.
