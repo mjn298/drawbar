@@ -46,6 +46,35 @@ drawbar-kb recall "dynamodb tenancy" --dir "$PWD/.drawbar/memory" --json
 drawbar-kb stats --dir "$PWD/.drawbar/memory"
 ```
 
+## Development
+
+Working on drawbar itself? The `kb` tool has tests:
+
+```bash
+bun test
+```
+
+**Loading your edits — two modes:**
+
+- **Iterating fast → run the live source directly.** Launch Claude Code with `--plugin-dir` so it loads your working copy and bypasses the plugin cache entirely:
+
+  ```bash
+  claude --plugin-dir /path/to/drawbar
+  ```
+
+  Edits to commands/agents/skills take effect on `/reload-plugins` — no version bump, no reinstall. It shadows any installed copy for that session only.
+
+- **Releasing a change through the marketplace → bump the version.** The plugin cache is **keyed by `plugin.json` version**, so editing files in place at the *same* version silently won't propagate — `/reload-plugins` keeps serving the stale cached copy. To ship a real change:
+
+  ```bash
+  # 1. bump "version" in .claude-plugin/plugin.json (e.g. 0.1.1 → 0.1.2)
+  claude plugin marketplace update <marketplace>   # re-read the source
+  claude plugin update drawbar@<marketplace>        # fetch the new version
+  # 2. /reload-plugins (or restart) in your session
+  ```
+
+  Forgetting the version bump is the #1 "my change didn't show up" gotcha.
+
 ## Credits
 
 drawbar stands on the shoulders of three projects:
