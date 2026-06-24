@@ -33,6 +33,21 @@ export function buildIndex(dir: string): void {
   }
 }
 
+// Number of rows in the FTS index, or 0 if the table is missing/corrupt
+// (in which case the index needs rebuilding anyway).
+function indexRowCount(indexDb: string): number {
+  let db: Database | null = null;
+  try {
+    db = new Database(indexDb, { readonly: true });
+    const row = db.query("SELECT count(*) AS n FROM kb").get() as { n: number } | null;
+    return row?.n ?? 0;
+  } catch {
+    return 0;
+  } finally {
+    db?.close();
+  }
+}
+
 export function ensureFreshIndex(dir: string): void {
   const p = storePaths(dir);
   if (!existsSync(p.indexDb)) return buildIndex(dir);
@@ -40,7 +55,15 @@ export function ensureFreshIndex(dir: string): void {
   const dbMtime = statSync(p.indexDb).mtimeMs;
   const activeMtime = existsSync(p.active) ? statSync(p.active).mtimeMs : 0;
   const archiveMtime = existsSync(p.archive) ? statSync(p.archive).mtimeMs : 0;
-  if (Math.max(activeMtime, archiveMtime) > dbMtime) buildIndex(dir);
+  if (Math.max(activeMtime, archiveMtime) > dbMtime) return buildIndex(dir);
+
+  // Self-heal: the index looks fresh by mtime but is empty while the store has
+  // entries — e.g. an index built when the JSONL was empty, then the JSONL was
+  // populated by a git checkout that left an older-looking mtime. Without this,
+  // recall silently returns [] against a non-empty store. Rebuild.
+  if (indexRowCount(p.indexDb) === 0 && readEntries(dir, { includeArchive: true }).length > 0) {
+    buildIndex(dir);
+  }
 }
 
 export interface RecallFilters {

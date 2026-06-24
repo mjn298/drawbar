@@ -1,9 +1,9 @@
 import { test, expect, describe, beforeEach } from "bun:test";
-import { mkdtempSync, existsSync, utimesSync, statSync } from "node:fs";
+import { mkdtempSync, existsSync, utimesSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
-import { appendEntry, storePaths } from "./store";
+import { appendEntry, storePaths, ensureDir } from "./store";
 import { buildIndex, ensureFreshIndex } from "./fts";
 import type { Entry } from "./schema";
 
@@ -59,6 +59,26 @@ describe("ensureFreshIndex", () => {
     utimesSync(storePaths(dir).active, future, future);
     ensureFreshIndex(dir);
     expect(rowCount(dir)).toBe(2);
+  });
+
+  test("self-heals an empty index over a non-empty store (mtime looks fresh)", () => {
+    // Build an index while the store is empty.
+    const p = ensureDir(dir);
+    writeFileSync(p.active, "");
+    buildIndex(dir);
+    expect(rowCount(dir)).toBe(0);
+
+    // The JSONL gains an entry but with an OLDER mtime than the index — as if a
+    // git checkout dropped in content under an index that looks fresh by mtime.
+    writeFileSync(p.active, JSON.stringify(entry({ key: "healed", content: "self heal me" })) + "\n");
+    const past = new Date(Date.now() - 60_000);
+    utimesSync(p.active, past, past);
+
+    // recall calls ensureFreshIndex, which should notice the empty index over a
+    // non-empty store and rebuild before querying.
+    const r = recall(dir, "heal");
+    expect(r.map((e) => e.key)).toContain("healed");
+    expect(rowCount(dir)).toBe(1);
   });
 });
 
