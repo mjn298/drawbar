@@ -13,17 +13,35 @@ The knowledge base is the heart of it: every lesson, decision, and "MUST-CHECK" 
 
 If you want maximum agent autonomy, drawbar will feel too hands-on. If you want an agent that drafts and proposes while *you* stay the decision-maker — and a memory that actually accumulates — that's the point.
 
+## Requirements
+
+drawbar needs two things set up before it works:
+
+- **[Bun](https://bun.sh)** — runs the `drawbar-kb` knowledge CLI (and the tests). Install: `curl -fsSL https://bun.sh/install | bash`.
+- **The Linear MCP, connected in Claude Code** — drawbar tracks all work in Linear *through the MCP* (`mcp__…Linear…` tools must be available in your session). Without it, the design/plan/work commands can still run locally but won't write to Linear.
+
+Plus Claude Code itself (the plugin host).
+
 ## Install
 
-```bash
-# Link the knowledge CLI onto your PATH (live symlink to scripts/kb.ts — no version drift)
-cd /path/to/drawbar && bun link
+1. **Add the marketplace and install the plugin:**
 
-# If `drawbar-kb` isn't found afterward, add Bun's global bin to PATH:
-export PATH="$(bun pm bin -g):$PATH"
-```
+   ```bash
+   claude plugin marketplace add mjn298/drawbar
+   claude plugin install drawbar@drawbar-dev
+   ```
 
-Install the plugin in Claude Code so the `/drawbar-*` commands are available.
+   Then run `/reload-plugins` (or restart) so the `/drawbar-*` commands load.
+
+2. **Run `/drawbar-setup` once in a project.** It links the `drawbar-kb` CLI onto your PATH (via `bun link` from the installed plugin) and initializes `<project>/.drawbar/memory/`.
+
+   If `drawbar-kb` still isn't found afterward, add Bun's global bin to PATH:
+
+   ```bash
+   export PATH="$(bun pm bin -g):$PATH"
+   ```
+
+> Hacking on drawbar itself? Skip the marketplace and load the repo directly — see [Development](#development).
 
 ## Use
 
