@@ -55,7 +55,12 @@ Repeat until the story's acceptance criteria are met.
 
 ## 5. Review and fix loop
 
-Dispatch the `code-reviewer` agent with the story's diff and its acceptance criteria. Fix every Critical/Important finding it returns, then re-review until clean. (Keep this loop — it catches real issues before the PR.)
+Dispatch **two reviewers in parallel** on the story's diff, in a single message:
+
+- `code-reviewer` — spec compliance, code quality, and tests (pass it the acceptance criteria).
+- `security-reviewer` — security only: committed secrets/credentials, authz/tenant isolation, injection, data exposure (pass it the `.drawbar/memory` path so it can recall `MUST-CHECK security` constraints).
+
+They are independent on purpose: a single reviewer juggling spec + quality + tests under-weights security, which is how a committed credential slips through. Merge both reviews, fix every Critical/Important finding, then re-review until both come back clean. (Keep this loop — it catches real issues before the PR.)
 
 ## 6. Capture lessons (inline)
 
