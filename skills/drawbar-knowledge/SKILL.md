@@ -31,9 +31,9 @@ drawbar-kb recall "<query>" --dir "$PWD/.drawbar/memory" --json \
   [--type <type>] [--tag <tag>] [--file <path>] [--since <unix>] [--limit <n>] [--all]
 ```
 
-Ranked by relevance (FTS5 BM25), deduped by key (latest wins). `--all` includes archived entries. Recall before designing, planning, or implementing so you reuse prior lessons and honor `MUST-CHECK:` constraints.
+Ranked by relevance (FTS5 BM25), deduped by key (latest wins). Archived entries are excluded by default; `--all` includes them. Recall before designing, planning, or implementing so you reuse prior lessons and honor `MUST-CHECK:` constraints.
 
-## Write (safe, deduped)
+## Write (safe, upserted)
 
 Always pipe the entry as JSON on **stdin** — never interpolate content into the shell:
 
@@ -41,11 +41,17 @@ Always pipe the entry as JSON on **stdin** — never interpolate content into th
 echo '<json entry>' | drawbar-kb add --dir "$PWD/.drawbar/memory"
 ```
 
-`add` validates the entry and round-trips it through JSON before appending; it fails loudly on invalid input and is a no-op for an identical key+content (`{"written":false}`).
+`add` validates the entry and round-trips it through JSON before appending. It **upserts**: a key holds exactly one entry in the active store, so a correction always wins over what it corrects.
+
+- Re-adding an unchanged entry (every field but `ts` matches) is a no-op — `{"written":false,"superseded":false,"key":"..."}`.
+- Changing *any* field (content, issue, tags, files, type) is a correction: the key's line is replaced in place and the old copy moves to the archive — `{"written":true,"superseded":true,"key":"..."}`.
+
+A `superseded:true` you did not expect means you just overwrote knowledge under an existing key — check that you meant to.
 
 ## Other commands
 
-- `drawbar-kb stats [--json]` — counts by type, active vs archived.
+- `drawbar-kb stats [--json]` — counts by type, active vs archived, plus `duplicateKeys` (active keys with more than one line — should always be 0).
 - `drawbar-kb reindex` — rebuild the FTS index from the JSONL.
 - `drawbar-kb archive --days <n>` — age out entries older than N days.
+- `drawbar-kb compact [--dry-run]` — collapse any duplicate-key lines in the active store to newest-per-key, archiving the losers, then reindex. `--dry-run` reports the same counts without touching disk.
 - `drawbar-kb import <legacy.jsonl>` — one-time import of a legacy corpus (repairs corruption, reports every dropped line).
