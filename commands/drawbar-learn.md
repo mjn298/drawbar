@@ -38,7 +38,7 @@ echo '{"key":"<kebab-key>","type":"<type>","content":"<lesson>","source":"agent"
   | drawbar-kb add --dir "$PWD/.drawbar/memory"
 ```
 
-`drawbar-kb add` validates and dedupes by key+content — re-adding an identical entry is a no-op (returns `{"written":false,...}`). A new entry under the same key with *different* content appends a revision, and recall returns the most recent by timestamp.
+`drawbar-kb add` validates and **upserts** by key — one entry per key, so a correction always wins over what it corrects. Re-adding an unchanged entry is a no-op (`{"written":false,"superseded":false,...}`). Changing any field under an existing key replaces that key's line in place and archives the old copy (`{"written":true,"superseded":true,...}`).
 
 ## 4. Report
 

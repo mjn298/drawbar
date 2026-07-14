@@ -1,9 +1,9 @@
 import { test, expect, describe, beforeEach } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { run } from "./kb";
-import { readEntries } from "./lib/store";
+import { readEntries, readArchiveEntries, ensureDir } from "./lib/store";
 
 let dir: string;
 beforeEach(() => {
@@ -11,15 +11,16 @@ beforeEach(() => {
 });
 
 // Run the CLI with stdin text by invoking the binary through Bun so stdin is real.
-async function cli(args: string[], stdin = ""): Promise<{ code: number; out: string }> {
+async function cli(args: string[], stdin = ""): Promise<{ code: number; out: string; err: string }> {
   const proc = Bun.spawn(["bun", "run", join(import.meta.dir, "kb.ts"), ...args], {
     stdin: stdin ? new TextEncoder().encode(stdin) : undefined,
     stdout: "pipe",
     stderr: "pipe",
   });
   const out = await new Response(proc.stdout).text();
+  const err = await new Response(proc.stderr).text();
   const code = await proc.exited;
-  return { code, out };
+  return { code, out, err };
 }
 
 describe("run (in-process)", () => {
@@ -71,5 +72,76 @@ describe("cli (subprocess, real stdin)", () => {
     const rows = readEntries(dir);
     expect(rows.map((e) => e.key)).toContain("no-ts");
     expect(rows.find((e) => e.key === "no-ts")!.ts).toBeGreaterThan(0);
+  });
+
+  test("add reports superseded:true on a changed-content re-add", async () => {
+    const v1 = JSON.stringify({ key: "dup", type: "fact", content: "v1", ts: 1 });
+    const v2 = JSON.stringify({ key: "dup", type: "fact", content: "v2", ts: 2 });
+    const first = await cli(["add", "--dir", dir], v1);
+    expect(JSON.parse(first.out)).toEqual({ written: true, superseded: false, key: "dup" });
+    const second = await cli(["add", "--dir", dir], v2);
+    expect(JSON.parse(second.out)).toEqual({ written: true, superseded: true, key: "dup" });
+  });
+
+  test("stats reports duplicateKeys", async () => {
+    const p = ensureDir(dir);
+    writeFileSync(
+      p.active,
+      [
+        JSON.stringify({ key: "a", type: "fact", content: "a1", source: "user", tags: [], ts: 1, issue: null, files: [] }),
+        JSON.stringify({ key: "a", type: "fact", content: "a2", source: "user", tags: [], ts: 2, issue: null, files: [] }),
+        JSON.stringify({ key: "b", type: "fact", content: "b1", source: "user", tags: [], ts: 3, issue: null, files: [] }),
+      ].join("\n") + "\n",
+    );
+    const { code, out } = await cli(["stats", "--dir", dir]);
+    expect(code).toBe(0);
+    expect(JSON.parse(out).duplicateKeys).toBe(1);
+  });
+
+  test("compact collapses duplicates and moves losers to the archive", async () => {
+    const p = ensureDir(dir);
+    writeFileSync(
+      p.active,
+      [
+        JSON.stringify({ key: "a", type: "fact", content: "a1", source: "user", tags: [], ts: 1, issue: null, files: [] }),
+        JSON.stringify({ key: "a", type: "fact", content: "a2", source: "user", tags: [], ts: 2, issue: null, files: [] }),
+        JSON.stringify({ key: "b", type: "fact", content: "b1", source: "user", tags: [], ts: 3, issue: null, files: [] }),
+      ].join("\n") + "\n",
+    );
+    const { code, out } = await cli(["compact", "--dir", dir]);
+    expect(code).toBe(0);
+    expect(JSON.parse(out)).toEqual({ scanned: 3, keys: 2, removed: 1 });
+    expect(readEntries(dir).map((e) => e.key)).toEqual(["a", "b"]);
+    expect(readEntries(dir).find((e) => e.key === "a")!.content).toBe("a2");
+    expect(readArchiveEntries(dir).map((e) => e.content)).toEqual(["a1"]);
+  });
+
+  test("compact is a no-op on a clean store", async () => {
+    await cli(["add", "--dir", dir], JSON.stringify({ key: "a", type: "fact", content: "a1", ts: 1 }));
+    const { code, out } = await cli(["compact", "--dir", dir]);
+    expect(code).toBe(0);
+    expect(JSON.parse(out)).toEqual({ scanned: 1, keys: 1, removed: 0 });
+  });
+
+  test("compact --dry-run changes nothing on disk", async () => {
+    const p = ensureDir(dir);
+    writeFileSync(
+      p.active,
+      [
+        JSON.stringify({ key: "a", type: "fact", content: "a1", source: "user", tags: [], ts: 1, issue: null, files: [] }),
+        JSON.stringify({ key: "a", type: "fact", content: "a2", source: "user", tags: [], ts: 2, issue: null, files: [] }),
+      ].join("\n") + "\n",
+    );
+    const { code, out } = await cli(["compact", "--dir", dir, "--dry-run"]);
+    expect(code).toBe(0);
+    expect(JSON.parse(out)).toEqual({ scanned: 2, keys: 1, removed: 1 });
+    expect(readEntries(dir).map((e) => e.content)).toEqual(["a1", "a2"]);
+    expect(readArchiveEntries(dir).length).toBe(0);
+  });
+
+  test("usage string mentions compact for an unknown command", async () => {
+    const { code, err } = await cli(["bogus", "--dir", dir]);
+    expect(code).toBe(1);
+    expect(err).toContain("compact");
   });
 });

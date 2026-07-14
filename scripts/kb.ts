@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 import { join } from "node:path";
 import { validateEntry } from "./lib/schema";
-import { appendEntry, readEntries, archiveOlderThan, ensureDir } from "./lib/store";
+import { appendEntry, readEntries, archiveOlderThan, compactActive, ensureDir } from "./lib/store";
 import { buildIndex, recall, type RecallFilters } from "./lib/fts";
 import type { KnowledgeType } from "./lib/schema";
 
@@ -53,7 +53,7 @@ export async function run(argv: string[]): Promise<number> {
       if (!v.ok) { process.stderr.write(`add: invalid entry: ${v.error}\n`); return 1; }
       const res = appendEntry(dir, v.entry);
       buildIndex(dir);
-      process.stdout.write(JSON.stringify({ written: res.written, key: v.entry.key }) + "\n");
+      process.stdout.write(JSON.stringify({ written: res.written, superseded: res.superseded, key: v.entry.key }) + "\n");
       return 0;
     }
     case "recall": {
@@ -92,8 +92,13 @@ export async function run(argv: string[]): Promise<number> {
       const all = readEntries(dir, { includeArchive: true });
       const active = readEntries(dir);
       const byType: Record<string, number> = {};
-      for (const e of active) byType[e.type] = (byType[e.type] ?? 0) + 1;
-      const stats = { active: active.length, archived: all.length - active.length, byType };
+      const countByKey = new Map<string, number>();
+      for (const e of active) {
+        byType[e.type] = (byType[e.type] ?? 0) + 1;
+        countByKey.set(e.key, (countByKey.get(e.key) ?? 0) + 1);
+      }
+      const duplicateKeys = [...countByKey.values()].filter((n) => n > 1).length;
+      const stats = { active: active.length, archived: all.length - active.length, duplicateKeys, byType };
       process.stdout.write((flags.json === true ? JSON.stringify(stats, null, 2) : JSON.stringify(stats)) + "\n");
       return 0;
     }
@@ -102,6 +107,12 @@ export async function run(argv: string[]): Promise<number> {
       const cutoff = Math.floor(Date.now() / 1000) - days * 86400;
       const res = archiveOlderThan(dir, cutoff);
       buildIndex(dir);
+      process.stdout.write(JSON.stringify(res) + "\n");
+      return 0;
+    }
+    case "compact": {
+      const res = compactActive(dir, { dryRun: flags["dry-run"] === true });
+      if (flags["dry-run"] !== true) buildIndex(dir);
       process.stdout.write(JSON.stringify(res) + "\n");
       return 0;
     }
@@ -114,7 +125,7 @@ export async function run(argv: string[]): Promise<number> {
       return 0;
     }
     default:
-      process.stderr.write("usage: kb <add|recall|reindex|stats|archive|import> [--dir <path>] [...]\n");
+      process.stderr.write("usage: kb <add|recall|reindex|stats|archive|compact|import> [--dir <path>] [...]\n");
       return cmd ? 1 : 0;
   }
 }
