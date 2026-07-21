@@ -8,8 +8,7 @@ import type { KnowledgeType } from "./lib/schema";
 interface Flags { [k: string]: string | boolean; }
 
 function parseNonNegInt(raw: string): number | null {
-  const n = Number(raw);
-  return Number.isFinite(n) && n >= 0 ? n : null;
+  return /^\d+$/.test(raw) ? Number(raw) : null;
 }
 
 function parseFlags(args: string[]): { positionals: string[]; flags: Flags } {
@@ -62,14 +61,16 @@ export async function run(argv: string[]): Promise<number> {
       if (typeof flags.type === "string") filters.type = flags.type as KnowledgeType;
       if (typeof flags.tag === "string") filters.tag = flags.tag;
       if (typeof flags.file === "string") filters.file = flags.file;
+      if (flags.since === true) { process.stderr.write("recall: --since requires a value\n"); return 1; }
       if (typeof flags.since === "string") {
         const n = parseNonNegInt(flags.since);
-        if (n === null) { process.stderr.write("recall: --since must be a non-negative number\n"); return 1; }
+        if (n === null) { process.stderr.write("recall: --since must be a non-negative integer (digits only)\n"); return 1; }
         filters.since = n;
       }
+      if (flags.limit === true) { process.stderr.write("recall: --limit requires a value\n"); return 1; }
       if (typeof flags.limit === "string") {
         const n = parseNonNegInt(flags.limit);
-        if (n === null) { process.stderr.write("recall: --limit must be a non-negative number\n"); return 1; }
+        if (n === null) { process.stderr.write("recall: --limit must be a non-negative integer (digits only)\n"); return 1; }
         filters.limit = n;
       }
       if (flags.all === true) filters.includeArchive = true;
@@ -103,7 +104,13 @@ export async function run(argv: string[]): Promise<number> {
       return 0;
     }
     case "archive": {
-      const days = typeof flags.days === "string" ? Number(flags.days) : 90;
+      let days = 90;
+      if (flags.days === true) { process.stderr.write("archive: --days requires a value\n"); return 1; }
+      if (typeof flags.days === "string") {
+        const n = parseNonNegInt(flags.days);
+        if (n === null) { process.stderr.write("archive: --days must be a non-negative integer (digits only)\n"); return 1; }
+        days = n;
+      }
       const cutoff = Math.floor(Date.now() / 1000) - days * 86400;
       const res = archiveOlderThan(dir, cutoff);
       buildIndex(dir);

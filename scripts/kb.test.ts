@@ -40,6 +40,114 @@ describe("run (in-process)", () => {
   test("recall rejects a negative --since", async () => {
     expect(await run(["recall", "x", "--dir", dir, "--since", "-5"])).toBe(1);
   });
+
+  test("recall rejects non-integer --since and --limit (PCO-339)", async () => {
+    expect(await run(["recall", "x", "--dir", dir, "--since", "1.5"])).toBe(1);
+    expect(await run(["recall", "x", "--dir", dir, "--limit", "2.7"])).toBe(1);
+  });
+
+  test("recall still accepts --since 0 and --limit 0 (PCO-339)", async () => {
+    expect(await run(["recall", "x", "--dir", dir, "--since", "0"])).toBe(0);
+    expect(await run(["recall", "x", "--dir", dir, "--limit", "0"])).toBe(0);
+  });
+
+  test("archive --days 0 archives everything older than now (PCO-339)", async () => {
+    const p = ensureDir(dir);
+    const past = Math.floor(Date.now() / 1000) - 3600;
+    writeFileSync(
+      p.active,
+      [
+        JSON.stringify({ key: "a", type: "fact", content: "a1", source: "user", tags: [], ts: past, issue: null, files: [] }),
+        JSON.stringify({ key: "b", type: "fact", content: "b1", source: "user", tags: [], ts: past, issue: null, files: [] }),
+      ].join("\n") + "\n",
+    );
+    expect(readEntries(dir).length).toBe(2);
+    expect(await run(["archive", "--dir", dir, "--days", "0"])).toBe(0);
+    expect(readEntries(dir).length).toBe(0);
+    expect(readArchiveEntries(dir).length).toBe(2);
+  });
+
+  test("archive --days 30 archives only entries older than 30 days (PCO-339)", async () => {
+    const p = ensureDir(dir);
+    const old = Math.floor(Date.now() / 1000) - 40 * 86400;
+    const recent = Math.floor(Date.now() / 1000) - 10 * 86400;
+    writeFileSync(
+      p.active,
+      [
+        JSON.stringify({ key: "old", type: "fact", content: "old1", source: "user", tags: [], ts: old, issue: null, files: [] }),
+        JSON.stringify({ key: "recent", type: "fact", content: "recent1", source: "user", tags: [], ts: recent, issue: null, files: [] }),
+      ].join("\n") + "\n",
+    );
+    expect(await run(["archive", "--dir", dir, "--days", "30"])).toBe(0);
+    expect(readEntries(dir).map((e) => e.key)).toEqual(["recent"]);
+  });
+
+  test("archive with no --days defaults to 90 days (PCO-339)", async () => {
+    const p = ensureDir(dir);
+    const old = Math.floor(Date.now() / 1000) - 100 * 86400;
+    const recent = Math.floor(Date.now() / 1000) - 10 * 86400;
+    writeFileSync(
+      p.active,
+      [
+        JSON.stringify({ key: "old", type: "fact", content: "old1", source: "user", tags: [], ts: old, issue: null, files: [] }),
+        JSON.stringify({ key: "recent", type: "fact", content: "recent1", source: "user", tags: [], ts: recent, issue: null, files: [] }),
+      ].join("\n") + "\n",
+    );
+    expect(await run(["archive", "--dir", dir])).toBe(0);
+    expect(readEntries(dir).map((e) => e.key)).toEqual(["recent"]);
+  });
+
+  test("archive --days with no value is rejected, not silently defaulted to 90 (PCO-339 F1)", async () => {
+    const p = ensureDir(dir);
+    const old = Math.floor(Date.now() / 1000) - 100 * 86400;
+    writeFileSync(
+      p.active,
+      [JSON.stringify({ key: "old", type: "fact", content: "old1", source: "user", tags: [], ts: old, issue: null, files: [] })].join("\n") + "\n",
+    );
+    const code = await run(["archive", "--dir", dir, "--days"]);
+    expect(code).toBe(1);
+    expect(readEntries(dir).length).toBe(1);
+  });
+
+  test("archive --days swallowed by the next flag is rejected, not silently defaulted (PCO-339 F1)", async () => {
+    const p = ensureDir(dir);
+    const old = Math.floor(Date.now() / 1000) - 100 * 86400;
+    writeFileSync(
+      p.active,
+      [JSON.stringify({ key: "old", type: "fact", content: "old1", source: "user", tags: [], ts: old, issue: null, files: [] })].join("\n") + "\n",
+    );
+    const code = await run(["archive", "--days", "--dir", dir]);
+    expect(code).toBe(1);
+    expect(readEntries(dir).length).toBe(1);
+  });
+
+  test("recall --since with no value is rejected, not silently ignored (PCO-339 F1)", async () => {
+    expect(await run(["recall", "x", "--dir", dir, "--since"])).toBe(1);
+  });
+
+  test("recall --limit with no value is rejected, not silently ignored (PCO-339 F1)", async () => {
+    expect(await run(["recall", "x", "--dir", dir, "--limit"])).toBe(1);
+  });
+
+  test("archive --days rejects malformed values and archives nothing (PCO-339)", async () => {
+    const invalid = ["-1", "", " ", "abc", "1.5", "0x10", "1e3", "3."];
+    for (const raw of invalid) {
+      const p = ensureDir(dir);
+      const past = Math.floor(Date.now() / 1000) - 3600;
+      writeFileSync(
+        p.active,
+        [
+          JSON.stringify({ key: "a", type: "fact", content: "a1", source: "user", tags: [], ts: past, issue: null, files: [] }),
+          JSON.stringify({ key: "b", type: "fact", content: "b1", source: "user", tags: [], ts: past, issue: null, files: [] }),
+          JSON.stringify({ key: "c", type: "fact", content: "c1", source: "user", tags: [], ts: past, issue: null, files: [] }),
+        ].join("\n") + "\n",
+      );
+      const code = await run(["archive", "--dir", dir, "--days", raw]);
+      expect(code).toBe(1);
+      expect(readEntries(dir).length).toBe(3);
+      expect(readArchiveEntries(dir).length).toBe(0);
+    }
+  });
 });
 
 describe("cli (subprocess, real stdin)", () => {
@@ -143,5 +251,35 @@ describe("cli (subprocess, real stdin)", () => {
     const { code, err } = await cli(["bogus", "--dir", dir]);
     expect(code).toBe(1);
     expect(err).toContain("compact");
+  });
+
+  test("archive --days -1 names the flag on stderr (PCO-339)", async () => {
+    const { code, err } = await cli(["archive", "--dir", dir, "--days", "-1"]);
+    expect(code).toBe(1);
+    expect(err).toContain("--days");
+  });
+
+  test("archive --days 1e3 names the flag on stderr (PCO-339 F4)", async () => {
+    const { code, err } = await cli(["archive", "--dir", dir, "--days", "1e3"]);
+    expect(code).toBe(1);
+    expect(err).toContain("--days");
+  });
+
+  test("archive --days error message names integers, not just non-negative numbers (PCO-339 F3)", async () => {
+    const { err } = await cli(["archive", "--dir", dir, "--days", "1.5"]);
+    expect(err).toContain("non-negative integer");
+    expect(err).not.toContain("non-negative number");
+  });
+
+  test("recall --since error message names integers, not just non-negative numbers (PCO-339 F3)", async () => {
+    const { err } = await cli(["recall", "x", "--dir", dir, "--since", "1.5"]);
+    expect(err).toContain("non-negative integer");
+    expect(err).not.toContain("non-negative number");
+  });
+
+  test("recall --limit error message names integers, not just non-negative numbers (PCO-339 F3)", async () => {
+    const { err } = await cli(["recall", "x", "--dir", dir, "--limit", "2.7"]);
+    expect(err).toContain("non-negative integer");
+    expect(err).not.toContain("non-negative number");
   });
 });
