@@ -103,9 +103,22 @@ export interface RecallFilters {
 }
 
 // FTS5 MATCH is picky about punctuation; quote each token defensively.
-function toMatchQuery(query: string): string {
+//
+// Tokens are joined with OR, not a bare space. A bare space is FTS5's
+// implicit AND, which requires every token to appear in the same row — one
+// irrelevant word (or a typo) in a multi-word query zeroes out the entire
+// recall. OR returns the union instead. bm25 ranking (see `recall` below)
+// sorts rows matching rarer terms above ones matching only common terms; it
+// does not reward matching more tokens per se, and document length also
+// factors in (shorter documents score better, all else equal). `ts DESC` is
+// only a tie-break for rows whose bm25 comes out bit-identical — which
+// requires structural symmetry (same document length, same df/tf for every
+// matched term) — not a general fallback for "common" terms: when every
+// matched term is common, fts5 clamps its IDF to 1e-6 rather than 0, and
+// bm25 still fully determines the order at that tiny magnitude.
+export function toMatchQuery(query: string): string {
   const tokens = query.match(/[\p{L}\p{N}]+/gu) ?? [];
-  return tokens.map((t) => `"${t}"`).join(" ");
+  return tokens.map((t) => `"${t}"`).join(" OR ");
 }
 
 export function recall(dir: string, query: string, filters: RecallFilters = {}): Entry[] {
