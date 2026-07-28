@@ -1,1 +1,11 @@
 index.db
+
+# PCO-349 fix pass 3, Important 9: this is the redaction graveyard. `drawbar-kb`'s
+# supersede-to-redact operation deposits the PRE-redaction original here (see
+# scripts/plugin.test.ts's "ported files carry no private-org identifiers" describe block).
+# Once this file is tracked, a future redaction commit would silently publish the unredacted
+# text IN THE SAME COMMIT that redacts it — and it would no longer stand out as a new `??`
+# entry an operator might review before `git add -A`. Git history makes that unrecoverable.
+# Never track it; the archive-scan tests in plugin.test.ts still cover it "when present" for
+# local runs.
+knowledge.archive.jsonl

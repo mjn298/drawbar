@@ -94,7 +94,17 @@ describe("skill", () => {
 describe("ported files carry no private-org identifiers (leak regression)", () => {
   const DOC_FILES = ["commands/drawbar-ship.md", "agents/drawbar-story-lead.md"];
   const SELF_FILES = [".drawbar/memory/knowledge.jsonl", "scripts/plugin.test.ts"];
-  const ALL_FILES = [...DOC_FILES, ...SELF_FILES];
+  // I10 (PCO-349 fix pass): these three files are new, shipped, permanently-public — the
+  // same category DOC_FILES/SELF_FILES exist to cover — but were outside every rule's scope
+  // until now. No live leak was found in them (the only high-entropy literal is this repo's
+  // own public commit sha, cited as fixture provenance); this closes the coverage gap so a
+  // future edit to any of them is scanned too.
+  const NEW_PUBLIC_FILES = [
+    "scripts/lib/coderabbit.ts",
+    "scripts/lib/coderabbit.test.ts",
+    "scripts/lib/fixtures/f14-historical-cr-ready.sh",
+  ];
+  const ALL_FILES = [...DOC_FILES, ...SELF_FILES, ...NEW_PUBLIC_FILES];
 
   // Shape-based rules only: a pattern that describes what a concrete identifier looks like,
   // never a literal naming one. This is strictly weaker at catching a bare unstructured word
@@ -358,6 +368,509 @@ describe("merge guard fails closed when STORY is unset", () => {
       { branch: "someone/abc-1-slug" }
     );
     expect(code).toBe(0);
+  });
+});
+
+// PCO-349 — the CodeRabbit completion predicate (F14 fix) and its TIMEOUT-parks fix.
+// Anchored on the ACTUAL shipped markdown throughout, never a paraphrase or a
+// hand-reconstructed stand-in — see MUST-CHECK
+// verification-harness-must-replicate-full-fixture and l23-preservation-tests-need-anchor-not-just-header.
+describe("CodeRabbit verdict predicate — single implementation, TIMEOUT parks (PCO-349)", () => {
+  // Extracts the §7 bash fence from the real shipped agent file, exactly like
+  // extractGuard()/extractMergeGuard() above.
+  function extractSection7Fence(): string {
+    const txt = readNonEmpty(join(root, "agents/drawbar-story-lead.md"));
+    const sectionStart = txt.indexOf("## 7. Drive it green");
+    expect(sectionStart, "'## 7. Drive it green' heading not found").toBeGreaterThan(-1);
+    const fenceStart = txt.indexOf("```bash", sectionStart);
+    const fenceEnd = txt.indexOf("```", fenceStart + 7);
+    expect(fenceStart).toBeGreaterThan(-1);
+    expect(fenceEnd).toBeGreaterThan(fenceStart);
+    return txt.slice(fenceStart + 7, fenceEnd);
+  }
+
+  // Extracts just the wait loop (`while :; do` ... matching `done`), so a test can drive it
+  // to its TIMEOUT branch without waiting out a real DEADLINE=+3600s — the DEADLINE value
+  // itself is supplied by the test's environment instead of the doc's own computation line.
+  function extractWaitLoop(): string {
+    const block = extractSection7Fence();
+    const loopStart = block.indexOf("while :; do");
+    expect(loopStart, "'while :; do' not found in §7").toBeGreaterThan(-1);
+    // Anchored on "\ndone", not bare "done" — the latter matches anywhere, including inside
+    // a word (e.g. a future "abandoned"/"undone" in the loop body would truncate the
+    // extraction silently). A closing `done` is always alone on its own line.
+    const doneIdx = block.indexOf("\ndone", loopStart);
+    expect(doneIdx, "'done' not found closing the §7 wait loop").toBeGreaterThan(loopStart);
+    return block.slice(loopStart, doneIdx + "\ndone".length) + '\necho "STATUS=$STATUS"\n';
+  }
+
+  function makeFakeBin(dir: string, name: string, script: string): void {
+    const path = join(dir, name);
+    writeFileSync(path, script);
+    chmodSync(path, 0o755);
+  }
+
+  // C2: the only test that previously executed §7's bash always fed `gh pr checks` a "false"
+  // answer, so the `if` body — the `bun run`, the `jq` parse, the ready branch, the
+  // rate-limited branch — was never executed by any test. Measured mutation survivors this
+  // closes: `if [ "$OK" = "true" ]` -> `!= "false"` (turns every infrastructure failure into
+  // STATUS=ready), deleting the `bun run …coderabbit.ts` line entirely, and
+  // "rate_limited" -> "ratelimited".
+  function makeFakeGhForVerdict(statusesJson: string): string {
+    const dir = mkdtempSync(join(tmpdir(), "drawbar-cr-verdict-stub-"));
+    makeFakeBin(
+      dir,
+      "gh",
+      `#!/usr/bin/env bash\n` +
+        `if [ "$1" = "pr" ] && [ "$2" = "checks" ]; then\n` +
+        `  echo "true"\n` +
+        `elif [[ "$2" == repos/*/pulls/* ]]; then\n` +
+        `  echo '{"head":{"sha":"deadbeef00"}}' | jq -r "$4"\n` +
+        `elif [[ "$2" == repos/*/commits/*/statuses ]]; then\n` +
+        `  cat <<'STATUSES_EOF'\n${statusesJson}\nSTATUSES_EOF\n` +
+        `fi\n`,
+    );
+    return dir;
+  }
+
+  async function runWaitLoop(env: Record<string, string>): Promise<{ code: number; output: string }> {
+    const script = extractWaitLoop();
+    const proc = Bun.spawn(["bash", "-c", script], {
+      env: { PATH: process.env.PATH ?? "", ...env },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const out = await new Response(proc.stdout).text();
+    const err = await new Response(proc.stderr).text();
+    const code = await proc.exited;
+    return { code, output: out + err }; // see MUST-CHECK bash-echo-goes-to-stdout-not-stderr
+  }
+
+  test("§7 reaches STATUS=ready on a real 'Review completed' verdict, driven through the actual coderabbit.ts module", async () => {
+    const binDir = makeFakeGhForVerdict(
+      JSON.stringify([
+        { context: "CodeRabbit", state: "success", description: "Review completed", updated_at: "2026-07-28T18:06:18Z" },
+      ]),
+    );
+    const { output } = await runWaitLoop({
+      PATH: `${binDir}:${process.env.PATH ?? ""}`,
+      REPO: "org/repo",
+      PR: "1",
+      CLAUDE_PLUGIN_ROOT: root,
+      DEADLINE: String(Math.floor(Date.now() / 1000) + 3600),
+    });
+    expect(output).toContain("STATUS=ready");
+    expect(output).not.toContain("TIMEOUT");
+  });
+
+  test("§7 parks (does not merge) on a real 'Review rate limited' verdict, before the deadline", async () => {
+    const binDir = makeFakeGhForVerdict(
+      JSON.stringify([
+        { context: "CodeRabbit", state: "success", description: "Review rate limited", updated_at: "2026-07-28T18:06:18Z" },
+      ]),
+    );
+    const { output } = await runWaitLoop({
+      PATH: `${binDir}:${process.env.PATH ?? ""}`,
+      REPO: "org/repo",
+      PR: "1",
+      CLAUDE_PLUGIN_ROOT: root,
+      DEADLINE: String(Math.floor(Date.now() / 1000) + 3600),
+    });
+    expect(output).toContain("STATUS=parked");
+    expect(output).not.toContain("STATUS=ready");
+    // Parked immediately by the rate-limited branch, not by burning the hour-long deadline.
+    expect(output).not.toContain("TIMEOUT");
+  });
+
+  test("§7 parks immediately (never STATUS=ready) when the module is unavailable, rather than silently waiting out the deadline", async () => {
+    const binDir = makeFakeGhForVerdict(
+      JSON.stringify([
+        { context: "CodeRabbit", state: "success", description: "Review completed", updated_at: "2026-07-28T18:06:18Z" },
+      ]),
+    );
+    const emptyRoot = mkdtempSync(join(tmpdir(), "drawbar-cr-no-module-"));
+    const { output } = await runWaitLoop({
+      PATH: `${binDir}:${process.env.PATH ?? ""}`,
+      REPO: "org/repo",
+      PR: "1",
+      // Set but wrong: no scripts/lib/coderabbit.ts under here, so `bun run` fails and VERDICT
+      // is unparseable JSON — this must park via the "VERDICT_UNAVAILABLE" branch (I3),
+      // never reach STATUS=ready, and never have to wait out the hour-long deadline either.
+      CLAUDE_PLUGIN_ROOT: emptyRoot,
+      DEADLINE: String(Math.floor(Date.now() / 1000) + 3600),
+    });
+    expect(output).toContain("STATUS=parked");
+    expect(output).toContain("VERDICT_UNAVAILABLE");
+    expect(output).not.toContain("STATUS=ready");
+    expect(output).not.toContain("TIMEOUT");
+  });
+
+  test("§7's TIMEOUT path yields STATUS=parked, not a silent pass-through", async () => {
+    const script = extractWaitLoop();
+    const binDir = mkdtempSync(join(tmpdir(), "drawbar-cr-stub-"));
+    // Always reports "not all checks concluded" so the loop never takes the ready branch —
+    // it falls straight to the deadline check, which we've already put in the past.
+    makeFakeBin(binDir, "gh", `#!/usr/bin/env bash\necho "false"\n`);
+    const proc = Bun.spawn(["bash", "-c", script], {
+      env: {
+        PATH: `${binDir}:${process.env.PATH ?? ""}`,
+        REPO: "org/repo",
+        PR: "1",
+        CLAUDE_PLUGIN_ROOT: root,
+        // Already elapsed — the loop must hit TIMEOUT on its first iteration, not sleep 60s.
+        DEADLINE: "1",
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const out = await new Response(proc.stdout).text();
+    const err = await new Response(proc.stderr).text();
+    const combined = out + err; // see MUST-CHECK bash-echo-goes-to-stdout-not-stderr
+    expect(combined).toContain("TIMEOUT");
+    expect(combined).toContain("STATUS=parked");
+    // Must NOT be indistinguishable from a pass.
+    expect(combined).not.toContain("STATUS=ready");
+  });
+
+  // PCO-349 fix pass 3, Important 3: `: "${CLAUDE_PLUGIN_ROOT:?...}"` was only ever "caught"
+  // by the misleading line-number-pinned I6 allowlist (see Important 2) — replacing it with
+  // `true` (line count preserved) left all 217 tests green. Runs the real §7 loop with
+  // CLAUDE_PLUGIN_ROOT unset and asserts the guard fails the whole script closed: non-zero
+  // exit, never STATUS=ready.
+  test("§7's wait loop fails closed (never STATUS=ready) when CLAUDE_PLUGIN_ROOT is unset", async () => {
+    const script = extractWaitLoop();
+    const proc = Bun.spawn(["bash", "-c", script], {
+      // Deliberately omit CLAUDE_PLUGIN_ROOT — Bun.spawn's `env` fully replaces the child's
+      // environment rather than merging with the parent's, so this reliably leaves it unset
+      // regardless of what the test runner's own process happens to have.
+      env: {
+        PATH: process.env.PATH ?? "",
+        REPO: "org/repo",
+        PR: "1",
+        DEADLINE: String(Math.floor(Date.now() / 1000) + 3600),
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const out = await new Response(proc.stdout).text();
+    const err = await new Response(proc.stderr).text();
+    const code = await proc.exited;
+    expect(code).not.toBe(0);
+    expect(out + err).toContain("CLAUDE_PLUGIN_ROOT must be set");
+    expect(out).not.toContain("STATUS=ready");
+  });
+
+  // PCO-349 fix pass 3, Important 1: a well-formed but infrastructure-broken verdict
+  // (`fetch_failed` — e.g. `gh` missing from PATH) passed the `case "$OK" in true|false)`
+  // guard (REASON isn't unparseable, it's a real string) and fell all the way through to the
+  // ordinary poll-until-deadline path — indistinguishable from "CodeRabbit hasn't finished
+  // yet" until the full hour elapsed. Fixed by bounding consecutive fetch_failed iterations.
+  // `sleep` is stubbed to a no-op alongside `gh` so 3+ iterations complete near-instantly —
+  // DEADLINE is set short (not the real 3600s) so the PRE-fix behavior (silently burning the
+  // whole duration) is observable in a bounded test.
+  function makeFakeGhAlwaysFetchFailed(): string {
+    const dir = mkdtempSync(join(tmpdir(), "drawbar-cr-fetchfail-stub-"));
+    makeFakeBin(
+      dir,
+      "gh",
+      `#!/usr/bin/env bash\n` +
+        `if [ "$1" = "pr" ] && [ "$2" = "checks" ]; then\n` +
+        `  echo "true"\n` +
+        `elif [[ "$2" == repos/*/pulls/* ]]; then\n` +
+        `  exit 1\n` + // every head-sha lookup fails -> checkPr always returns fetch_failed
+        `fi\n`,
+    );
+    makeFakeBin(dir, "sleep", `#!/usr/bin/env bash\n:\n`); // no-op: don't actually pause
+    return dir;
+  }
+
+  test("§7 parks with a distinct reason after repeated fetch_failed verdicts, rather than burning the full deadline on an infrastructure failure", async () => {
+    const binDir = makeFakeGhAlwaysFetchFailed();
+    const { output } = await runWaitLoop({
+      PATH: `${binDir}:${process.env.PATH ?? ""}`,
+      REPO: "org/repo",
+      PR: "1",
+      CLAUDE_PLUGIN_ROOT: root,
+      // Short deadline: if the fix's bounded-retry park doesn't fire, the loop falls through
+      // to this deadline instead — proving the pre-fix module actually reaches TIMEOUT here,
+      // not merely hanging for an unrelated reason.
+      DEADLINE: String(Math.floor(Date.now() / 1000) + 5),
+    });
+    expect(output).toContain("STATUS=parked");
+    expect(output).toContain("FETCH_FAILED_REPEATED");
+    expect(output).not.toContain("STATUS=ready");
+    // The whole point: parked BEFORE the deadline, not by falling through to it.
+    expect(output).not.toContain("TIMEOUT");
+  });
+
+  // Real F14 input, not a plausible reconstruction: pinned as a checked-in fixture rather
+  // than resolved via `git show HEAD` — HEAD is a moving ref, and the moment this story's
+  // fix commit lands, HEAD holds the FIXED agent file, which would silently invert this test
+  // (see scripts/lib/fixtures/f14-historical-cr-ready.sh for full provenance, and MUST-CHECK
+  // regression-guard-must-be-tested-against-the-real-historical-input).
+  function extractHistoricalCrReady(): string {
+    const txt = readNonEmpty(join(root, "scripts/lib/fixtures/f14-historical-cr-ready.sh"));
+    const start = txt.indexOf("cr_ready() {");
+    expect(start, "historical cr_ready() not found in the pinned fixture").toBeGreaterThan(-1);
+    const end = txt.indexOf("\n}", start);
+    expect(end).toBeGreaterThan(start);
+    return txt.slice(start, end + 2);
+  }
+
+  test("the historical .state-only predicate passes the real F14 input (state=success, description=\"Review rate limited\") — proving the bug existed", async () => {
+    const crReady = extractHistoricalCrReady();
+    const binDir = mkdtempSync(join(tmpdir(), "drawbar-cr-hist-"));
+    // Fake `gh api` that runs the SAME jq expression the real predicate passes via --jq,
+    // against a real F14-shaped payload — so the historical jq filter itself decides the
+    // output, not a value we chose to make the test pass.
+    makeFakeBin(
+      binDir,
+      "gh",
+      `#!/usr/bin/env bash\n` +
+        `if [[ "$2" == repos/*/pulls/* ]]; then\n` +
+        `  echo '{"head":{"sha":"deadbeef00"}}' | jq -r "$4"\n` +
+        `elif [[ "$2" == repos/*/commits/*/statuses ]]; then\n` +
+        `  echo '[{"context":"CodeRabbit","state":"success","description":"Review rate limited","updated_at":"2026-07-28T18:06:18Z"}]' | jq -r "$4"\n` +
+        `fi\n`
+    );
+    const script = `REPO=org/repo\nPR=1\n${crReady}\ncr_ready; echo "EXIT=$?"\n`;
+    const proc = Bun.spawn(["bash", "-c", script], {
+      env: { PATH: `${binDir}:${process.env.PATH ?? ""}` },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const out = await new Response(proc.stdout).text();
+    const err = await new Response(proc.stderr).text();
+    expect(out + err).toContain("EXIT=0"); // the bug: rate-limited was treated as ready
+  });
+
+  test("coderabbitVerdict refuses the identical real F14 input", async () => {
+    const { coderabbitVerdict } = await import("./lib/coderabbit");
+    const verdict = coderabbitVerdict({
+      headSha: "deadbeef00",
+      statuses: [
+        {
+          context: "CodeRabbit",
+          state: "success",
+          description: "Review rate limited",
+          sha: "deadbeef00",
+          updated_at: "2026-07-28T18:06:18Z",
+        },
+      ],
+    });
+    expect(verdict.ok).toBe(false);
+    if (!verdict.ok) expect(verdict.reason).toBe("rate_limited");
+  });
+
+  // I6: the old version of this test only scanned three hardcoded paths with a TS-only
+  // regex (`description === "Review completed"`), so a hand-rolled bash/jq duplicate of the
+  // predicate inserted into §7 — e.g.
+  // `--jq '[.[] | select(.context=="CodeRabbit" and .state=="success" and
+  // .description=="Review completed")] | length'` — used `==`, not `===`, and a NEW file
+  // wasn't scanned at all either way. Both slipped past silently. Fixed by grepping the
+  // whole repo (not a fixed file list) for both the phrase AND the jq-shaped context
+  // comparison, then asserting the exact multiset of (file, matched-line-content) pairs
+  // found is covered by a reviewed allowlist — any new occurrence anywhere fails loudly for
+  // a human to triage, rather than needing a smarter regex to anticipate every future
+  // duplicate's syntax.
+  //
+  // Scoped to the runbook/implementation surfaces (commands/, agents/, skills/, scripts/)
+  // and excludes `*.test.ts`: test fixtures legitimately construct dozens of literal
+  // `"Review completed"` status objects as data, which is not an implementation site and
+  // would make this allowlist churn on every unrelated test edit. A duplicate predicate
+  // placed in a test file wouldn't execute in production, which is the risk this guard
+  // targets. Scan root is `scripts` (not just `scripts/lib`) so a duplicate landing in any
+  // future `scripts/*.ts` (e.g. a de-hardcoded ship-config module) is not invisible.
+  //
+  // PCO-349 fix pass 3, Important 2: keyed on (file, TRIMMED line content) rather than
+  // (file, line number) — the previous line-number key broke on ANY line-shifting edit to an
+  // allowlisted file (a one-line insert anywhere above an allowlisted line, or a one-line
+  // deletion, both fail this test for the wrong reason: "new duplicate predicate?" when
+  // nothing moved but the line number). A `Map<key, count>` MULTISET, not a `Set`: keying on
+  // content alone would let a genuine second, identical copy of an allowlisted line silently
+  // pass (both instances share the same key), which a line-number Set would have caught by
+  // virtue of the two copies naturally landing on different line numbers. This is also
+  // STRICTLY STRONGER against a different mutation: editing an allowlisted line to weaken it
+  // (e.g. loosening `description === "Review completed"`) changes its content, so it no
+  // longer matches its allowlist key and now fails loudly too — a line-number key would have
+  // stayed silent on that edit (see the two proofs below the assertions).
+  test("the CodeRabbit completion predicate has no occurrence outside the reviewed allowlist (I6)", () => {
+    const proc = Bun.spawnSync(
+      [
+        "grep",
+        "-rn",
+        "-E",
+        'Review completed|context=="CodeRabbit"|context === "CodeRabbit"',
+        "commands",
+        "agents",
+        "skills",
+        "scripts",
+        "--include=*.md",
+        "--include=*.ts",
+        "--include=*.sh",
+        "--exclude=*.test.ts",
+      ],
+      { cwd: root },
+    );
+    // grep exits 0 (matches found) or 1 (no matches) on success; anything else means the
+    // grep itself broke (bad cwd, renamed dir) rather than the repo being clean — a broken
+    // grep must not silently pass as "found nothing to check".
+    expect(proc.exitCode, `grep failed to run: ${proc.stderr.toString()}`).toBeLessThanOrEqual(1);
+    const lines = proc.stdout.toString().split("\n").filter((l) => l.length > 0);
+    const matches = lines.map((l) => {
+      const firstColon = l.indexOf(":");
+      const secondColon = l.indexOf(":", firstColon + 1);
+      return { file: l.slice(0, firstColon), content: l.slice(secondColon + 1).trim() };
+    });
+    const keyOf = (m: { file: string; content: string }) => `${m.file} ${m.content}`;
+
+    // Non-vacuity: assert the scan actually found the known-good implementation's real
+    // CONTENT, not merely a non-empty grep at some line number (a content assertion survives
+    // the very line-shifting edit this fix exists to tolerate).
+    expect(
+      matches.some((m) => m.file === "scripts/lib/coderabbit.ts" && m.content.includes('description === "Review completed"')),
+      "scan did not find the module's own allowlist check — broken grep, not a clean repo",
+    ).toBe(true);
+
+    // Multiset: file+content -> how many occurrences are reviewed-and-allowed there.
+    const ALLOWLIST = new Map<string, number>([
+      // The module implementation: the single-winner allowlist check, and the tie-break
+      // allowlist check (Critical 1's fail-closed-on-ties fix) — both are the one real
+      // implementation, not a second copy.
+      ["scripts/lib/coderabbit.ts if (latest.state === \"success\" && latest.description === \"Review completed\") {", 1],
+      ["scripts/lib/coderabbit.ts (w) => shaMatchesHead(w, headSha) && w.state === \"success\" && w.description === \"Review completed\",", 1],
+      // I5's endpoint-injection-guard comment, discussing the predicate, not implementing it.
+      ["scripts/lib/coderabbit.ts // (success, \"Review completed\") into a universal ok:true oracle. Validated at the CLI", 1],
+      // Appendix measured-evidence table row and amendment prose (Locked 23).
+      ["commands/drawbar-ship.md Review completed    success   18:06:18", 1],
+      ["commands/drawbar-ship.md `description=\"Review completed\"` — against the current head sha, taking the MAX `updated_at`", 1],
+      ["commands/drawbar-ship.md tie between `Review completed` and any other CodeRabbit status therefore can never pass;", 1],
+      // §7's prose describing the predicate before the bash fence.
+      ["agents/drawbar-story-lead.md longer sorts. Operator-relevant consequence: a same-second tie between `Review completed` and", 1],
+      ["agents/drawbar-story-lead.md bug. Only the exact allowlisted pair (`state=success`, `description=\"Review completed\"`)", 1],
+      // The pinned historical (pre-fix) fixture's OLD `.state`-only jq expression.
+      ["scripts/lib/fixtures/f14-historical-cr-ready.sh --jq 'map(select(.context==\"CodeRabbit\")) | first | .state // \"none\"' 2>/dev/null)", 1],
+    ]);
+
+    const actualCounts = new Map<string, number>();
+    for (const m of matches) actualCounts.set(keyOf(m), (actualCounts.get(keyOf(m)) ?? 0) + 1);
+
+    for (const m of matches) {
+      const key = keyOf(m);
+      const allowed = ALLOWLIST.get(key) ?? 0;
+      const actual = actualCounts.get(key)!;
+      expect(
+        actual <= allowed,
+        `unreviewed occurrence at ${m.file} (content: ${JSON.stringify(m.content)}) — new duplicate predicate, or an allowlisted line duplicated beyond its reviewed count?`,
+      ).toBe(true);
+    }
+  });
+
+  test("the old .state-only bash predicate is gone from both markdown files", () => {
+    const shipTxt = readNonEmpty(join(root, "commands/drawbar-ship.md"));
+    const leadTxt = readNonEmpty(join(root, "agents/drawbar-story-lead.md"));
+    for (const txt of [shipTxt, leadTxt]) {
+      expect(txt).not.toContain("cr_ready()");
+      expect(txt).not.toContain('map(select(.context=="CodeRabbit")) | first | .state');
+      expect(txt).not.toContain('case "$st" in success|failure|error');
+    }
+  });
+
+  // I8: `expect(txt).toContain("scripts/lib/coderabbit.ts")` against the WHOLE file matched
+  // the prose paragraph above the fence too — which is exactly why deleting the `bun run`
+  // invocation line (C2 mutation 2) left this test green. Anchor on the fence itself and
+  // assert the actual invocation shape, which also enforces that call sites reference
+  // `${CLAUDE_PLUGIN_ROOT}` (nothing else currently checks that).
+  test("§7's bash fence actually invokes the shared module via ${CLAUDE_PLUGIN_ROOT}, not just mentions it in prose", () => {
+    const fence = extractSection7Fence();
+    expect(fence).toContain('bun run "${CLAUDE_PLUGIN_ROOT}/scripts/lib/coderabbit.ts" verdict --repo "$REPO" --pr "$PR"');
+  });
+
+  test("the drawbar-ship.md measured-evidence Appendix survives, amended not deleted (Locked 23)", () => {
+    const txt = readNonEmpty(join(root, "commands/drawbar-ship.md"));
+    // The original measured evidence is untouched...
+    expect(txt).toContain("## Appendix — why the CodeRabbit gate is shaped the way it is");
+    expect(txt).toContain("Review completed    success   18:06:18");
+    expect(txt).toContain("Verified in the first real run: concluded `success` in ~3 minutes and re-armed per head sha.");
+    // ...and the amendment says the signal is right but `.state` alone is not the predicate.
+    expect(txt).toContain("Amendment (F14)");
+    expect(txt).toContain("is not the right *predicate*");
+  });
+
+  describe("no @coderabbitai command is ever issued (Locked 7)", () => {
+    // I7: the old detector only matched `review|full review`, missing CodeRabbit's other
+    // commands (`resolve`, `pause`, `resume`, `summary`, `plan`, `configuration`, "generate
+    // docstrings") — a reviewer added `gh pr comment ... --body "@coderabbitai resolve"` to
+    // §7 and the suite stayed green. It also exempted any line starting with `#`, but in
+    // markdown `#` is a HEADING, not a comment — a line like
+    // "## Step 3: post @coderabbitai review" is a real instruction an LLM reading the
+    // runbook would follow, and the old exemption skipped it. Fixed by matching
+    // "@coderabbitai" followed by whitespace then any non-space token (broad enough to catch
+    // any command, known or future) and dropping the "#"-line exemption entirely — a mention
+    // that is genuinely just prose (e.g. backtick-wrapped, `` `@coderabbitai` command ``) has
+    // no whitespace immediately after the handle and so does not match on its own, with no
+    // special-casing required.
+    function isCommandIssuingMention(line: string): boolean {
+      return /@coderabbitai\s+\S/.test(line);
+    }
+
+    test("the detector actually catches a real invocation shape (positive control)", () => {
+      expect(isCommandIssuingMention('gh pr comment "$PR" --body "@coderabbitai full review"')).toBe(true);
+      expect(isCommandIssuingMention("@coderabbitai review")).toBe(true);
+    });
+
+    test("the detector catches CodeRabbit's other commands too, not just review/full review (I7)", () => {
+      expect(isCommandIssuingMention('gh pr comment -R "$REPO" "$PR" --body "@coderabbitai resolve"')).toBe(true);
+      expect(isCommandIssuingMention("@coderabbitai pause")).toBe(true);
+      expect(isCommandIssuingMention("@coderabbitai generate docstrings")).toBe(true);
+    });
+
+    test("the detector catches a command-issuing markdown HEADING, which the old '#'-line exemption wrongly skipped (I7)", () => {
+      expect(isCommandIssuingMention("## Step 3: post @coderabbitai review")).toBe(true);
+    });
+
+    test("the detector does not flag a comment merely discussing the rule (negative control)", () => {
+      expect(isCommandIssuingMention("# no `@coderabbitai` command is ever issued")).toBe(false);
+    });
+
+    test("commands/, agents/, scripts/, skills/ contain no command-issuing @coderabbitai invocation", () => {
+      // Exclude this test file itself: its own positive/negative-control fixtures above
+      // necessarily contain the literal invocation shape being checked for — scanning them
+      // would be self-referential, not a real finding. See MUST-CHECK
+      // leak-scan-self-reference-needs-per-rule-file-scope.
+      const proc = Bun.spawnSync(
+        ["grep", "-rn", "--exclude=plugin.test.ts", "@coderabbitai", "commands", "agents", "scripts", "skills"],
+        { cwd: root },
+      );
+      // grep exits 0 (found) or 1 (no matches); anything else means it errored (bad cwd,
+      // renamed dir) rather than the repo being clean of mentions, so must not silently
+      // assert nothing.
+      expect(proc.exitCode, `grep failed to run: ${proc.stderr.toString()}`).toBeLessThanOrEqual(1);
+      const out = proc.stdout.toString();
+      const lines = out.split("\n").filter((l) => l.length > 0);
+      const locations = lines.map((l) => {
+        const firstColon = l.indexOf(":");
+        const secondColon = l.indexOf(":", firstColon + 1);
+        return l.slice(0, secondColon);
+      });
+      // Assert the grep actually ran and found the one known-benign mention — otherwise a
+      // silently broken grep (wrong cwd, exit code swallowed) would make every assertion
+      // below vacuously pass. PCO-349 fix pass 3, Important 2: content-keyed, not
+      // line-number-keyed — a line-shifting edit anywhere above this benign mention moved it
+      // from :143 to :152 with nothing wrong, and the OLD line-number pin reported "grep
+      // found no @coderabbitai mentions at all — broken grep, not a clean repo", which was
+      // flatly false (the grep ran fine and found the line; only its number moved).
+      expect(
+        lines.some((l) => l.includes("agents/drawbar-story-lead.md") && l.includes("no `@coderabbitai` command")),
+        "grep found no @coderabbitai mentions at all — broken grep, not a clean repo",
+      ).toBe(true);
+      for (const line of lines) {
+        const firstColon = line.indexOf(":");
+        const secondColon = line.indexOf(":", firstColon + 1);
+        const content = line.slice(secondColon + 1);
+        expect(isCommandIssuingMention(content), `command-issuing mention found: ${line}`).toBe(false);
+      }
+    });
   });
 });
 
