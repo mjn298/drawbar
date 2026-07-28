@@ -161,7 +161,12 @@ function normalizeRemote(url: string): string {
 // A relative path, or any path carrying a literal `..` segment, is refused outright — never
 // resolved against a runner. `path.isAbsolute` alone would accept `/a/../b`, which is
 // absolute but still path-traversal-shaped, so the segment check is independent of it.
-function isCleanAbsolutePath(p: string): boolean {
+//
+// Exported (fix pass, IMPORTANT 6) so run-state.ts's `parseRunState` can reuse this exact
+// check on `resolved_config.envDir`/`projectDir` rather than a second, hand-copied
+// implementation of the same shape check — this repo has a single-implementation-site
+// regression test that scans for duplicated predicates.
+export function isCleanAbsolutePath(p: string): boolean {
   if (!isAbsolute(p)) return false;
   const segments = p.split(/[\\/]+/).filter((s) => s.length > 0);
   return !segments.includes("..");

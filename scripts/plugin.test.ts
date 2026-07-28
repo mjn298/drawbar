@@ -110,6 +110,11 @@ describe("ported files carry no private-org identifiers (leak regression)", () =
     ".drawbar/ship.config.example.json",
     "scripts/lib/ship-config.ts",
     "scripts/lib/ship-config.test.ts",
+    // PCO-350 (S5): the run-state module and its tests — every fixture id in the test file
+    // is deliberately lowercase (e.g. "story-a"), which cannot match the issue-id rule's
+    // uppercase-team-prefix shape.
+    "scripts/lib/run-state.ts",
+    "scripts/lib/run-state.test.ts",
   ];
   const ALL_FILES = [...DOC_FILES, ...SELF_FILES, ...NEW_PUBLIC_FILES];
 
@@ -1851,5 +1856,52 @@ describe("Locked 23 — preserved verbatim (grep-assertable, or hash-pinned for 
       hash,
       "§4 body hash changed — if this is an intentional edit, regenerate with the one-liner in the comment above; if not, something silently altered §4."
     ).toBe("e3e06c41f1f3e83c490c7046f6b59287d02ec0d97d8ebb34170063f3f2d93858");
+  });
+});
+
+// Fix pass (PCO-350, IMPORTANT 5): scripts/lib/run-state.test.ts used to carry THREE tests
+// with byte-identical bodies (same seed, same call to `clearInFlight`) under three different
+// names — one for "report," one for "park," one for "halt." They could not fail
+// independently: `clearInFlight`'s whole implementation is `{...state, in_flight: null}`, so
+// one unit test fully covers it (see run-state.test.ts). What the AC actually cares about —
+// that each of the THREE runbook narrative sites still instructs clearing `in_flight` — was
+// never tested at all; deleting any one of the three prose lines below left the old suite
+// green. These doc assertions close that gap, following the established
+// grep-commands/drawbar-ship.md pattern used elsewhere in this file (e.g. the §5/mutation-gate
+// tests above).
+describe("in_flight is cleared at all three Locked-13 narrative sites in commands/drawbar-ship.md (IMPORTANT 5)", () => {
+  // Every assertion below runs against a WHITESPACE-NORMALIZED section, never the raw slice.
+  // These are prose paragraphs: markdown hard-wraps them, so which words land on which line is
+  // an editorial accident, not a property worth pinning. An earlier version of this block
+  // asserted the literal `"in_flight:\nnull"` — i.e. it depended on the wrap falling between
+  // those two tokens, and would have gone red on an ordinary reflow that changed nothing about
+  // what the runbook instructs. Same lesson as MUST-CHECK
+  // repo-wide-duplicate-implementation-scan-excludes-test-fixtures: key the assertion on
+  // CONTENT, never on position or formatting.
+  function section(startMarker: string, endMarker: string): string {
+    const txt = readNonEmpty(join(root, "commands/drawbar-ship.md"));
+    const start = txt.indexOf(startMarker);
+    expect(start, `'${startMarker}' heading not found`).toBeGreaterThan(-1);
+    const end = txt.indexOf(endMarker, start);
+    expect(end, `'${endMarker}' heading not found after '${startMarker}'`).toBeGreaterThan(start);
+    return txt.slice(start, end).replace(/\s+/g, " ");
+  }
+
+  test("step 5 (report) clears in_flight", () => {
+    const s5 = section("## 5.", "## 6.");
+    expect(s5).toContain("Clear `in_flight` in the state file");
+    expect(s5).toContain("in_flight: null");
+  });
+
+  test("'Parking a story' clears in_flight", () => {
+    const parkSection = section("## Parking a story", "## Crash recovery");
+    expect(parkSection).toContain("clear `in_flight` in the state file");
+    expect(parkSection).toContain("in_flight: null");
+  });
+
+  test("the halt branch of 'Crash recovery' clears in_flight", () => {
+    const crashSection = section("## Crash recovery", "## Finishing the run");
+    expect(crashSection).toContain("must be halted outright");
+    expect(crashSection).toContain("**clear `in_flight`** (`in_flight: null`) before halting");
   });
 });
