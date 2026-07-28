@@ -1,5 +1,5 @@
 import { test, expect, describe } from "bun:test";
-import { mkdtempSync, writeFileSync, existsSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, existsSync, rmSync, readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -8,9 +8,11 @@ import {
   resolveConfigPath,
   resolvedConfig,
   parseCliArgs,
+  main,
   type ShipConfig,
   type LinearFacts,
   type Runner,
+  type MainDeps,
 } from "./ship-config";
 
 // A structurally-valid config used as the shared happy-path fixture. Repo/team/dir names
@@ -197,6 +199,26 @@ describe("validateShipConfig — the five Locked-18 assertions", () => {
     expect(result.resolved.observed.defaultBranch).toBe("main");
   });
 
+  // Fix pass 2, Important 5: every OTHER fixture in this file uses the `https://` remote
+  // form, so a mutation deleting normalizeRemote's SSH-prefix strip
+  // (`.replace(/^git@github\.com:/, "")`) left the suite fully green — SSH is the more
+  // common real-world remote form, and a regression here gives every SSH-cloning operator a
+  // permanent `repo_mismatch` refusal. This fixture is deliberately SSH-form on BOTH sides
+  // (projectDir remote and envDir remote) so the normalization is actually load-bearing for
+  // every comparison the function makes, not just one.
+  test("normalizes an SSH-form (git@github.com:) remote the same as the https:// form", () => {
+    const git = makeGitRunner({
+      "/tmp/fixture-project-dir": "git@github.com:acme/widgets.git",
+      "/tmp/fixture-env-dir": "git@github.com:acme/knowledge-base.git",
+    });
+    const gh = makeGhRunner("main");
+    const result = validateShipConfig({ config: VALID_CONFIG, linear: VALID_LINEAR, git: git.run, gh: gh.run });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.resolved.observed.projectDirRemote).toBe("acme/widgets");
+    expect(result.resolved.observed.envDirRemote).toBe("acme/knowledge-base");
+  });
+
   test("refuses when repo disagrees with the projectDir remote — reason repo_mismatch", () => {
     const git = makeGitRunner({
       "/tmp/fixture-project-dir": "https://github.com/other-org/other-repo.git",
@@ -213,6 +235,24 @@ describe("validateShipConfig — the five Locked-18 assertions", () => {
   test("refuses when projectDir equals envDir (path-equality path, independent of remotes)", () => {
     const config: ShipConfig = { ...VALID_CONFIG, projectDir: "/tmp/same-dir", envDir: "/tmp/same-dir" };
     const git = makeGitRunner({ "/tmp/same-dir": "https://github.com/acme/widgets.git" });
+    const gh = makeGhRunner("main");
+    const result = validateShipConfig({ config, linear: VALID_LINEAR, git: git.run, gh: gh.run });
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.reason).toBe("project_dir_equals_env_dir");
+  });
+
+  // Minor fix pass 2: pins the trailing-slash normalization end to end (Node's `resolve()`
+  // strips it) — `stripTrailingSlash` used to exist as a separate, dead step applied AFTER
+  // `resolve()` had already normalized its input; deleted rather than left unpinned. Uses
+  // deliberately DIFFERENT remotes for the two raw directory strings so this test isolates
+  // the PATH-equality check specifically, not the independent same-remote check.
+  test("refuses when projectDir and envDir are the same directory, written with vs without a trailing slash", () => {
+    const config: ShipConfig = { ...VALID_CONFIG, projectDir: "/tmp/same-dir/", envDir: "/tmp/same-dir" };
+    const git = makeGitRunner({
+      "/tmp/same-dir/": "https://github.com/acme/widgets.git",
+      "/tmp/same-dir": "https://github.com/other-org/other-repo.git",
+    });
     const gh = makeGhRunner("main");
     const result = validateShipConfig({ config, linear: VALID_LINEAR, git: git.run, gh: gh.run });
     expect(result.ok).toBe(false);
@@ -324,6 +364,53 @@ describe("validateShipConfig — the five Locked-18 assertions", () => {
     const result = validateShipConfig({ config, linear: VALID_LINEAR, git: git.run, gh: gh.run });
     expect(result.ok).toBe(false);
     if (result.ok) return;
+    // Minor fix pass 2: unlike its siblings (repo-shape, envDir-path tests above/below), this
+    // test previously asserted only `ok === false` and the call counts, never `result.reason`.
+    expect(result.reason).toBe("project_dir_path_invalid");
+    expect(git.calls.length).toBe(0);
+    expect(gh.calls.length).toBe(0);
+  });
+
+  // Fix pass 2, Important 6: `isCleanAbsolutePath`'s segment check
+  // (`!segments.includes("..")`) is the load-bearing half of the traversal guard — the
+  // comment says `isAbsolute` alone would accept `/a/../b`. The relative-path test above
+  // doesn't reach this branch at all (it fails `isAbsolute` first), so a mutation replacing
+  // the whole function body with `return true` left the suite green. This is absolute AND
+  // traversal-shaped, so only the segment check can catch it.
+  test("a projectDir path that is absolute but carries a '..' segment is refused outright (traversal-shaped, not merely relative)", () => {
+    const git = makeGitRunner({});
+    const gh = makeGhRunner("main");
+    const config: ShipConfig = { ...VALID_CONFIG, projectDir: "/tmp/fixture-project-dir/../etc" };
+    const result = validateShipConfig({ config, linear: VALID_LINEAR, git: git.run, gh: gh.run });
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.reason).toBe("project_dir_path_invalid");
+    expect(git.calls.length).toBe(0);
+    expect(gh.calls.length).toBe(0);
+  });
+
+  // `env_dir_path_invalid` was never exercised at all before this fix pass — only projectDir
+  // got an invalid-path test, leaving envDir's own reason code entirely unproven.
+  test("a relative envDir path is refused outright with reason env_dir_path_invalid (never previously exercised)", () => {
+    const git = makeGitRunner({});
+    const gh = makeGhRunner("main");
+    const config: ShipConfig = { ...VALID_CONFIG, envDir: "relative/env" };
+    const result = validateShipConfig({ config, linear: VALID_LINEAR, git: git.run, gh: gh.run });
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.reason).toBe("env_dir_path_invalid");
+    expect(git.calls.length).toBe(0);
+    expect(gh.calls.length).toBe(0);
+  });
+
+  test("an envDir path that is absolute but carries a '..' segment is refused with reason env_dir_path_invalid", () => {
+    const git = makeGitRunner({});
+    const gh = makeGhRunner("main");
+    const config: ShipConfig = { ...VALID_CONFIG, envDir: "/tmp/fixture-env-dir/../etc" };
+    const result = validateShipConfig({ config, linear: VALID_LINEAR, git: git.run, gh: gh.run });
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.reason).toBe("env_dir_path_invalid");
     expect(git.calls.length).toBe(0);
     expect(gh.calls.length).toBe(0);
   });
@@ -490,5 +577,57 @@ describe("CLI end-to-end: every misuse case exits non-zero with no stdout", () =
     expect(out).toBe("");
     expect(err.length).toBeGreaterThan(0);
     rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+// Fix pass 2 (Minor): main() is fully dependency-injectable — argv/env/cwd, the config read,
+// stdin, git/gh, and the final stdout write all default to the real implementation but can be
+// overridden. This is what lets the genuine SUCCESS path (the one path that reaches the final
+// `writeStdout` call) be driven entirely in-process, deterministically — no subprocess, no
+// mutating global `process.argv`/`PATH`, no EPIPE-via-pipe-race flakiness.
+describe("main() — CLI entry, fully injectable (Minor fix pass 2)", () => {
+  function happyDeps(overrides: Partial<MainDeps> = {}): MainDeps {
+    const { git, gh } = happyRunners();
+    return {
+      argv: ["validate", "--config", "/tmp/whatever.json"],
+      env: {},
+      cwd: "/tmp",
+      readConfig: () => JSON.stringify(VALID_CONFIG),
+      readStdin: async () => JSON.stringify(VALID_LINEAR),
+      git: git.run,
+      gh: gh.run,
+      writeStderr: () => {},
+      ...overrides,
+    };
+  }
+
+  test("sanity: the injected happy path genuinely reaches the end — returns 0 and writes the resolved JSON", async () => {
+    let written = "";
+    const code = await main(happyDeps({ writeStdout: (s) => { written += s; } }));
+    expect(code).toBe(0);
+    expect(JSON.parse(written).repo).toBe("acme/widgets");
+  });
+
+  // The whole point of the `writeStdout` seam: proves main()'s own promise genuinely REJECTS
+  // (the throw is not swallowed internally) when the final write fails — e.g. EPIPE from a
+  // consuming `jq` dying early. This is exactly why the top-level `.catch` wired at
+  // `if (import.meta.main)` is load-bearing, not decoration; see the source-anchored test
+  // below for proof that wiring actually exists in the shipped file.
+  test("main()'s promise REJECTS (is not swallowed) when the final stdout write throws", async () => {
+    const boom = new Error("EPIPE: write failed");
+    await expect(main(happyDeps({ writeStdout: () => { throw boom; } }))).rejects.toThrow("EPIPE");
+  });
+
+  // Source-anchored: proves the REAL shipped entry point actually wires a `.catch` onto
+  // `main().then(...)`, not merely that main() itself can reject in the abstract (proven
+  // above). Without this, an unexpected throw becomes an unhandled promise rejection instead
+  // of the named refusal this pins.
+  test("the real CLI entry point wires .catch onto main().then(...) (source-anchored)", () => {
+    const txt = readFileSync(join(import.meta.dir, "ship-config.ts"), "utf8");
+    const entryStart = txt.indexOf("if (import.meta.main)");
+    expect(entryStart, "'if (import.meta.main)' entry point not found").toBeGreaterThan(-1);
+    const entry = txt.slice(entryStart);
+    expect(entry).toMatch(/main\(\)\s*\.then\(\(code\)\s*=>\s*process\.exit\(code\)\)\s*\.catch\(/);
+    expect(entry).toContain("process.exit(1)");
   });
 });

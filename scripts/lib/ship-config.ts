@@ -158,10 +158,6 @@ function normalizeRemote(url: string): string {
     .replace(/\.git$/, "");
 }
 
-function stripTrailingSlash(p: string): string {
-  return p.length > 1 && p.endsWith("/") ? p.slice(0, -1) : p;
-}
-
 // A relative path, or any path carrying a literal `..` segment, is refused outright — never
 // resolved against a runner. `path.isAbsolute` alone would accept `/a/../b`, which is
 // absolute but still path-traversal-shaped, so the segment check is independent of it.
@@ -240,9 +236,14 @@ export function validateShipConfig({ config, linear, git, gh }: ValidateInput): 
   }
   const envDirRemote = normalizeRemote(envRemoteRes.stdout);
 
-  // Assertion 2, path-equality half: normalized absolute paths (trailing slash stripped).
-  const normProjectDir = stripTrailingSlash(resolve(config.projectDir));
-  const normEnvDir = stripTrailingSlash(resolve(config.envDir));
+  // Assertion 2, path-equality half: normalized absolute paths. `resolve()` alone already
+  // strips any trailing slash (verified: `resolve("/tmp/a/b/") === resolve("/tmp/a/b")`), so
+  // there is no separate trailing-slash-stripping step here — one used to exist as dead code
+  // (Minor fix pass 2: `stripTrailingSlash` was applied AFTER `resolve()` had already
+  // normalized its input, so it could never observe a trailing slash; deleted rather than
+  // pinned with a fixture that would only prove `resolve()`'s own behavior).
+  const normProjectDir = resolve(config.projectDir);
+  const normEnvDir = resolve(config.envDir);
   if (normProjectDir === normEnvDir) {
     return { ok: false, reason: "project_dir_equals_env_dir", detail: normProjectDir };
   }
@@ -311,6 +312,11 @@ export function validateShipConfig({ config, linear, git, gh }: ValidateInput): 
 // Locked 17: there is NO parent-directory probing here or anywhere else in this module — an
 // empty-string env var falls back to the cwd-relative default rather than producing a bare
 // (and therefore wrong) relative path.
+//
+// Cross-reference (Minor, fix pass 2): `commands/drawbar-ship.md`'s Preflight section
+// duplicates this exact default via `CONFIG="${DRAWBAR_SHIP_CONFIG:-$PWD/.drawbar/ship.config.json}"`
+// (bash has no way to call into this TS module for the fallback). Keep both in sync if the
+// default location or the env-var name ever changes.
 export function resolveConfigPath(env: Record<string, string | undefined>, cwd: string): string {
   const fromEnv = env.DRAWBAR_SHIP_CONFIG;
   if (typeof fromEnv === "string" && fromEnv.length > 0) return fromEnv;
@@ -379,25 +385,55 @@ function isLinearFacts(v: unknown): v is LinearFacts {
   );
 }
 
-async function main(): Promise<number> {
-  const [cmd, ...rest] = process.argv.slice(2);
+// Every real I/O boundary is injectable, defaulting to the real implementation — the same
+// shape as `Runner` (`git`/`gh`) already established above, extended to cover argv/env/cwd,
+// the config-file read, stdin, and the final stdout write. This is what lets a test drive
+// main() all the way to a genuine success (or a genuine mid-flight throw) entirely in-process,
+// without spawning a subprocess or mutating global `process.argv`/`PATH`. `writeStdout` in
+// particular exists so a test can prove main()'s promise genuinely REJECTS when the final
+// write fails (e.g. EPIPE from a consuming `jq` dying early) — which is exactly why the
+// `.catch` at the bottom of this file is load-bearing, not decoration.
+export interface MainDeps {
+  argv?: string[];
+  env?: Record<string, string | undefined>;
+  cwd?: string;
+  readConfig?: (path: string) => string;
+  readStdin?: () => Promise<string>;
+  git?: Runner;
+  gh?: Runner;
+  writeStdout?: (s: string) => void;
+  writeStderr?: (s: string) => void;
+}
+
+export async function main(deps: MainDeps = {}): Promise<number> {
+  const argv = deps.argv ?? process.argv.slice(2);
+  const env = deps.env ?? process.env;
+  const cwd = deps.cwd ?? process.cwd();
+  const readConfig = deps.readConfig ?? ((p: string) => readFileSync(p, "utf8"));
+  const readStdin = deps.readStdin ?? (() => new Response(Bun.stdin.stream()).text());
+  const git = deps.git ?? makeRealRunner("git");
+  const gh = deps.gh ?? makeRealRunner("gh");
+  const writeStdout = deps.writeStdout ?? ((s: string) => { process.stdout.write(s); });
+  const writeStderr = deps.writeStderr ?? ((s: string) => { process.stderr.write(s); });
+
+  const [cmd, ...rest] = argv;
   if (cmd !== "validate") {
-    process.stderr.write("usage: ship-config.ts validate [--config <path>]\n");
+    writeStderr("usage: ship-config.ts validate [--config <path>]\n");
     return 1;
   }
 
   const parsedArgs = parseCliArgs(rest);
   if (!parsedArgs.ok) {
-    process.stderr.write(`refused: ${parsedArgs.error}\n`);
+    writeStderr(`refused: ${parsedArgs.error}\n`);
     return 1;
   }
-  const configPath = parsedArgs.config ?? resolveConfigPath(process.env, process.cwd());
+  const configPath = parsedArgs.config ?? resolveConfigPath(env, cwd);
 
   let configText: string;
   try {
-    configText = readFileSync(configPath, "utf8");
+    configText = readConfig(configPath);
   } catch {
-    process.stderr.write(
+    writeStderr(
       `refused: config file not found or unreadable: ${configPath} — copy .drawbar/ship.config.example.json and fill in real values\n`,
     );
     return 1;
@@ -405,15 +441,15 @@ async function main(): Promise<number> {
 
   const parsedConfig = parseShipConfig(configText);
   if (!parsedConfig.ok) {
-    process.stderr.write(`refused: config ${parsedConfig.reason} (${parsedConfig.detail})\n`);
+    writeStderr(`refused: config ${parsedConfig.reason} (${parsedConfig.detail})\n`);
     return 1;
   }
 
   let stdinText: string;
   try {
-    stdinText = await new Response(Bun.stdin.stream()).text();
+    stdinText = await readStdin();
   } catch {
-    process.stderr.write("refused: could not read Linear facts from stdin\n");
+    writeStderr("refused: could not read Linear facts from stdin\n");
     return 1;
   }
 
@@ -421,29 +457,39 @@ async function main(): Promise<number> {
   try {
     const raw: unknown = JSON.parse(stdinText);
     if (!isLinearFacts(raw)) {
-      process.stderr.write('refused: stdin is not valid Linear facts JSON ({"teams":[...],"statuses":[{"name":...,"type":...}]})\n');
+      writeStderr('refused: stdin is not valid Linear facts JSON ({"teams":[...],"statuses":[{"name":...,"type":...}]})\n');
       return 1;
     }
     linear = raw;
   } catch {
-    process.stderr.write("refused: stdin is not valid JSON\n");
+    writeStderr("refused: stdin is not valid JSON\n");
     return 1;
   }
 
   const result = validateShipConfig({
     config: parsedConfig.config,
     linear,
-    git: makeRealRunner("git"),
-    gh: makeRealRunner("gh"),
+    git,
+    gh,
   });
   if (!result.ok) {
-    process.stderr.write(`refused: ${result.reason}${result.detail ? ` (${result.detail})` : ""}\n`);
+    writeStderr(`refused: ${result.reason}${result.detail ? ` (${result.detail})` : ""}\n`);
     return 1;
   }
-  process.stdout.write(JSON.stringify(result.resolved) + "\n");
+  writeStdout(JSON.stringify(result.resolved) + "\n");
   return 0;
 }
 
 if (import.meta.main) {
-  main().then((code) => process.exit(code));
+  // MUST-CHECK (Minor, fix pass 2): without `.catch`, an unexpected throw anywhere in
+  // main() not already caught internally (e.g. EPIPE when a consuming `jq` dies early on the
+  // final stdout write) becomes an UNHANDLED PROMISE REJECTION instead of a named refusal —
+  // see the `MainDeps.writeStdout` seam above and its regression test for proof main()
+  // genuinely rejects in that case.
+  main()
+    .then((code) => process.exit(code))
+    .catch((err) => {
+      process.stderr.write(`refused: unexpected error: ${err instanceof Error ? err.message : String(err)}\n`);
+      process.exit(1);
+    });
 }

@@ -1,6 +1,6 @@
 ---
 name: drawbar-ship
-description: Unattended overnight burn-down of a Linear parent's stories — delegate each story to an Opus story-lead, then merge, set Pre-QA, sync knowledge, and move to the next. One story per invocation; drive it with /loop.
+description: Unattended overnight burn-down of a Linear parent's stories — delegate each story to an Opus story-lead, then merge, set the configured merged-but-not-QA'd status, sync knowledge, and move to the next. One story per invocation; drive it with /loop.
 argument-hint: "<TEAM>-#### parent issue id, or a single story id"
 ---
 
@@ -45,7 +45,26 @@ command -v gh        >/dev/null && gh auth status >/dev/null 2>&1 || { echo "gh 
 # directory, and no probing for a sibling knowledge-repo checkout anywhere in this file —
 # both are gone for good; every downstream value comes from the validated config instead.
 CONFIG="${DRAWBAR_SHIP_CONFIG:-$PWD/.drawbar/ship.config.json}"
+# Cross-reference: this fallback duplicates ship-config.ts's `resolveConfigPath` — keep both
+# in sync if the default location or the env-var name ever changes.
 [ -f "$CONFIG" ] || { echo "FATAL: no config at $CONFIG — copy .drawbar/ship.config.example.json, fill in real values, and either place the copy there or set DRAWBAR_SHIP_CONFIG to point at it."; exit 1; }
+
+# MUST-CHECK config-file-must-not-be-tracked-by-git (Important 8, fix pass 2): the mechanism
+# this replaced read its config from EXPORTED ENV VARS — only the operator's own shell could
+# set those. $CONFIG is now a file inside a working directory, and any repository can carry
+# one in its tree (`.drawbar/` is an established convention adopting projects commit); a
+# contributor PR adding `.drawbar/ship.config.json` is easy to miss, and the operator's next
+# run from that repo root loads it with no prompt. The repo-anchor guard alone does not stop
+# this — `repo` matching projectDir's remote says nothing about whether the CONFIG FILE ITSELF
+# was planted. A planted config still controls requiredChecks (a trivially-passing name
+# neuters the merge gate), envDir (where $KB and the run-state file get written), and team
+# or mergedStatus. Enforce the invariant the `.gitignore` line already encodes: a real ship
+# config is NEVER tracked by git. Fails closed on a genuine tracked hit; a `git` failure
+# (e.g. $CONFIG's directory isn't a repo at all) is not itself the vulnerability this guards
+# against, so it does not need special-casing here.
+git -C "$(dirname "$CONFIG")" ls-files --error-unmatch "$CONFIG" >/dev/null 2>&1 \
+  && { echo "FATAL: $CONFIG is tracked by git — a committed ship config is never trusted. Untrack it (git rm --cached) and keep it out of version control."; exit 1; } \
+  || true
 
 # Fetch the Linear facts THIS AGENT SESSION can see via MCP — ship-config.ts has no Linear
 # tools of its own, only the session driving this command does — and hand them to the
@@ -69,13 +88,17 @@ ENV_DIR=$(echo "$RESOLVED" | jq -r '.envDir // empty')
 PROJECT_DIR=$(echo "$RESOLVED" | jq -r '.projectDir // empty')
 REPO=$(echo "$RESOLVED" | jq -r '.repo // empty')
 BASE_BRANCH=$(echo "$RESOLVED" | jq -r '.baseBranch // empty')
+# Fix pass 2, Important 4: derived here so §5 can set the story to the CONFIGURED
+# mergedStatus rather than a hardcoded literal — `mergedStatus` was otherwise a dead config
+# field, validated and carried through `resolved_config` but never consumed anywhere.
+MERGED_STATUS=$(echo "$RESOLVED" | jq -r '.mergedStatus // empty')
 
 # MUST-CHECK repo-anchor-guard-is-what-gates-an-unfixed-vulnerability: quote every one of
 # these, and assert each is non-empty and NOT the literal string "null" before anything below
 # depends on it — jq's `// empty` already collapses a JSON `null` to `""`, but a value that
 # somehow arrives as the STRING "null" (a malformed `resolved_config`) must not silently
 # satisfy a downstream substring/case guard either.
-for v in ENV_DIR PROJECT_DIR REPO BASE_BRANCH; do
+for v in ENV_DIR PROJECT_DIR REPO BASE_BRANCH MERGED_STATUS; do
   val="${!v}"
   [ -n "$val" ] && [ "$val" != "null" ] || { echo "FATAL: $v is empty or null after validation — refusing."; exit 1; }
 done
@@ -175,8 +198,8 @@ Then dispatch **one** `drawbar-story-lead` agent (Opus). The brief must carry:
 
 - the story id, full description, and acceptance criteria
 - every `Locked` decision and `MUST-CHECK:` verbatim
-- `$KB` (absolute), `$PROJECT_DIR`, `$REPO`, and the branch name — prefer Linear's
-  `gitBranchName` from `get_issue`, which guarantees the PR auto-links
+- `$KB` (absolute), `$PROJECT_DIR`, `$REPO`, `$BASE_BRANCH`, and the branch name — prefer
+  Linear's `gitBranchName` from `get_issue`, which guarantees the PR auto-links
 - that it must **not** merge and has no Linear authority
 
 It returns the JSON report in its §8: `{status, pr, branch, mutation_pairs, out_of_scope,
@@ -202,6 +225,13 @@ Not added to the snapshot — they wait for the next run.
 ```bash
 STORY="<TEAM>-####"      # the story this iteration is shipping
 PR="<from the report>"
+# $RESOLVED (Preflight's validated resolved_config JSON) is REQUIRED below. This fence is a
+# SEPARATE bash invocation from Preflight's — nothing carries a plain shell assignment
+# forward across two `Bash` tool calls, the same reason STORY and PR are re-declared above
+# rather than assumed to still be set. Carry the exact JSON Preflight produced into this
+# fence (re-run Preflight in this session first if it is not at hand) before anything below
+# runs:
+RESOLVED="<Preflight's resolved_config JSON>"
 
 # CI actually passed. The story-lead waited for checks to CONCLUDE; concluded is not green.
 bad=$(gh pr checks -R "$REPO" "$PR" --json bucket \
@@ -212,6 +242,17 @@ bad=$(gh pr checks -R "$REPO" "$PR" --json bucket \
 # and landed in a passing bucket — a check that never ran (renamed, or the workflow that
 # reports it never fired) must refuse, not be silently waved through just because nothing
 # failed or cancelled.
+#
+# MUST-CHECK vacuous-assertion-needs-preseed-state: an empty or unset $RESOLVED makes
+# `echo "$RESOLVED" | jq -r '.requiredChecks[]'` emit nothing, so the `while` body below would
+# execute zero times and the loop would exit 0 — silently skipping the entire gate, with no
+# output and no refusal, straight through to `gh pr merge`. Assert BOTH that $RESOLVED is
+# non-empty AND that it actually yields at least one check, before the loop is trusted at all
+# — the same shape as the `lc()` self-test and the `STORY` and `BASE_BRANCH` asserts below.
+[ -n "$RESOLVED" ] || { echo "FATAL: RESOLVED unset — requiredChecks gate would be vacuous"; exit 1; }
+REQUIRED_COUNT=$(echo "$RESOLVED" | jq -r '.requiredChecks | length' 2>/dev/null)
+case "$REQUIRED_COUNT" in ''|*[!0-9]*|0) echo "FATAL: RESOLVED carries no requiredChecks — requiredChecks gate would be vacuous"; exit 1 ;; esac
+
 # `while read` + process substitution, NOT `mapfile`/`readarray` — those need bash 4+, and
 # the `bash` an operator actually has on PATH (notably macOS's shipped `/bin/bash`) is
 # routinely 3.2.
@@ -222,7 +263,15 @@ while IFS= read -r check; do
   # into the filter.
   seen=$(gh pr checks -R "$REPO" "$PR" --json name,bucket \
          | jq --arg n "$check" '[.[] | select(.name==$n and .bucket=="pass")] | length')
-  [ "$seen" != "0" ] || { echo "REFUSING: required check '$check' never ran / did not pass"; exit 1; }
+  # Fail-CLOSED direction: `$seen` must be a genuine positive integer. Empty or non-numeric
+  # (e.g. `gh` itself failed mid-loop — a secondary rate limit, a 502, a token expiring
+  # partway through the per-check calls) is refused as unreadable, distinct from "read fine,
+  # zero matches" — conflating the two would silently treat a transient infra failure as a
+  # passed check (`[ "$seen" != "0" ]` was that exact fail-OPEN bug: empty "" != "0" is true).
+  case "$seen" in
+    ''|*[!0-9]*) echo "REFUSING: required check '$check' status could not be read (gh or jq returned '$seen')"; exit 1 ;;
+  esac
+  [ "$seen" -gt 0 ] || { echo "REFUSING: required check '$check' never ran / did not pass"; exit 1; }
 done < <(echo "$RESOLVED" | jq -r '.requiredChecks[]')
 
 # Identity: Linear ids are uppercase (<TEAM>-####), the branches its GitHub integration
@@ -253,16 +302,22 @@ force-push, never touch `main` directly.
 > itself — sequential-only (see the Hard rules) is what keeps that true regardless of
 > whatever the target repo's own CI does on merge to its default branch.
 
-## 5. Linear status — `Pre-QA`, and verify it stuck
+## 5. Linear status — the configured `$MERGED_STATUS`, and verify it stuck
 
-Set the story to **`Pre-QA`** (`type: started`: merged, implementation complete, not QA'd).
+Set the story to **`$MERGED_STATUS`** — the value Preflight resolved from the config's
+`mergedStatus` field (`type: started`: merged, implementation complete, not QA'd). This is
+workspace-configured, not a fixed literal: the example config's own placeholder for the
+field (`<merged-but-not-QAd status name>`) is there because it varies per adopting team.
+`validateShipConfig`'s `type: started` assertion (Locked-18 Assertion 4, run inside
+`ship-config.ts` during Preflight) is what mechanically guarantees `$MERGED_STATUS` can
+never be a `completed`-type status — it is refused at Preflight, before this step ever runs.
 
 **Never** `Done`, `Ready For QA`, `Ready for Rollout`, or `Rolled Out` — human- and
 QA-owned. Never call `save_issue` with any `completed`-type status.
 
-**Then re-read the issue and assert `status == "Pre-QA"`.** If it moved, notify loudly and
-halt: either an integration is overwriting you, or something in the run has Linear
-authority it should not.
+**Then re-read the issue and assert `status == "$MERGED_STATUS"`.** If it moved, notify
+loudly and halt: either an integration is overwriting you, or something in the run has
+Linear authority it should not.
 
 > Sibling stories <TEAM>-D1 and <TEAM>-D2 sit at `Done`, having gone `In Progress → Done`
 > on 2026-07-27 without passing through `Pre-QA`. **Those were completed by an earlier,
@@ -368,6 +423,16 @@ then `ScheduleWakeup({stop: true})`.
   project checkout — `$ENV_DIR`, `$PROJECT_DIR`, `$REPO`, `$BASE_BRANCH` and `$KB` all come
   from the validated config, resolved absolutely, regardless of the directory you run from.
 - Code git work targets `$PROJECT_DIR`; the knowledge sync targets `$ENV_DIR`. Separate repos.
+- **A real ship config must never be tracked by git** (Important 8, fix pass 2). Preflight
+  refuses outright if `$CONFIG` is tracked in its own repository — the config now lives as a
+  file inside a working directory rather than exported env vars, and any repository's tree
+  (including a contributor PR) can otherwise plant one. Keep it untracked, as `.gitignore`
+  already enforces for the default path.
+- **Ship-config refusal text must be paraphrased, never pasted**, into a KB entry or a Linear
+  comment. Refusal `detail` strings echo absolute paths and the real repo slug, and the
+  slug leak-scan rule is deliberately out of scope for `knowledge.jsonl` (prose there produces
+  too many false-positive "word / word" matches to allowlist) — pasting a refusal verbatim
+  would leak it unscanned.
 - Session must survive the night: `caffeinate -is`.
 - Permissions must be pre-approved or the loop stalls at the first `gh pr merge` until
   morning. Run `/fewer-permission-prompts` first.

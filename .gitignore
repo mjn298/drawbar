@@ -4,5 +4,7 @@ node_modules/
 
 # The operator's real ship config carries real repo/team/status values — never tracked.
 # .drawbar/ship.config.example.json (placeholders only) IS tracked; this pattern is
-# specific enough that it does not shadow it.
-.drawbar/ship.config.json
+# specific enough that it does not shadow it. Leading `**/` (not a bare `.drawbar/...`,
+# which git would anchor to the repo root only) so a nested `sub/.drawbar/ship.config.json`
+# is ignored too — not just the repo-root copy.
+**/.drawbar/ship.config.json
