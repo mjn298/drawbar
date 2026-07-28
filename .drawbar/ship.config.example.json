@@ -1,0 +1,9 @@
+{
+  "envDir": "/absolute/path/to/knowledge-repo",
+  "projectDir": "/absolute/path/to/code-repo",
+  "repo": "<org>/<repo>",
+  "team": "<TEAM>",
+  "baseBranch": "main",
+  "mergedStatus": "<merged-but-not-QAd status name>",
+  "requiredChecks": ["<required-check-name>"]
+}

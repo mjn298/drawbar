@@ -1,8 +1,9 @@
 import { test, expect, describe } from "bun:test";
-import { readFileSync, mkdtempSync, writeFileSync, chmodSync, existsSync } from "node:fs";
+import { readFileSync, mkdtempSync, writeFileSync, chmodSync, existsSync, mkdirSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { parseShipConfig, validateShipConfig, type Runner } from "./lib/ship-config";
 
 const root = join(import.meta.dir, "..");
 
@@ -103,6 +104,12 @@ describe("ported files carry no private-org identifiers (leak regression)", () =
     "scripts/lib/coderabbit.ts",
     "scripts/lib/coderabbit.test.ts",
     "scripts/lib/fixtures/f14-historical-cr-ready.sh",
+    // PCO-348 (S3): the ship-config module, its tests, and the committed example config —
+    // this list is data-driven precisely so S3 could extend it here without touching the
+    // test body below.
+    ".drawbar/ship.config.example.json",
+    "scripts/lib/ship-config.ts",
+    "scripts/lib/ship-config.test.ts",
   ];
   const ALL_FILES = [...DOC_FILES, ...SELF_FILES, ...NEW_PUBLIC_FILES];
 
@@ -148,13 +155,22 @@ describe("ported files carry no private-org identifiers (leak regression)", () =
       // test below). Every slug found must be either placeholder-form (starts with `<`) or
       // on the reviewed allowlist of benign non-placeholder matches enumerated below.
       //
-      // Scoped to DOC_FILES only: knowledge.jsonl and this test file are prose-heavy and
-      // produce large numbers of ordinary word "/" word matches (e.g. "and/or",
-      // "archive/compact") that are not GitHub slugs at all — an allowlist covering those
-      // would be unbounded and would stop being reviewable. The issue-id, filename,
-      // absolute-path, and literal-vocabulary rules above/below still cover those two files.
+      // Scoped to DOC_FILES plus `.drawbar/ship.config.example.json` (Important 9, fix pass
+      // 2): knowledge.jsonl and this test file are prose-heavy and produce large numbers of
+      // ordinary word "/" word matches (e.g. "and/or", "archive/compact") that are not GitHub
+      // slugs at all — an allowlist covering those would be unbounded and would stop being
+      // reviewable. The issue-id, filename, absolute-path, and literal-vocabulary rules
+      // above/below still cover those two files. `ship-config.test.ts` is deliberately left
+      // OUT of this rule too — it legitimately carries fixture slugs (e.g. `acme/widgets`)
+      // and would need an unbounded allowlist, which MUST-CHECK
+      // leak-scan-self-reference-needs-per-rule-file-scope warns against. But
+      // `.drawbar/ship.config.example.json` WAS added to `NEW_PUBLIC_FILES` (so it is covered
+      // by the issue-id/yml/absolute-path rules above) without ever being added HERE — the
+      // one field in this repo specifically designed to hold an `<org>/<repo>` slug, and the
+      // most likely place for someone to "helpfully fill in" a real value, was unscanned by
+      // the one rule that would catch it.
       name: "concrete owner/repo GitHub slug not on the reviewed benign allowlist",
-      files: DOC_FILES,
+      files: [...DOC_FILES, ".drawbar/ship.config.example.json"],
       test: (txt) => {
         const slugCandidate = /(?<![\w/])[\w.<>-]+\/[\w.<>-]+(?![\w/])/g;
         // Every non-placeholder slug-shaped match currently in DOC_FILES, reviewed by hand
@@ -169,6 +185,18 @@ describe("ported files carry no private-org identifiers (leak regression)", () =
           "backend/security-touching",
           "Critical/Important",
           "head/statuses",
+          // PCO-348 (S3) additions — config-file paths, a prose word/word pair, and two
+          // in-repo file references, none an org/repo slug:
+          "drawbar/ship.config.json",
+          ".drawbar/ship.config.example.json",
+          "projectDir/envDir",
+          "substring/case",
+          "scripts/plugin.test.ts",
+          "commands/drawbar-ship.md",
+          // PCO-348 fix pass 2 (Important 8 security fix) additions — a leading-dot form of
+          // the config path (preceded by a backtick, so the leading "." isn't trimmed off the
+          // way it is at line 47), and a prose word/word pair. Neither is an org/repo slug.
+          ".drawbar/ship.config.json",
         ]);
         for (const line of txt.split("\n")) {
           for (const m of line.match(slugCandidate) ?? []) {
@@ -231,12 +259,13 @@ describe("ported files carry no private-org identifiers (leak regression)", () =
   }
 });
 
-describe("repo-identity preflight guard fails closed", () => {
-  // Extract the EXPECTED_REPO guard from the actual preflight bash block in the shipped
-  // doc, rather than hand-reimplementing it — a hand probe that drifts from the real
-  // source would defeat the point. See MUST-CHECK
-  // verification-harness-must-replicate-full-fixture.
-  function extractGuard(): string {
+// PCO-348 (S3): the EXPECTED_REPO env-var guard is gone — Locked 17 replaces it with a
+// config-driven preflight (no `$PWD`/parent-directory probing anywhere). This harness proves
+// the two bash-level guards that replaced it fail closed for real, extracted from the actual
+// shipped doc rather than hand-reimplemented — see MUST-CHECK
+// verification-harness-must-replicate-full-fixture.
+describe("config-driven preflight guard fails closed (PCO-348)", () => {
+  function preflightBlock(): string {
     const txt = readNonEmpty(join(root, "commands/drawbar-ship.md"));
     const sectionStart = txt.indexOf("## Preflight (halt on any failure)");
     expect(sectionStart).toBeGreaterThan(-1);
@@ -244,16 +273,50 @@ describe("repo-identity preflight guard fails closed", () => {
     const fenceEnd = txt.indexOf("```", fenceStart + 7);
     expect(fenceStart).toBeGreaterThan(-1);
     expect(fenceEnd).toBeGreaterThan(fenceStart);
-    const block = txt.slice(fenceStart + 7, fenceEnd);
-    const guardStart = block.indexOf("# EXPECTED_REPO");
-    expect(guardStart).toBeGreaterThan(-1);
-    const esacIdx = block.indexOf("esac", guardStart);
-    expect(esacIdx).toBeGreaterThan(-1);
-    return block.slice(guardStart, esacIdx + "esac".length);
+    return txt.slice(fenceStart + 7, fenceEnd);
   }
 
-  async function runGuard(env: Record<string, string>): Promise<{ code: number; output: string }> {
-    const script = extractGuard();
+  // The CONFIG-file-existence guard: resolving `$CONFIG` and refusing if it's absent. Never
+  // touches ship-config.ts / bun / gh at all, so this is testable in complete isolation.
+  function extractConfigFileGuard(): string {
+    const block = preflightBlock();
+    const guardStart = block.indexOf('CONFIG="${DRAWBAR_SHIP_CONFIG');
+    expect(guardStart, "CONFIG resolution not found in Preflight").toBeGreaterThan(-1);
+    const guardEnd = block.indexOf("exit 1; }", guardStart);
+    expect(guardEnd, "config-file-existence guard's exit not found").toBeGreaterThan(guardStart);
+    return block.slice(guardStart, guardEnd + "exit 1; }".length);
+  }
+
+  // Fix pass 2, Important 8: the tracked-config security guard. Bounded by its own MUST-CHECK
+  // comment start and the closing `exit 1; }` of its refusal, mirroring extractConfigFileGuard
+  // above — extracted for real from the shipped doc, never hand-reimplemented.
+  function extractTrackedConfigGuard(): string {
+    const block = preflightBlock();
+    const guardStart = block.indexOf("git -C \"$(dirname \"$CONFIG\")\" ls-files --error-unmatch");
+    expect(guardStart, "tracked-config guard not found in Preflight").toBeGreaterThan(-1);
+    // Ends at `|| true` (not merely `exit 1; }`) — that trailing clause is what keeps the
+    // guard's OWN exit status 0 on the untracked/pass path when it is run standalone (in the
+    // real fence, later commands overwrite $? regardless, same as the documented `[ "$seen" =
+    // "0" ]` asymmetry elsewhere in this file).
+    const guardEnd = block.indexOf("|| true", guardStart);
+    expect(guardEnd, "tracked-config guard's trailing `|| true` not found").toBeGreaterThan(guardStart);
+    return block.slice(guardStart, guardEnd + "|| true".length);
+  }
+
+  // The derive-from-$RESOLVED guard: bounded by explicit marker comments (an intentional
+  // test seam, not incidental) so this can be extracted and run with a hand-built $RESOLVED
+  // JSON payload supplied from outside — proving the REAL fail-closed assert loop, not a
+  // reimplementation of it, without needing a real ship-config.ts invocation.
+  function extractDeriveGuard(): string {
+    const txt = readNonEmpty(join(root, "commands/drawbar-ship.md"));
+    const start = txt.indexOf("# --- derive from the resolved config");
+    expect(start, "derive-from-resolved-config marker not found").toBeGreaterThan(-1);
+    const end = txt.indexOf("# --- end derive from the resolved config", start);
+    expect(end, "end-derive marker not found").toBeGreaterThan(start);
+    return txt.slice(start, end);
+  }
+
+  async function runScript(script: string, env: Record<string, string>): Promise<{ code: number; output: string }> {
     const proc = Bun.spawn(["bash", "-c", script], {
       env: { PATH: process.env.PATH ?? "", ...env },
       stdout: "pipe",
@@ -265,27 +328,265 @@ describe("repo-identity preflight guard fails closed", () => {
     return { code, output: out + err };
   }
 
-  test("refuses when EXPECTED_REPO is unset", async () => {
-    const { code, output } = await runGuard({ REPO: "org/repo" });
+  // Minor fix pass 2: renamed from "refuses when the config file is absent, pointing at the
+  // example file" — that name claimed a refusal but the body only asserted a doc substring,
+  // testing no refusal at all. Folded into the real refusal test below instead, which now
+  // covers both the exit behavior AND the example-file pointer in the message.
+  test("refuses (for real) when the resolved config file path does not exist, and points at the example file", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "drawbar-preflight-cfg-"));
+    const { code, output } = await runScript(extractConfigFileGuard(), {
+      DRAWBAR_SHIP_CONFIG: join(dir, "does-not-exist.json"),
+    });
     expect(code).not.toBe(0);
-    expect(output).toContain("EXPECTED_REPO is unset");
+    expect(output).toContain("no config at");
+    expect(output).toContain(".drawbar/ship.config.example.json");
   });
 
-  test("refuses when EXPECTED_REPO is set but empty", async () => {
-    const { code, output } = await runGuard({ REPO: "org/repo", EXPECTED_REPO: "" });
-    expect(code).not.toBe(0);
-    expect(output).toContain("EXPECTED_REPO is unset");
-  });
-
-  test("refuses when REPO does not match a configured EXPECTED_REPO", async () => {
-    const { code, output } = await runGuard({ REPO: "someone-else/other-repo", EXPECTED_REPO: "org/repo" });
-    expect(code).not.toBe(0);
-    expect(output).toContain("expected repo");
-  });
-
-  test("passes when REPO matches a configured EXPECTED_REPO", async () => {
-    const { code } = await runGuard({ REPO: "org/repo", EXPECTED_REPO: "org/repo" });
+  test("passes (for real) when the resolved config file exists", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "drawbar-preflight-cfg-"));
+    const cfgPath = join(dir, "ship.config.json");
+    writeFileSync(cfgPath, "{}");
+    const { code } = await runScript(extractConfigFileGuard(), { DRAWBAR_SHIP_CONFIG: cfgPath });
     expect(code).toBe(0);
+  });
+
+  // Fix pass 2, Important 8 (security): a ship config is never read from EXPORTED ENV VARS
+  // anymore — it's a file inside the working directory, which any repository's own tree can
+  // carry (`.drawbar/` is an established convention adopting projects commit). A contributor
+  // PR adding `.drawbar/ship.config.json` is easy to miss, and a planted config still
+  // controls requiredChecks, envDir (where $KB and the run-state file get written), and
+  // team/mergedStatus even though the repo-anchor guard holds. Enforce the invariant the
+  // .gitignore line already encodes: a real ship config is NEVER tracked by git. Both cases
+  // use a REAL temporary git repo, not a stubbed `git`.
+  function initRealGitRepo(): string {
+    const dir = mkdtempSync(join(tmpdir(), "drawbar-tracked-cfg-"));
+    Bun.spawnSync(["git", "init", "-q"], { cwd: dir });
+    Bun.spawnSync(["git", "config", "user.email", "test@example.com"], { cwd: dir });
+    Bun.spawnSync(["git", "config", "user.name", "test"], { cwd: dir });
+    return dir;
+  }
+
+  test("refuses (for real, against a real temp git repo) when the config file IS tracked by git", async () => {
+    const dir = initRealGitRepo();
+    const cfgDir = join(dir, ".drawbar");
+    mkdirSync(cfgDir, { recursive: true });
+    const cfgPath = join(cfgDir, "ship.config.json");
+    writeFileSync(cfgPath, "{}");
+    Bun.spawnSync(["git", "add", "ship.config.json"], { cwd: cfgDir });
+    Bun.spawnSync(["git", "commit", "-q", "-m", "add config"], { cwd: dir });
+    const { code, output } = await runScript(`CONFIG='${cfgPath}'\n` + extractTrackedConfigGuard(), {});
+    expect(code).not.toBe(0);
+    expect(output).toContain("tracked by git");
+  });
+
+  test("passes (for real, against a real temp git repo) when the config file is NOT tracked by git", async () => {
+    const dir = initRealGitRepo();
+    const cfgDir = join(dir, ".drawbar");
+    mkdirSync(cfgDir, { recursive: true });
+    const cfgPath = join(cfgDir, "ship.config.json");
+    writeFileSync(cfgPath, "{}"); // deliberately never `git add`ed
+    const { code } = await runScript(`CONFIG='${cfgPath}'\n` + extractTrackedConfigGuard(), {});
+    expect(code).toBe(0);
+  });
+
+  test("refuses (for real) when the resolved repo identity is empty", async () => {
+    const script =
+      `RESOLVED='{"envDir":"/tmp/e","projectDir":"/tmp/p","repo":"","baseBranch":"main"}'\n` + extractDeriveGuard();
+    const { code, output } = await runScript(script, {});
+    expect(code).not.toBe(0);
+    expect(output).toContain("REPO is empty or null");
+  });
+
+  test("refuses (for real) when the resolved repo identity is the literal string null", async () => {
+    const script =
+      `RESOLVED='{"envDir":"/tmp/e","projectDir":"/tmp/p","repo":null,"baseBranch":"main"}'\n` + extractDeriveGuard();
+    const { code, output } = await runScript(script, {});
+    expect(code).not.toBe(0);
+    expect(output).toContain("REPO is empty or null");
+  });
+
+  test("refuses (for real) when the resolved base branch is missing entirely", async () => {
+    const script = `RESOLVED='{"envDir":"/tmp/e","projectDir":"/tmp/p","repo":"acme/widgets"}'\n` + extractDeriveGuard();
+    const { code, output } = await runScript(script, {});
+    expect(code).not.toBe(0);
+    expect(output).toContain("BASE_BRANCH is empty or null");
+  });
+
+  // Fix pass 2, Important 7: a mutation narrowing the assert loop from
+  // `for v in ENV_DIR PROJECT_DIR REPO BASE_BRANCH` to `for v in REPO BASE_BRANCH` left the
+  // suite fully green — $ENV_DIR is what feeds $KB and the whole step-6 knowledge sync
+  // (`cd "$ENV_DIR"`), so an unguarded ENV_DIR matters most of all four. Only REPO and
+  // BASE_BRANCH had empty/null coverage before this fix pass; ENV_DIR and PROJECT_DIR did not.
+  test("refuses (for real) when the resolved envDir is empty (Important 7)", async () => {
+    const script =
+      `RESOLVED='{"envDir":"","projectDir":"/tmp/p","repo":"acme/widgets","baseBranch":"main"}'\n` + extractDeriveGuard();
+    const { code, output } = await runScript(script, {});
+    expect(code).not.toBe(0);
+    expect(output).toContain("ENV_DIR is empty or null");
+  });
+
+  test("refuses (for real) when the resolved envDir is the literal string null (Important 7)", async () => {
+    const script =
+      `RESOLVED='{"envDir":null,"projectDir":"/tmp/p","repo":"acme/widgets","baseBranch":"main"}'\n` + extractDeriveGuard();
+    const { code, output } = await runScript(script, {});
+    expect(code).not.toBe(0);
+    expect(output).toContain("ENV_DIR is empty or null");
+  });
+
+  test("refuses (for real) when the resolved projectDir is empty (Important 7)", async () => {
+    const script =
+      `RESOLVED='{"envDir":"/tmp/e","projectDir":"","repo":"acme/widgets","baseBranch":"main"}'\n` + extractDeriveGuard();
+    const { code, output } = await runScript(script, {});
+    expect(code).not.toBe(0);
+    expect(output).toContain("PROJECT_DIR is empty or null");
+  });
+
+  test("refuses (for real) when the resolved projectDir is the literal string null (Important 7)", async () => {
+    const script =
+      `RESOLVED='{"envDir":"/tmp/e","projectDir":null,"repo":"acme/widgets","baseBranch":"main"}'\n` + extractDeriveGuard();
+    const { code, output } = await runScript(script, {});
+    expect(code).not.toBe(0);
+    expect(output).toContain("PROJECT_DIR is empty or null");
+  });
+
+  // Important 4: $MERGED_STATUS must be derived and vacuity-guarded the same way as the other
+  // four resolved-config values — §5 parameterizes on it instead of hardcoding `Pre-QA`.
+  test("refuses (for real) when the resolved mergedStatus is missing entirely (Important 4)", async () => {
+    const script =
+      `RESOLVED='{"envDir":"/tmp/e","projectDir":"/tmp/p","repo":"acme/widgets","baseBranch":"main"}'\n` +
+      extractDeriveGuard();
+    const { code, output } = await runScript(script, {});
+    expect(code).not.toBe(0);
+    expect(output).toContain("MERGED_STATUS is empty or null");
+  });
+
+  test("passes (for real) on a well-formed resolved payload, deriving all five values plus $KB", async () => {
+    const script =
+      `RESOLVED='{"envDir":"/tmp/e","projectDir":"/tmp/p","repo":"acme/widgets","baseBranch":"main","mergedStatus":"Pre-QA"}'\n` +
+      extractDeriveGuard() +
+      `\necho "OK $ENV_DIR $PROJECT_DIR $REPO $BASE_BRANCH $MERGED_STATUS $KB"`;
+    const { code, output } = await runScript(script, {});
+    expect(code).toBe(0);
+    expect(output).toContain("OK /tmp/e /tmp/p acme/widgets main Pre-QA /tmp/e/.drawbar/memory");
+  });
+
+  test("Preflight never probes $PWD or a parent directory to discover the knowledge repo (Locked 17, AC L17)", () => {
+    const block = preflightBlock();
+    // The removed mechanism specifically: walking up from $PWD to a parent directory, and
+    // testing for a `.drawbar/memory` directory's EXISTENCE to decide which root you're in.
+    // `KB="$ENV_DIR/.drawbar/memory"` (a plain derivation from the already-validated
+    // `$ENV_DIR`) legitimately still appears below and is not what this anchors against.
+    // Fix pass 2, Important 8: `dirname "$CONFIG"` (the tracked-config security guard) is
+    // also legitimate — a single-level dirname of the ALREADY-RESOLVED config path, not a
+    // walk-up-to-find-the-repo probe. Pinned to exactly one occurrence, of exactly that
+    // shape, so a future re-introduction of parent-walking `dirname` usage still fails this.
+    const dirnameOccurrences = (block.match(/dirname/g) ?? []).length;
+    expect(dirnameOccurrences, "unexpected number of `dirname` occurrences in Preflight").toBe(1);
+    expect(block).toContain('dirname "$CONFIG"'); // the ONE legitimate reference
+    expect(block).not.toMatch(/\[\s*-d\s+"?\$(PWD|ENV_DIR)\/\.drawbar\/memory"?\s*\]/);
+    expect(block).toContain('KB="$ENV_DIR/.drawbar/memory"'); // the ONE legitimate reference
+  });
+
+  // MUST-CHECK bash-parameter-guard-needs-unset-var-harness-not-just-mutation: prove the
+  // fail-closed `: "${CLAUDE_PLUGIN_ROOT:?...}"` guard by running the REAL extracted line
+  // with the variable genuinely UNSET in the child env (Bun.spawn's `env` fully replaces the
+  // child's environment, so simply omitting the key reliably leaves it unset), asserting the
+  // specific `:?` message — not merely mutating the guard to `true` and checking the suite
+  // stays green.
+  test("CLAUDE_PLUGIN_ROOT unset aborts with the specific :? message (real fence, real unset env)", async () => {
+    const block = preflightBlock();
+    const marker = ': "${CLAUDE_PLUGIN_ROOT:?CLAUDE_PLUGIN_ROOT must be set}"';
+    expect(block).toContain(marker);
+    const { code, output } = await runScript(marker, {});
+    expect(code).not.toBe(0);
+    expect(output).toContain("CLAUDE_PLUGIN_ROOT must be set");
+  });
+});
+
+// Important (fix pass 4): §4 re-declares $RESOLVED but, before this fix, never re-declared
+// $REPO or $BASE_BRANCH — the SAME cross-invocation dependency, and $REPO in particular is a
+// commonly-exported ambient env-var name. Mirrors Preflight's own derive-guard tests above:
+// extracted for real via explicit marker comments (an intentional test seam), run with a
+// hand-built $RESOLVED supplied from outside, proving the REAL fail-closed assert loop.
+describe("§4 derives REPO and BASE_BRANCH from RESOLVED, not ambient env (Important, fix pass 4)", () => {
+  function extractMergeDeriveGuard(): string {
+    const txt = readNonEmpty(join(root, "commands/drawbar-ship.md"));
+    const start = txt.indexOf("# --- derive REPO and BASE_BRANCH from RESOLVED");
+    expect(start, "merge derive-REPO/BASE_BRANCH marker not found").toBeGreaterThan(-1);
+    const end = txt.indexOf("# --- end derive REPO and BASE_BRANCH from RESOLVED", start);
+    expect(end, "merge derive-REPO/BASE_BRANCH end marker not found").toBeGreaterThan(start);
+    return txt.slice(start, end);
+  }
+
+  async function runDerive(env: Record<string, string>): Promise<{ code: number; output: string }> {
+    const proc = Bun.spawn(["bash", "-c", extractMergeDeriveGuard()], {
+      env: { PATH: process.env.PATH ?? "", ...env },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const out = await new Response(proc.stdout).text();
+    const err = await new Response(proc.stderr).text();
+    const code = await proc.exited;
+    return { code, output: out + err };
+  }
+
+  test("refuses when RESOLVED carries no repo", async () => {
+    const { code, output } = await runDerive({ RESOLVED: '{"baseBranch":"main"}' });
+    expect(code).not.toBe(0);
+    expect(output).toContain("REPO is empty or null");
+  });
+
+  test("refuses when RESOLVED's repo is the literal string \"null\"", async () => {
+    const { code, output } = await runDerive({ RESOLVED: '{"repo":null,"baseBranch":"main"}' });
+    expect(code).not.toBe(0);
+    expect(output).toContain("REPO is empty or null");
+  });
+
+  test("refuses when RESOLVED carries no baseBranch", async () => {
+    const { code, output } = await runDerive({ RESOLVED: '{"repo":"acme/widgets"}' });
+    expect(code).not.toBe(0);
+    expect(output).toContain("BASE_BRANCH is empty or null");
+  });
+
+  // The actual gap this closes: a leaked/ambient $REPO in the operator's own shell must NOT
+  // silently win over the validated value carried in $RESOLVED — every §4 harness before this
+  // fix pre-seeded $REPO directly as an env var (see the STORY-guard describe below), which
+  // cannot tell a derived value apart from an ambient one. This test seeds NEITHER: $REPO
+  // comes ONLY from $RESOLVED, proving the derivation is what actually populates it.
+  test("derives REPO and BASE_BRANCH from RESOLVED alone, with no ambient REPO/BASE_BRANCH pre-seeded (Important, fix pass 4)", async () => {
+    const echoScript = `${extractMergeDeriveGuard()}\necho "GOT $REPO $BASE_BRANCH"`;
+    const proc = Bun.spawn(["bash", "-c", echoScript], {
+      // No REPO or BASE_BRANCH key at all in env — the exact unseeded pre-state the gap
+      // allowed. $REPO must come ONLY from $RESOLVED below.
+      env: { PATH: process.env.PATH ?? "", RESOLVED: '{"repo":"acme/widgets","baseBranch":"trunk"}' },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const out = await new Response(proc.stdout).text();
+    const code = await proc.exited;
+    expect(code).toBe(0);
+    expect(out).toContain("GOT acme/widgets trunk");
+  });
+
+  // Poisoned-ambient-env regression: an operator's shell exports $REPO (a common name) with a
+  // DIFFERENT value than the validated $RESOLVED carries. The derivation must overwrite it,
+  // never silently defer to whatever was already there.
+  test("an ambient REPO env var is overwritten by the value derived from RESOLVED, not trusted (Important, fix pass 4)", async () => {
+    const echoScript = `${extractMergeDeriveGuard()}\necho "GOT $REPO"`;
+    const proc = Bun.spawn(["bash", "-c", echoScript], {
+      env: {
+        PATH: process.env.PATH ?? "",
+        REPO: "attacker/evil", // ambient, poisoned
+        RESOLVED: '{"repo":"acme/widgets","baseBranch":"main"}',
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const out = await new Response(proc.stdout).text();
+    const code = await proc.exited;
+    expect(code).toBe(0);
+    expect(out).toContain("GOT acme/widgets");
+    expect(out).not.toContain("attacker/evil");
   });
 });
 
@@ -355,19 +656,527 @@ describe("merge guard fails closed when STORY is unset", () => {
 
   test("refuses an unrelated branch when STORY is empty", async () => {
     const { code, output } = await runMergeGuard(
-      { STORY: "", PR: "1", REPO: "org/repo" },
+      { STORY: "", PR: "1", REPO: "org/repo", BASE_BRANCH: "main" },
       { branch: "attacker/unrelated-branch" }
     );
     expect(code).not.toBe(0);
     expect(output).toContain("STORY unset");
   });
 
-  test("passes when STORY matches the PR's branch", async () => {
+  test("passes when STORY matches the PR's branch and BASE_BRANCH matches the PR's base", async () => {
     const { code } = await runMergeGuard(
-      { STORY: "ABC-1", PR: "1", REPO: "org/repo" },
+      { STORY: "ABC-1", PR: "1", REPO: "org/repo", BASE_BRANCH: "main" },
       { branch: "someone/abc-1-slug" }
     );
     expect(code).toBe(0);
+  });
+
+  // PCO-348 (S3): `[ "$base" = "main" ]` became `[ "$base" = "$BASE_BRANCH" ]`, driven by the
+  // resolved config — exactly the vacuity trap the STORY assertion above already guards
+  // against. An unset $BASE_BRANCH must refuse outright, never silently match any base.
+  test("refuses any base when BASE_BRANCH is empty (would otherwise vacuously match)", async () => {
+    const { code, output } = await runMergeGuard(
+      { STORY: "ABC-1", PR: "1", REPO: "org/repo", BASE_BRANCH: "" },
+      { branch: "someone/abc-1-slug", base: "main" }
+    );
+    expect(code).not.toBe(0);
+    expect(output).toContain("BASE_BRANCH unset");
+  });
+
+  test("refuses when BASE_BRANCH is set but the PR's actual base differs", async () => {
+    const { code, output } = await runMergeGuard(
+      { STORY: "ABC-1", PR: "1", REPO: "org/repo", BASE_BRANCH: "main" },
+      { branch: "someone/abc-1-slug", base: "develop" }
+    );
+    expect(code).not.toBe(0);
+    expect(output).toContain("REFUSING: base is 'develop'");
+  });
+
+  // Fix pass (mutation-gate hole): every fixture above pins BASE_BRANCH to "main", so a
+  // hardcoded `[ "$base" = "main" ]` behaves identically to the parameterized
+  // `[ "$base" = "$BASE_BRANCH" ]` in every one of them — none of them can tell the two
+  // apart. These two use a non-"main" configured base to discriminate: under the
+  // hardcoded-`main` mutation, the first case (which must pass) wrongly refuses, and the
+  // second case (which must refuse) wrongly passes.
+  test("passes when BASE_BRANCH is a non-main value and matches the PR's actual base", async () => {
+    const { code } = await runMergeGuard(
+      { STORY: "ABC-1", PR: "1", REPO: "org/repo", BASE_BRANCH: "trunk" },
+      { branch: "someone/abc-1-slug", base: "trunk" }
+    );
+    expect(code).toBe(0);
+  });
+
+  test("refuses when BASE_BRANCH is a non-main value but the PR's actual base is main", async () => {
+    const { code, output } = await runMergeGuard(
+      { STORY: "ABC-1", PR: "1", REPO: "org/repo", BASE_BRANCH: "trunk" },
+      { branch: "someone/abc-1-slug", base: "main" }
+    );
+    expect(code).not.toBe(0);
+    expect(output).toContain("REFUSING: base is 'main'");
+  });
+});
+
+// Fix pass (mutation-gate hole): no existing test asserted anything about the literal
+// `gh pr create` / Hard-rules text for `--base`, so a mutation replacing
+// `--base "$BASE_BRANCH"` with a bare `--base main` was invisible to the suite. These pin
+// the parameterized form and positively forbid the hardcoded one from reappearing in either
+// file. Anchored on files first proven non-empty via readNonEmpty, per MUST-CHECK
+// vacuous-assertion-needs-preseed-state.
+describe("PCO-348 fix pass: --base parameterization is not silently re-hardcoded", () => {
+  test("agents/drawbar-story-lead.md section 6 ships gh pr create with the configured base branch", () => {
+    const txt = readNonEmpty(join(root, "agents/drawbar-story-lead.md"));
+    expect(txt).toContain('gh pr create -R "$REPO" --base "$BASE_BRANCH"');
+    expect(txt).not.toMatch(/--base\s+main\b/);
+  });
+
+  test("commands/drawbar-ship.md does not contain a hardcoded --base main", () => {
+    const txt = readNonEmpty(join(root, "commands/drawbar-ship.md"));
+    expect(txt).not.toMatch(/--base\s+main\b/);
+  });
+
+  // Fix pass 2, Important 3: the producer (this bullet, §2) and the consumer
+  // (agents/drawbar-story-lead.md, which runs `gh pr create --base "$BASE_BRANCH"` in §6)
+  // must agree on what the brief carries. As shipped, only the consumer side named
+  // $BASE_BRANCH — the producer's "brief must carry" list still named just $KB, $PROJECT_DIR,
+  // $REPO and the branch name, so a story-lead built from this brief alone would run
+  // `gh pr create --base ""` and fail mid-story after the implementation was already done.
+  test("commands/drawbar-ship.md's 'brief must carry' list names $BASE_BRANCH, matching agents/drawbar-story-lead.md's consumption of it (Important 3)", () => {
+    const txt = readNonEmpty(join(root, "commands/drawbar-ship.md"));
+    const idx = txt.indexOf("The brief must carry:");
+    expect(idx, "'The brief must carry:' not found").toBeGreaterThan(-1);
+    const listStart = txt.indexOf("\n-", idx); // start of the first bullet
+    expect(listStart, "start of the 'brief must carry' bullet list not found").toBeGreaterThan(idx);
+    const listEnd = txt.indexOf("\n\n", listStart); // blank line closing the bullet list
+    expect(listEnd, "end of the 'brief must carry' bullet list not found").toBeGreaterThan(listStart);
+    const bulletList = txt.slice(idx, listEnd);
+    expect(bulletList).toContain("$BASE_BRANCH");
+  });
+});
+
+// Minor (fix pass 4): `$bad` — the failing/cancelled check count immediately above the
+// requiredChecks loop — previously fail-closed on a degraded `gh` only by the accident that
+// `"" = "0"` is false, reporting "REFUSING:  failing/cancelled checks" with an empty count
+// indistinguishable from a real bug in this fence. Give it the same `case ''|*[!0-9]*)` "could
+// not be read" arm the `$seen` guard already has. Extracted for real from the shipped doc.
+describe("merge guard: $bad failing/cancelled check count fails closed on a degraded gh (Minor, fix pass 4)", () => {
+  function extractBadGuard(): string {
+    const txt = readNonEmpty(join(root, "commands/drawbar-ship.md"));
+    const sectionStart = txt.indexOf("## 4. Merge");
+    expect(sectionStart, "'## 4. Merge' heading not found").toBeGreaterThan(-1);
+    const fenceStart = txt.indexOf("```bash", sectionStart);
+    const fenceEnd = txt.indexOf("```", fenceStart + 7);
+    const block = txt.slice(fenceStart + 7, fenceEnd);
+    const start = block.indexOf('bad=$(gh pr checks -R "$REPO" "$PR" --json bucket');
+    expect(start, "$bad guard not found in the merge block").toBeGreaterThan(-1);
+    const endLine = '[ "$bad" = "0" ] || { echo "REFUSING: $bad failing/cancelled checks"; exit 1; }';
+    const endIdx = block.indexOf(endLine, start);
+    expect(endIdx, "closing $bad refusal not found").toBeGreaterThan(start);
+    return block.slice(start, endIdx + endLine.length);
+  }
+
+  // Fake `gh` answering `pr checks --json bucket --jq '...'` directly with the value the real
+  // `gh`'s embedded `--jq` would have already reduced it to (a bare count) — `gh`'s own `--jq`
+  // does its own filtering internally, unlike the separate `jq --arg` pipe the requiredChecks
+  // loop uses, so there is nothing further to filter here.
+  function makeFakeGh(stdout: string): string {
+    const dir = mkdtempSync(join(tmpdir(), "drawbar-bad-stub-"));
+    const gh = join(dir, "gh");
+    writeFileSync(
+      gh,
+      `#!/usr/bin/env bash\n` + `if [ "$1" = "pr" ] && [ "$2" = "checks" ]; then\n` + `  echo "${stdout}"\n` + `fi\n`,
+    );
+    chmodSync(gh, 0o755);
+    return dir;
+  }
+
+  // Important 2 regression, applied here: `gh pr checks` itself fails (secondary rate limit,
+  // 502, expired token) — exits non-zero with EMPTY stdout, exactly the degraded shape.
+  function makeFakeGhDegraded(): string {
+    const dir = mkdtempSync(join(tmpdir(), "drawbar-bad-degraded-"));
+    const gh = join(dir, "gh");
+    writeFileSync(gh, `#!/usr/bin/env bash\n` + `if [ "$1" = "pr" ] && [ "$2" = "checks" ]; then\n` + `  exit 1\n` + `fi\n`);
+    chmodSync(gh, 0o755);
+    return dir;
+  }
+
+  async function run(binDir: string): Promise<{ code: number; output: string }> {
+    const script = `REPO=org/repo\nPR=1\n${extractBadGuard()}`;
+    const proc = Bun.spawn(["bash", "-c", script], {
+      env: { PATH: `${binDir}:${process.env.PATH ?? ""}` },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const out = await new Response(proc.stdout).text();
+    const err = await new Response(proc.stderr).text();
+    const code = await proc.exited;
+    return { code, output: out + err };
+  }
+
+  test("passes when there are no failing/cancelled checks", async () => {
+    const { code } = await run(makeFakeGh("0"));
+    expect(code).toBe(0);
+  });
+
+  test("refuses with the count when checks are failing/cancelled", async () => {
+    const { code, output } = await run(makeFakeGh("2"));
+    expect(code).not.toBe(0);
+    expect(output).toContain("REFUSING: 2 failing/cancelled checks");
+  });
+
+  test("refuses with a distinct 'could not be read' message when gh itself fails, rather than an empty-count REFUSING (Minor, fix pass 4)", async () => {
+    const { code, output } = await run(makeFakeGhDegraded());
+    expect(code).not.toBe(0);
+    expect(output).toContain("could not be read");
+  });
+});
+
+// PCO-348 (S3): `requiredChecks` is otherwise a dead config field — parsed, validated, and
+// carried through `resolved_config`, but nothing ever CONSUMES it — unless this loop
+// actually refuses on a configured check that never ran. Extracted for real from the shipped
+// doc (not hand-reimplemented), proving the one seam that stops it from being dead.
+describe("merge guard: requiredChecks loop refuses a configured check that never ran", () => {
+  // Fix pass 2, Critical 1: the start anchor is the comment block that already precedes the
+  // loop (present before AND after the fix) rather than "while IFS= read -r check; do" itself
+  // — so this extraction picks up the new pre-loop $RESOLVED vacuity guard once it exists,
+  // without needing a brand-new marker the pre-fix doc doesn't have yet (which would make a
+  // RED run fail on "marker not found" instead of on the real vacuous-pass behavior).
+  function extractRequiredChecksLoop(): string {
+    const txt = readNonEmpty(join(root, "commands/drawbar-ship.md"));
+    const sectionStart = txt.indexOf("## 4. Merge");
+    expect(sectionStart, "'## 4. Merge' heading not found").toBeGreaterThan(-1);
+    const fenceStart = txt.indexOf("```bash", sectionStart);
+    const fenceEnd = txt.indexOf("```", fenceStart + 7);
+    const block = txt.slice(fenceStart + 7, fenceEnd);
+    const start = block.indexOf("# requiredChecks (from the resolved config):");
+    expect(start, "requiredChecks section not found in the merge block").toBeGreaterThan(-1);
+    const doneLine = 'done < <(echo "$RESOLVED" | jq -r \'.requiredChecks[]\')';
+    const doneIdx = block.indexOf(doneLine, start);
+    expect(doneIdx, "closing 'done < <(...)' of the requiredChecks loop not found").toBeGreaterThan(start);
+    // Critical, fix pass 4: extend the extraction past `done < <(...)` to also capture the
+    // reconciliation check — count-of-iterations must equal $REQUIRED_COUNT — that closes the
+    // type-blind `jq length` gap independent of the type guard above it. Without this, the
+    // reconciliation is never exercised by the extracted fence at all.
+    const reconcileLine =
+      '[ "$verified" -eq "$REQUIRED_COUNT" ] || { echo "REFUSING: only $verified of $REQUIRED_COUNT required checks were evaluated"; exit 1; }';
+    const reconcileIdx = block.indexOf(reconcileLine, doneIdx);
+    expect(reconcileIdx, "reconciliation check after the requiredChecks loop not found").toBeGreaterThan(doneIdx);
+    return block.slice(start, reconcileIdx + reconcileLine.length);
+  }
+
+  // Fake `gh` answering `pr checks --json name,bucket` with a raw JSON array on stdout — the
+  // REAL `jq` on PATH (inherited below, never stripped for this describe block) is what does
+  // the filtering, exactly as the extracted fence itself pipes to it.
+  function makeFakeGh(checks: { name: string; bucket: string }[]): string {
+    const dir = mkdtempSync(join(tmpdir(), "drawbar-reqchecks-stub-"));
+    const gh = join(dir, "gh");
+    const jsonBody = JSON.stringify(checks).replace(/'/g, "'\\''");
+    writeFileSync(
+      gh,
+      `#!/usr/bin/env bash\n` +
+        `if [ "$1" = "pr" ] && [ "$2" = "checks" ]; then\n` +
+        `  echo '${jsonBody}'\n` +
+        `fi\n`,
+    );
+    chmodSync(gh, 0o755);
+    return dir;
+  }
+
+  // Important 2 regression: `gh pr checks` itself fails (secondary rate limit, 502, expired
+  // token mid-loop) — exits non-zero with EMPTY stdout, exactly the shape a transient `gh`
+  // failure produces. Distinct from makeFakeGh above, which always emits well-formed JSON.
+  function makeFakeGhDegraded(): string {
+    const dir = mkdtempSync(join(tmpdir(), "drawbar-reqchecks-degraded-"));
+    const gh = join(dir, "gh");
+    writeFileSync(
+      gh,
+      `#!/usr/bin/env bash\n` +
+        `if [ "$1" = "pr" ] && [ "$2" = "checks" ]; then\n` +
+        `  exit 1\n` +
+        `fi\n`,
+    );
+    chmodSync(gh, 0o755);
+    return dir;
+  }
+
+  async function runLoop(resolvedJson: string, checks: { name: string; bucket: string }[]): Promise<{ code: number; output: string }> {
+    const binDir = makeFakeGh(checks);
+    const script = `RESOLVED='${resolvedJson}'\nREPO=org/repo\nPR=1\n${extractRequiredChecksLoop()}`;
+    const proc = Bun.spawn(["bash", "-c", script], {
+      env: { PATH: `${binDir}:${process.env.PATH ?? ""}` },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const out = await new Response(proc.stdout).text();
+    const err = await new Response(proc.stderr).text();
+    const code = await proc.exited;
+    return { code, output: out + err };
+  }
+
+  // Critical 1: run the extracted fence with $RESOLVED genuinely UNSET (never assigned in the
+  // script at all — not even `RESOLVED=""`), the exact pre-state a fresh, separate bash
+  // invocation of §4 actually starts from. Bun.spawn's `env` fully replaces the child's
+  // environment, so omitting the key reliably leaves it unset. See MUST-CHECK
+  // vacuous-assertion-needs-preseed-state: the OLD `runLoop` helper always pre-seeded
+  // RESOLVED, which is exactly the pre-state that is missing in production.
+  async function runLoopResolvedUnset(checks: { name: string; bucket: string }[]): Promise<{ code: number; output: string }> {
+    const binDir = makeFakeGh(checks);
+    const script = `REPO=org/repo\nPR=1\n${extractRequiredChecksLoop()}`;
+    const proc = Bun.spawn(["bash", "-c", script], {
+      env: { PATH: `${binDir}:${process.env.PATH ?? ""}` }, // RESOLVED deliberately absent
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const out = await new Response(proc.stdout).text();
+    const err = await new Response(proc.stderr).text();
+    const code = await proc.exited;
+    return { code, output: out + err };
+  }
+
+  test("refuses when the configured check never appears at all", async () => {
+    const { code, output } = await runLoop('{"requiredChecks":["build"]}', [{ name: "lint", bucket: "pass" }]);
+    expect(code).not.toBe(0);
+    expect(output).toContain("required check 'build' never ran");
+  });
+
+  test("refuses when the configured check ran but has not passed", async () => {
+    const { code, output } = await runLoop('{"requiredChecks":["build"]}', [{ name: "build", bucket: "pending" }]);
+    expect(code).not.toBe(0);
+    expect(output).toContain("required check 'build' never ran");
+  });
+
+  // Regression: `[ "$seen" = "0" ] && { ...; exit 1; }` leaves the loop's OWN exit status as
+  // 1 (false) on the last SUCCESSFUL check — `&&` short-circuits without running anything, so
+  // the last-executed command is the failed `[ "$seen" = "0" ]` test. Harmless in the real
+  // fence (later commands overwrite $?, and there's no `set -e`), but this isolated harness —
+  // which extracts the loop alone — is exactly the shape a future refactor that moves this
+  // loop to the end of the fence would hit for real. Fixed by flipping to the house
+  // `test || { ...; exit 1; }` style used everywhere else in this file, which exits 0 on its
+  // own when every check passes.
+  test("passes when every configured check ran and is in the pass bucket", async () => {
+    const { code } = await runLoop('{"requiredChecks":["build","lint"]}', [
+      { name: "build", bucket: "pass" },
+      { name: "lint", bucket: "pass" },
+    ]);
+    expect(code).toBe(0);
+  });
+
+  // Critical 1 (fix pass 2): the reviewer's verbatim repro — `RESOLVED="" bash v1.sh` falls
+  // straight through to `gh pr merge` with no output and exit 0. This is the same class but
+  // stronger: RESOLVED is never assigned at all (the real cross-invocation pre-state), not
+  // merely assigned empty.
+  // Important 3 (fix pass 4): the old assertion only checked `output.toContain("RESOLVED")`
+  // — but the OTHER FATAL this fence can emit ("FATAL: RESOLVED carries no requiredChecks
+  // array...") also contains that token, so deleting the `[ -n "$RESOLVED" ]` line entirely
+  // left this test green (the REQUIRED_COUNT guard below it still refuses, just with the
+  // wrong message). Anchor on the specific message the `[ -n "$RESOLVED" ]` line actually
+  // emits, so a mutation that deletes that exact line is caught here rather than papered over
+  // by the next guard down.
+  test("refuses (does not silently fall through) when RESOLVED is entirely unset, not merely empty (Critical 1)", async () => {
+    const { code, output } = await runLoopResolvedUnset([{ name: "build", bucket: "pass" }]);
+    expect(code).not.toBe(0);
+    expect(output).toContain("FATAL: RESOLVED unset");
+  });
+
+  // Fix pass 3: the second, independent half of the vacuity guard — $RESOLVED is genuinely
+  // NON-empty (the `[ -n "$RESOLVED" ]` assert above passes) but carries no usable
+  // `requiredChecks`. This is a live scenario because $RESOLVED is hand-carried into this
+  // fence by the agent (see the fence's own comment above `RESOLVED="<Preflight's ...>"`): a
+  // truncated or wrong paste yields non-empty JSON with no requiredChecks, and the loop below
+  // would run zero times, silently skipping the gate — the exact Critical already fixed
+  // above, reached by a second route. `REQUIRED_COUNT=... case ... in ''|*[!0-9]*|0)` is the
+  // guard under test; each of these three payload shapes must trip it.
+  test("refuses with the requiredChecks-specific FATAL when RESOLVED is non-empty but requiredChecks is an empty array (fix pass 3)", async () => {
+    const { code, output } = await runLoop('{"requiredChecks":[]}', []);
+    expect(code).not.toBe(0);
+    expect(output).toContain("FATAL: RESOLVED carries no requiredChecks");
+  });
+
+  test("refuses with the requiredChecks-specific FATAL when RESOLVED has no requiredChecks key at all (fix pass 3)", async () => {
+    const { code, output } = await runLoop('{}', []);
+    expect(code).not.toBe(0);
+    expect(output).toContain("FATAL: RESOLVED carries no requiredChecks");
+  });
+
+  test("refuses with the requiredChecks-specific FATAL when RESOLVED is non-JSON / malformed text (fix pass 3)", async () => {
+    const { code, output } = await runLoop('not valid json', []);
+    expect(code).not.toBe(0);
+    expect(output).toContain("FATAL: RESOLVED carries no requiredChecks");
+  });
+
+  // Critical (fix pass 4): `jq`'s `length` builtin is defined on every JSON type, not just
+  // arrays — a `requiredChecks` value that is a STRING or a NUMBER produces a digits-only
+  // `REQUIRED_COUNT` (the string's character count, or the number itself) that satisfies the
+  // OLD `case ''|*[!0-9]*|0)` guard, while `.requiredChecks[]` then errors and the `while` loop
+  // runs zero times — the vacuous-pass Critical 1 already fixed once, reached by a third route.
+  // The reconciliation check alone is not enough here either: with a type-blind REQUIRED_COUNT,
+  // `verified` (0) never equals `REQUIRED_COUNT` (5), so a plain-`length` build would actually
+  // still be refused by the reconciliation — these two cases specifically pin the TYPE assert,
+  // by asserting the type-specific message, not merely a non-zero exit.
+  test("refuses with the requiredChecks-specific FATAL when requiredChecks is a string, not an array (Critical, fix pass 4)", async () => {
+    const { code, output } = await runLoop('{"requiredChecks":"build"}', [{ name: "build", bucket: "pass" }]);
+    expect(code).not.toBe(0);
+    expect(output).toContain("FATAL: RESOLVED carries no requiredChecks array");
+  });
+
+  test("refuses with the requiredChecks-specific FATAL when requiredChecks is a number, not an array (Critical, fix pass 4)", async () => {
+    const { code, output } = await runLoop('{"requiredChecks":42}', [{ name: "build", bucket: "pass" }]);
+    expect(code).not.toBe(0);
+    expect(output).toContain("FATAL: RESOLVED carries no requiredChecks array");
+  });
+
+  // Critical (fix pass 4): prove the reconciliation closes the class INDEPENDENTLY of the type
+  // guard above — mutate REQUIRED_COUNT back to the plain (type-blind) `.requiredChecks |
+  // length` form inline in the script under test, and confirm a mid-loop `gh` death (a check
+  // that never appears, so the loop refuses via the per-check guard before ever reaching the
+  // reconciliation) is still caught by the per-check guard, and — the actual reconciliation
+  // scenario — that a genuine iteration shortfall against a well-typed array is refused even
+  // when every check that DID run passed, proving the count comparison is a real, independent
+  // gate and not just inherited from the per-check guards.
+  test("reconciliation refuses an iteration shortfall even with the type guard reverted to plain `length` (Critical, fix pass 4)", async () => {
+    // Revert the type guard back to the pre-fix, type-blind form inline in the extracted
+    // fence text under test — proving the reconciliation below is a genuinely independent
+    // gate, not one that merely inherits its correctness from the type guard above it.
+    const script = extractRequiredChecksLoop().replace(
+      'if (.requiredChecks | type) == "array" then (.requiredChecks | length) else "bad" end',
+      ".requiredChecks | length",
+    );
+    expect(script).not.toContain('if (.requiredChecks | type) == "array"'); // the mutation actually applied
+    // Three configured checks, every one of which `gh` reports as passing — the per-check
+    // guards alone have nothing to refuse on. Truncate what the loop actually ITERATES (not
+    // `gh`'s answers) via `head -n 2`, modeling a `jq`/`gh` process that dies partway through
+    // emitting `.requiredChecks[]` — the loop runs to completion on 2 of 3 with every visited
+    // check passing, so only the reconciliation can catch the shortfall.
+    const binDir = makeFakeGh([
+      { name: "build", bucket: "pass" },
+      { name: "lint", bucket: "pass" },
+      { name: "test", bucket: "pass" },
+    ]);
+    const truncated = script.replace(
+      'done < <(echo "$RESOLVED" | jq -r \'.requiredChecks[]\')',
+      'done < <(echo "$RESOLVED" | jq -r \'.requiredChecks[]\' | head -n 2)',
+    );
+    const fullScript = `RESOLVED='{"requiredChecks":["build","lint","test"]}'\nREPO=org/repo\nPR=1\n${truncated}`;
+    const proc = Bun.spawn(["bash", "-c", fullScript], {
+      env: { PATH: `${binDir}:${process.env.PATH ?? ""}` },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const out = await new Response(proc.stdout).text();
+    const err = await new Response(proc.stderr).text();
+    const code = await proc.exited;
+    expect(code).not.toBe(0);
+    expect(out + err).toContain("REFUSING: only 2 of 3 required checks were evaluated");
+  });
+
+  // Important 2: a transient `gh` failure (secondary rate limit, 502, expired token) inside
+  // the per-check loop must be diagnosable as "could not be read", never silently conflated
+  // with "the check passed". `[ "$seen" != "0" ]` is the fail-OPEN direction: empty `$seen`
+  // makes that comparison true.
+  test("refuses with a distinct message when gh itself fails mid-loop, rather than treating a degraded read as a pass (Important 2)", async () => {
+    const binDir = makeFakeGhDegraded();
+    const script = `RESOLVED='{"requiredChecks":["build"]}'\nREPO=org/repo\nPR=1\n${extractRequiredChecksLoop()}`;
+    const proc = Bun.spawn(["bash", "-c", script], {
+      env: { PATH: `${binDir}:${process.env.PATH ?? ""}` },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const out = await new Response(proc.stdout).text();
+    const err = await new Response(proc.stderr).text();
+    const code = await proc.exited;
+    expect(code).not.toBe(0);
+    expect(out + err).toContain("could not be read");
+  });
+});
+
+// Fix pass 2, Important 4: `mergedStatus` was validated by ship-config.ts and carried through
+// `resolved_config`, but §5 still hardcoded the literal `Pre-QA` — a dead config field, the
+// same class of bug `requiredChecks` had before this same fix pass. §5 must reference the
+// configured `$MERGED_STATUS` instead, while the human-owned/completed-status prohibition
+// (a fixed, workspace-independent list) survives verbatim.
+describe("§5 Linear status is parameterized on the configured mergedStatus, not hardcoded (Important 4)", () => {
+  function section5(): string {
+    const txt = readNonEmpty(join(root, "commands/drawbar-ship.md"));
+    const start = txt.indexOf("## 5.");
+    expect(start, "'## 5.' heading not found").toBeGreaterThan(-1);
+    const end = txt.indexOf("## 6.", start);
+    expect(end, "'## 6.' heading not found after §5").toBeGreaterThan(start);
+    return txt.slice(start, end);
+  }
+
+  // Important 3 (fix pass 4): the old assertion anchored on the exact byte sequence
+  // `Set the story to **`Pre-QA`**` and separately checked `s5.toContain("$MERGED_STATUS")`
+  // — but that second check is satisfied by the `$MERGED_STATUS` token ANYWHERE in §5 (e.g.
+  // the heading), so a re-hardcode with different markdown emphasis (`Set the story to
+  // `Pre-QA`` — no bold) survived undetected. Anchor POSITIVELY on the instruction line
+  // itself via regex (so emphasis-style drift can't hide behind it), and separately assert
+  // that §5's INSTRUCTION TEXT — §5 minus the historical blockquote, which legitimately and
+  // deliberately preserves the literal `Pre-QA` as a fact about a specific past run — carries
+  // no `Pre-QA` literal at all.
+  test("§5 sets the story to the configured $MERGED_STATUS, not the literal 'Pre-QA'", () => {
+    const s5 = section5();
+    expect(s5).toMatch(/Set the story to \*\*`\$MERGED_STATUS`\*\*/);
+    const instructionText = s5
+      .split("\n")
+      .filter((line) => !line.trimStart().startsWith(">"))
+      .join("\n");
+    expect(instructionText).not.toContain("Pre-QA");
+  });
+
+  test("§5's re-read-and-assert-it-stuck step asserts against $MERGED_STATUS, not the literal 'Pre-QA'", () => {
+    const s5 = section5();
+    expect(s5).toContain('assert `status == "$MERGED_STATUS"`');
+    expect(s5).not.toContain('assert `status == "Pre-QA"`');
+  });
+
+  test("the human-/QA-owned completion-status prohibition survives verbatim and un-weakened", () => {
+    const s5 = section5();
+    expect(s5).toContain(
+      "**Never** `Done`, `Ready For QA`, `Ready for Rollout`, or `Rolled Out` — human- and\nQA-owned. Never call `save_issue` with any `completed`-type status.",
+    );
+  });
+
+  test("§5 documents that validateShipConfig's type-started assertion is what mechanically guarantees $MERGED_STATUS can never be a completion status", () => {
+    const s5 = section5();
+    expect(s5).toContain("validateShipConfig");
+    expect(s5.toLowerCase()).toContain("type: started");
+  });
+
+  // Fix pass 3: the frontmatter `description:` — the one line users actually see in the
+  // plugin's command list — still named the workspace-specific literal `Pre-QA`, the same
+  // class of leftover §5's body was parameterized against above. It must describe the
+  // behaviour generically (setting the configured merged-but-not-QA'd status) instead.
+  test("the frontmatter description carries no hardcoded status literal (fix pass 3)", () => {
+    const fm = frontmatter(join(root, "commands/drawbar-ship.md"));
+    expect(fm.description).not.toContain("Pre-QA");
+  });
+});
+
+// Fix pass 2: Operator notes document the two new rules this pass introduced.
+describe("Operator notes document fix pass 2's new rules", () => {
+  function operatorNotes(): string {
+    const txt = readNonEmpty(join(root, "commands/drawbar-ship.md"));
+    const start = txt.indexOf("## Operator notes");
+    expect(start, "'## Operator notes' heading not found").toBeGreaterThan(-1);
+    const end = txt.indexOf("## Appendix", start);
+    expect(end, "'## Appendix' heading not found after Operator notes").toBeGreaterThan(start);
+    return txt.slice(start, end);
+  }
+
+  // Important 8: the tracked-config security rule must be documented for operators, not just
+  // enforced silently in Preflight.
+  test("documents that a real ship config must never be tracked by git", () => {
+    const notes = operatorNotes();
+    expect(notes).toContain("tracked by git");
+  });
+
+  // Minor: refusal `detail` strings echo absolute paths and the real repo slug — the slug
+  // leak-rule is deliberately out of scope for knowledge.jsonl (see the leak-scan describe
+  // above), so an operator pasting a refusal verbatim into the KB or a Linear comment would
+  // leak it unscanned.
+  test("documents that ship-config refusal text must be paraphrased, never pasted, into a KB entry or Linear comment", () => {
+    const notes = operatorNotes();
+    expect(notes.toLowerCase()).toContain("paraphrase");
+    expect(notes).toContain("never");
   });
 });
 
@@ -899,6 +1708,87 @@ describe("scaffolding", () => {
     expect(txt).toMatch(/^\*$/m);
     expect(txt).toMatch(/^!\.gitignore$/m);
   });
+
+  // PCO-348 (S3): the committed example config must be structurally acceptable to
+  // parseShipConfig (proving its shape actually matches ShipConfig) but its PLACEHOLDER
+  // values must be refused by validateShipConfig — that refusal is the fail-closed proof
+  // that a copied-but-unedited example can never actually run. See MUST-CHECK
+  // vacuous-assertion-needs-preseed-state: asserting "invalid" alone would be vacuous if the
+  // file were simply missing/unreadable, so readNonEmpty (which asserts non-empty first) is
+  // used, and the structural-parse assertion is checked before the refusal assertion.
+  test(".drawbar/ship.config.example.json is structurally valid but its placeholder values are refused", () => {
+    const txt = readNonEmpty(join(root, ".drawbar/ship.config.example.json"));
+    const parsed = parseShipConfig(txt);
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    expect(Object.keys(parsed.config).sort()).toEqual(
+      ["baseBranch", "envDir", "mergedStatus", "projectDir", "repo", "requiredChecks", "team"].sort(),
+    );
+
+    const calls: string[][] = [];
+    const spy: Runner = (argv) => {
+      calls.push(argv);
+      return { code: 0, stdout: "", stderr: "" };
+    };
+    const result = validateShipConfig({
+      config: parsed.config,
+      linear: { teams: [], statuses: [] },
+      git: spy,
+      gh: spy,
+    });
+    expect(result.ok).toBe(false);
+    // The placeholder repo `<org>/<repo>` fails shape validation before any runner call —
+    // an unedited example refuses at the very first check, not deep in the pipeline.
+    expect(calls.length).toBe(0);
+  });
+
+  test(".gitignore actually ignores the operator's real ship config (pattern-matched, not just non-empty)", () => {
+    const txt = readNonEmpty(join(root, ".gitignore"));
+    expect(txt).toMatch(/^\*\*\/\.drawbar\/ship\.config\.json$/m);
+  });
+
+  // MINOR fix pass 2: `.drawbar/ship.config.json` (no leading `**/`) contains a `/`, so git
+  // anchors it to the repo root only — `sub/.drawbar/ship.config.json` was NOT ignored.
+  // Verified for real against the actual repo's `.gitignore` via `git check-ignore`, both at
+  // the root (unaffected by the fix) and nested (the actual gap).
+  test("git check-ignore actually ignores the real ship config at any depth, not just the repo root", () => {
+    const rootCase = Bun.spawnSync(["git", "check-ignore", "-q", ".drawbar/ship.config.json"], { cwd: root });
+    expect(rootCase.exitCode, "root-level ship.config.json must still be ignored").toBe(0);
+
+    const nestedCase = Bun.spawnSync(["git", "check-ignore", "-q", "sub/.drawbar/ship.config.json"], { cwd: root });
+    expect(nestedCase.exitCode, "nested ship.config.json must be ignored too (the actual gap)").toBe(0);
+
+    // The example file must stay tracked — the fix must not shadow it.
+    const exampleCase = Bun.spawnSync(["git", "check-ignore", "-q", ".drawbar/ship.config.example.json"], { cwd: root });
+    expect(exampleCase.exitCode, "the example file must NOT be ignored").not.toBe(0);
+  });
+});
+
+// Locked 20 (as amended, PCO-348 / S3): workspace-specific REASONING about deploys is
+// removed from both ported files, not merely reworded — the staging-deploy queue, the
+// `cancel-in-progress: false` mechanism, and the "production is manually triggered" claim
+// are all specific to the original private workspace's CI, not generic properties this
+// plugin can assert. Each anchor is asserted absent from BOTH files: the phrases originated
+// in commands/drawbar-ship.md, but asserting absence from agents/drawbar-story-lead.md too
+// guards against either file re-accumulating the same reasoning later. Anchored on a file
+// first proven non-empty (readNonEmpty), per MUST-CHECK vacuous-assertion-needs-preseed-state.
+// The "dispatch-triggered" half of this claim is already covered globally by the existing
+// `workflow_dispatch`/`repository_dispatch` literal-absence rules above — not re-authored here.
+describe("Locked 20 — workspace-specific deploy reasoning removed (PCO-348)", () => {
+  const FILES = ["commands/drawbar-ship.md", "agents/drawbar-story-lead.md"];
+  const REMOVED_PHRASES = [
+    { name: "staging-deploy-queue phrasing", phrase: "staging deploy" },
+    { name: "cancel-in-progress: false string", phrase: "cancel-in-progress: false" },
+    { name: "production-is-manually-triggered claim", phrase: "triggered manually" },
+  ];
+  for (const file of FILES) {
+    for (const { name, phrase } of REMOVED_PHRASES) {
+      test(`${file} does not contain the ${name}`, () => {
+        const txt = readNonEmpty(join(root, file));
+        expect(txt).not.toContain(phrase);
+      });
+    }
+  }
 });
 
 // L23 preservation harness — reused unchanged by S3 to prove de-hardcoding

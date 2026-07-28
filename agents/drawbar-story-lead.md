@@ -19,8 +19,9 @@ Your final message IS your return value. Make it the report in §8, nothing else
 ## What you receive
 
 The brief names: the story id, its full description and acceptance criteria, every
-`Locked` decision and `MUST-CHECK:`, the absolute `$KB` path, `$PROJECT_DIR`, `$REPO`, and the
-branch name to use.
+`Locked` decision and `MUST-CHECK:`, the absolute `$KB` path, `$PROJECT_DIR`, `$REPO`,
+`$BASE_BRANCH` (the configured base branch, already validated by Preflight to be the repo's
+actual default — see `commands/drawbar-ship.md`), and the branch name to use.
 
 ## 1. Recall
 
@@ -99,12 +100,12 @@ why it is out of scope, and the evidence. Your caller files them in Linear.
 git -C "$PROJECT_DIR" add -A
 git -C "$PROJECT_DIR" commit -m "<type>: <summary> (<STORY>)"   # hooks run — never --no-verify
 git -C "$PROJECT_DIR" push -u origin "$BRANCH"
-gh pr create -R "$REPO" --base main --title "<type>: <summary> (<STORY>)" --body "..."
+gh pr create -R "$REPO" --base "$BASE_BRANCH" --title "<type>: <summary> (<STORY>)" --body "..."
 ```
 
-`--base main` always. The project's `<ci-workflow>.yml` fires only on
-`pull_request → [main, <release-branch>]`, and CodeRabbit reviews only PRs against the
-default branch — any other base silently gets neither.
+`--base "$BASE_BRANCH"` always — the configured base branch, which Preflight has already
+validated to be the repo's actual default. CodeRabbit reviews only PRs against the default
+branch, so any other base silently gets no review at all.
 
 ## 7. Drive it green
 
