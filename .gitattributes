@@ -1,0 +1,19 @@
+# Knowledge base — append-oriented JSONL, one independent record per line.
+#
+# `union` is a git built-in (no `git config merge.*` needed). On a merge or
+# rebase it concatenates both sides instead of raising a conflict, which is
+# what lets an unattended /drawbar-ship run pull → commit → push its lessons
+# without a human resolving a textual conflict at 3am.
+#
+# Caveat: union NEVER conflicts, so if the same entry is *edited* on both
+# sides you get both versions rather than an error. Usage here is nearly all
+# appends, so this is rare — and `drawbar-kb stats` reports `duplicateKeys`.
+# Resolve with `drawbar-kb compact`, ATTENDED. Never in the loop (see
+# commands/drawbar-ship.md — "Never run archive or compact").
+.drawbar/memory/knowledge.jsonl         merge=union
+.drawbar/memory/knowledge.archive.jsonl merge=union
+
+# A CRLF-normalizing checkout (e.g. Windows core.autocrlf=true) would change every line
+# ending in the ported docs, which would break the §4 mutation-gate block's pinned sha256
+# hash in scripts/plugin.test.ts. Force LF regardless of checkout platform.
+*.md text eol=lf
