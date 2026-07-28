@@ -127,7 +127,30 @@ until 2026-07-27, so earlier runs silently dropped it (<TEAM>-L1 and <TEAM>-L2 c
 ## 0. Snapshot the story list (first invocation only)
 
 State file: `$ENV_DIR/.drawbar/runs/<ARG>.json` (gitignored, absolute). If absent, create
-it — the shape depends on what you were invoked with:
+it in the PINNED schema below (Locked 12) — `scripts/lib/run-state.ts`'s `parseRunState`
+rejects any other shape loudly, structural-only, never silently tolerating an unknown key:
+
+```
+{
+  "arg": "<the id this run was invoked with>",
+  "invoked_as": "parent" | "leaf",
+  "started_at": "<ISO timestamp>",
+  "order_rationale": "<how the snapshot below was topologically sorted>",
+  "snapshot": ["<story id>", ...],
+  "stories_done": [],
+  "in_flight": null,
+  "merged": {},
+  "subissues_filed": [],
+  "resolved_config": { /* Preflight's $RESOLVED, verbatim — ship-config.ts's ResolvedConfig */ }
+}
+```
+
+The canonical story-list key is **`snapshot`** — never `stories`. Persist `resolved_config`
+at this point too (T0), copying Preflight's already-validated `$RESOLVED` verbatim: it is
+`scripts/lib/ship-config.ts`'s `ResolvedConfig` shape (the seven configured keys plus
+`observed`), never a second hand-copied shape.
+
+The shape of `snapshot`/`invoked_as` depends on what you were invoked with:
 
 - **`$ARGUMENTS` is a parent** (has sub-issues) → `list_issues` with `parentId`; record
   every child whose status is `Todo`.
@@ -189,10 +212,39 @@ ordering problem, not a missing dependency. A blocker **outside** the snapshot a
 
 ## 2. Delegate the whole story
 
+**Before dispatching, `in_flight` is the authoritative duplicate-dispatch guard (Locked
+13).** Check the state file: a non-null `in_flight` means a dispatch may already be running.
+
+- If `now - in_flight.agent_dispatched_at` is **within** 2x the heartbeat (see below), this
+  is a fresh, live dispatch — **no-op, do not dispatch a second agent at all, for ANY story,
+  while `in_flight` is non-null.** The guard is per-run, not per-story: `in_flight` names one
+  story-lead dispatch at a time regardless of which story it names, so a different story
+  never justifies a second dispatch either.
+- If it **exceeds** 2x the heartbeat (strict `>` — exactly 2x is still fresh, a deliberate
+  boundary choice), the prior dispatch is presumed crashed — go to *Crash recovery* instead
+  of no-op'ing forever. (The repo probe used there is a crash-recovery tool only, with a
+  blind window between dispatch and first commit — it read "indistinguishable from never
+  started" one minute after a live dispatch, so it must never gate a fresh in-window check.)
+- If `in_flight` is `null`, proceed to dispatch below.
+
+`scripts/lib/run-state.ts` (`dispatchVerdict` / `maybeDispatch`) implements this verdict as a
+pure function with an injected clock — follow the same boundary and ordering as
+`dispatchVerdict` / `maybeDispatch` here rather than reimplementing the logic ad hoc.
+
 **Post a `save_comment` on the story before dispatching** — that implementation is starting,
 with the branch name and timestamp. A crashed run that never commits leaves *no* record of
 intent otherwise; this comment is what makes a crash recoverable. Move the story to
 `In Progress`.
+
+**Write `in_flight` at dispatch, and re-arm the heartbeat (F13).** Set
+`in_flight: {story, agent_dispatched_at: <now>}` in the state file, where `<now>` is a **UTC
+ISO 8601 instant** — the exact form `new Date().toISOString()` produces (e.g.
+`2026-07-28T03:14:15.000Z`). Never a bare `YYYY-MM-DD HH:MM:SS` or any other non-ISO form:
+those parse as LOCAL time, not UTC, so the same literal timestamp means a different instant
+depending on the machine's timezone — silently corrupting every later staleness comparison.
+The heartbeat is **2700-3600 seconds** (45-60 minutes) and is **re-armed at every dispatch** —
+this dispatch's `agent_dispatched_at` is what the 2x-heartbeat staleness check above measures
+from, which is exactly what makes that threshold well-defined rather than a moving target.
 
 Then dispatch **one** `drawbar-story-lead` agent (Opus). The brief must carry:
 
@@ -370,6 +422,9 @@ Linear authority it should not.
 Post a `save_comment`: what shipped, the PR link, sub-issues filed, and the
 `mutation_pairs` from the report.
 
+**Clear `in_flight` in the state file** (`in_flight: null`) — the dispatch this run-state was
+guarding against a duplicate of is now reported and done (Locked 13).
+
 ## 6. Capture and sync knowledge
 
 Write each entry in the report's `lessons` via `drawbar-kb add --dir "$KB"`, then:
@@ -393,14 +448,16 @@ and derived, and a pull can bring in entries the local index has never seen.
 
 ## 7. Advance
 
-Append the story to `stories_done`. `PushNotification` one line: story id, PR link,
-sub-issues filed. `ScheduleWakeup` for the next story (under `/loop`), or report and finish.
+Append the story to `stories_done` (`in_flight` stays cleared — step 5 already cleared it on
+report). `PushNotification` one line: story id, PR link, sub-issues filed. `ScheduleWakeup`
+for the next story (under `/loop`), or report and finish.
 
 ## Parking a story
 
 `status: parked`, a guard refusal, a blocked blocker, or any hard failure: leave the PR
-open, leave the story `In Progress`, `PushNotification` the reason, and
-**`ScheduleWakeup({stop: true})`**.
+open, leave the story `In Progress`, **clear `in_flight` in the state file** (`in_flight:
+null` — Locked 13: a parked story is not an in-progress dispatch), `PushNotification` the
+reason, and **`ScheduleWakeup({stop: true})`**.
 
 **Halt — never skip.** Stories are dependency-ordered; building N+1 on a gap produces work
 that looks like progress and is not.
@@ -409,17 +466,27 @@ that looks like progress and is not.
 
 The most likely overnight failure is not a clean halt — it is a dead session with a state
 file present, a dirty tree, a branch mid-story, no PR, and no Linear comment. Preflight
-must route here rather than dying.
+must route here rather than dying. **A stale `in_flight`** (step 2's duplicate-dispatch
+guard: `now - in_flight.agent_dispatched_at` exceeding 2x the heartbeat) **routes here too**
+— that is Locked 13's whole point: a crashed run must not deadlock every later invocation by
+leaving `in_flight` permanently "fresh" from a no-op's point of view.
 
-1. **Read the state file** for the story that was in flight (last id not in `stories_done`).
+1. **Read the state file** for the story that was in flight (`in_flight.story`, or — if
+   `in_flight` is somehow already null — the last id not in `stories_done`).
 2. **Read that story's Linear comments** — step 2's start comment names the branch and time.
 3. **Establish where it got to**, in this order: is there an open PR for the branch? a
-   pushed branch? local commits? only uncommitted changes?
+   pushed branch? local commits? only uncommitted changes? (The repo probe used here is a
+   crash-recovery tool ONLY — it has a blind window between dispatch and first commit,
+   demonstrated when it read "indistinguishable from never started" one minute after a live
+   dispatch. Never use it to gate the fresh-in-window no-op check in step 2.)
 4. **Resume at the earliest incomplete step.** Uncommitted work is *not* discarded — it is
    the crashed run's output. Commit it on the story branch first so it is inspectable, then
-   re-dispatch the story-lead pointing at that branch.
+   re-dispatch the story-lead pointing at that branch, **re-writing `in_flight`** with the new
+   dispatch time exactly as step 2 does for a fresh dispatch.
 5. If the tree is dirty but the state file names **no** in-flight story, halt and notify —
    that is unexplained, and unexplained state is not something to resolve unattended.
+6. If recovery instead determines the story is unrecoverable and must be halted outright,
+   **clear `in_flight`** (`in_flight: null`) before halting — same as *Parking a story*.
 
 > Discipline that makes this work: commit each verified increment (the story-lead's §2), and
 > post the start comment *before* dispatching. A crashed run once left two hours of work as
