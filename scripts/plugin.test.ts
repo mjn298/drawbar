@@ -503,6 +503,93 @@ describe("config-driven preflight guard fails closed (PCO-348)", () => {
   });
 });
 
+// Important (fix pass 4): §4 re-declares $RESOLVED but, before this fix, never re-declared
+// $REPO or $BASE_BRANCH — the SAME cross-invocation dependency, and $REPO in particular is a
+// commonly-exported ambient env-var name. Mirrors Preflight's own derive-guard tests above:
+// extracted for real via explicit marker comments (an intentional test seam), run with a
+// hand-built $RESOLVED supplied from outside, proving the REAL fail-closed assert loop.
+describe("§4 derives REPO and BASE_BRANCH from RESOLVED, not ambient env (Important, fix pass 4)", () => {
+  function extractMergeDeriveGuard(): string {
+    const txt = readNonEmpty(join(root, "commands/drawbar-ship.md"));
+    const start = txt.indexOf("# --- derive REPO and BASE_BRANCH from RESOLVED");
+    expect(start, "merge derive-REPO/BASE_BRANCH marker not found").toBeGreaterThan(-1);
+    const end = txt.indexOf("# --- end derive REPO and BASE_BRANCH from RESOLVED", start);
+    expect(end, "merge derive-REPO/BASE_BRANCH end marker not found").toBeGreaterThan(start);
+    return txt.slice(start, end);
+  }
+
+  async function runDerive(env: Record<string, string>): Promise<{ code: number; output: string }> {
+    const proc = Bun.spawn(["bash", "-c", extractMergeDeriveGuard()], {
+      env: { PATH: process.env.PATH ?? "", ...env },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const out = await new Response(proc.stdout).text();
+    const err = await new Response(proc.stderr).text();
+    const code = await proc.exited;
+    return { code, output: out + err };
+  }
+
+  test("refuses when RESOLVED carries no repo", async () => {
+    const { code, output } = await runDerive({ RESOLVED: '{"baseBranch":"main"}' });
+    expect(code).not.toBe(0);
+    expect(output).toContain("REPO is empty or null");
+  });
+
+  test("refuses when RESOLVED's repo is the literal string \"null\"", async () => {
+    const { code, output } = await runDerive({ RESOLVED: '{"repo":null,"baseBranch":"main"}' });
+    expect(code).not.toBe(0);
+    expect(output).toContain("REPO is empty or null");
+  });
+
+  test("refuses when RESOLVED carries no baseBranch", async () => {
+    const { code, output } = await runDerive({ RESOLVED: '{"repo":"acme/widgets"}' });
+    expect(code).not.toBe(0);
+    expect(output).toContain("BASE_BRANCH is empty or null");
+  });
+
+  // The actual gap this closes: a leaked/ambient $REPO in the operator's own shell must NOT
+  // silently win over the validated value carried in $RESOLVED — every §4 harness before this
+  // fix pre-seeded $REPO directly as an env var (see the STORY-guard describe below), which
+  // cannot tell a derived value apart from an ambient one. This test seeds NEITHER: $REPO
+  // comes ONLY from $RESOLVED, proving the derivation is what actually populates it.
+  test("derives REPO and BASE_BRANCH from RESOLVED alone, with no ambient REPO/BASE_BRANCH pre-seeded (Important, fix pass 4)", async () => {
+    const echoScript = `${extractMergeDeriveGuard()}\necho "GOT $REPO $BASE_BRANCH"`;
+    const proc = Bun.spawn(["bash", "-c", echoScript], {
+      // No REPO or BASE_BRANCH key at all in env — the exact unseeded pre-state the gap
+      // allowed. $REPO must come ONLY from $RESOLVED below.
+      env: { PATH: process.env.PATH ?? "", RESOLVED: '{"repo":"acme/widgets","baseBranch":"trunk"}' },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const out = await new Response(proc.stdout).text();
+    const code = await proc.exited;
+    expect(code).toBe(0);
+    expect(out).toContain("GOT acme/widgets trunk");
+  });
+
+  // Poisoned-ambient-env regression: an operator's shell exports $REPO (a common name) with a
+  // DIFFERENT value than the validated $RESOLVED carries. The derivation must overwrite it,
+  // never silently defer to whatever was already there.
+  test("an ambient REPO env var is overwritten by the value derived from RESOLVED, not trusted (Important, fix pass 4)", async () => {
+    const echoScript = `${extractMergeDeriveGuard()}\necho "GOT $REPO"`;
+    const proc = Bun.spawn(["bash", "-c", echoScript], {
+      env: {
+        PATH: process.env.PATH ?? "",
+        REPO: "attacker/evil", // ambient, poisoned
+        RESOLVED: '{"repo":"acme/widgets","baseBranch":"main"}',
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const out = await new Response(proc.stdout).text();
+    const code = await proc.exited;
+    expect(code).toBe(0);
+    expect(out).toContain("GOT acme/widgets");
+    expect(out).not.toContain("attacker/evil");
+  });
+});
+
 // PCO-347 fix pass, Critical 1: `STORY=<TEAM>-####` in the merge block was UNQUOTED — bash
 // parses `<` and `>` as redirection there, silently assigning STORY="" and turning the
 // downstream branch-identity guard's `case *"$STORY"*` pattern into `**`, which matches any
@@ -666,6 +753,83 @@ describe("PCO-348 fix pass: --base parameterization is not silently re-hardcoded
   });
 });
 
+// Minor (fix pass 4): `$bad` — the failing/cancelled check count immediately above the
+// requiredChecks loop — previously fail-closed on a degraded `gh` only by the accident that
+// `"" = "0"` is false, reporting "REFUSING:  failing/cancelled checks" with an empty count
+// indistinguishable from a real bug in this fence. Give it the same `case ''|*[!0-9]*)` "could
+// not be read" arm the `$seen` guard already has. Extracted for real from the shipped doc.
+describe("merge guard: $bad failing/cancelled check count fails closed on a degraded gh (Minor, fix pass 4)", () => {
+  function extractBadGuard(): string {
+    const txt = readNonEmpty(join(root, "commands/drawbar-ship.md"));
+    const sectionStart = txt.indexOf("## 4. Merge");
+    expect(sectionStart, "'## 4. Merge' heading not found").toBeGreaterThan(-1);
+    const fenceStart = txt.indexOf("```bash", sectionStart);
+    const fenceEnd = txt.indexOf("```", fenceStart + 7);
+    const block = txt.slice(fenceStart + 7, fenceEnd);
+    const start = block.indexOf('bad=$(gh pr checks -R "$REPO" "$PR" --json bucket');
+    expect(start, "$bad guard not found in the merge block").toBeGreaterThan(-1);
+    const endLine = '[ "$bad" = "0" ] || { echo "REFUSING: $bad failing/cancelled checks"; exit 1; }';
+    const endIdx = block.indexOf(endLine, start);
+    expect(endIdx, "closing $bad refusal not found").toBeGreaterThan(start);
+    return block.slice(start, endIdx + endLine.length);
+  }
+
+  // Fake `gh` answering `pr checks --json bucket --jq '...'` directly with the value the real
+  // `gh`'s embedded `--jq` would have already reduced it to (a bare count) — `gh`'s own `--jq`
+  // does its own filtering internally, unlike the separate `jq --arg` pipe the requiredChecks
+  // loop uses, so there is nothing further to filter here.
+  function makeFakeGh(stdout: string): string {
+    const dir = mkdtempSync(join(tmpdir(), "drawbar-bad-stub-"));
+    const gh = join(dir, "gh");
+    writeFileSync(
+      gh,
+      `#!/usr/bin/env bash\n` + `if [ "$1" = "pr" ] && [ "$2" = "checks" ]; then\n` + `  echo "${stdout}"\n` + `fi\n`,
+    );
+    chmodSync(gh, 0o755);
+    return dir;
+  }
+
+  // Important 2 regression, applied here: `gh pr checks` itself fails (secondary rate limit,
+  // 502, expired token) — exits non-zero with EMPTY stdout, exactly the degraded shape.
+  function makeFakeGhDegraded(): string {
+    const dir = mkdtempSync(join(tmpdir(), "drawbar-bad-degraded-"));
+    const gh = join(dir, "gh");
+    writeFileSync(gh, `#!/usr/bin/env bash\n` + `if [ "$1" = "pr" ] && [ "$2" = "checks" ]; then\n` + `  exit 1\n` + `fi\n`);
+    chmodSync(gh, 0o755);
+    return dir;
+  }
+
+  async function run(binDir: string): Promise<{ code: number; output: string }> {
+    const script = `REPO=org/repo\nPR=1\n${extractBadGuard()}`;
+    const proc = Bun.spawn(["bash", "-c", script], {
+      env: { PATH: `${binDir}:${process.env.PATH ?? ""}` },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const out = await new Response(proc.stdout).text();
+    const err = await new Response(proc.stderr).text();
+    const code = await proc.exited;
+    return { code, output: out + err };
+  }
+
+  test("passes when there are no failing/cancelled checks", async () => {
+    const { code } = await run(makeFakeGh("0"));
+    expect(code).toBe(0);
+  });
+
+  test("refuses with the count when checks are failing/cancelled", async () => {
+    const { code, output } = await run(makeFakeGh("2"));
+    expect(code).not.toBe(0);
+    expect(output).toContain("REFUSING: 2 failing/cancelled checks");
+  });
+
+  test("refuses with a distinct 'could not be read' message when gh itself fails, rather than an empty-count REFUSING (Minor, fix pass 4)", async () => {
+    const { code, output } = await run(makeFakeGhDegraded());
+    expect(code).not.toBe(0);
+    expect(output).toContain("could not be read");
+  });
+});
+
 // PCO-348 (S3): `requiredChecks` is otherwise a dead config field — parsed, validated, and
 // carried through `resolved_config`, but nothing ever CONSUMES it — unless this loop
 // actually refuses on a configured check that never ran. Extracted for real from the shipped
@@ -688,7 +852,15 @@ describe("merge guard: requiredChecks loop refuses a configured check that never
     const doneLine = 'done < <(echo "$RESOLVED" | jq -r \'.requiredChecks[]\')';
     const doneIdx = block.indexOf(doneLine, start);
     expect(doneIdx, "closing 'done < <(...)' of the requiredChecks loop not found").toBeGreaterThan(start);
-    return block.slice(start, doneIdx + doneLine.length);
+    // Critical, fix pass 4: extend the extraction past `done < <(...)` to also capture the
+    // reconciliation check — count-of-iterations must equal $REQUIRED_COUNT — that closes the
+    // type-blind `jq length` gap independent of the type guard above it. Without this, the
+    // reconciliation is never exercised by the extracted fence at all.
+    const reconcileLine =
+      '[ "$verified" -eq "$REQUIRED_COUNT" ] || { echo "REFUSING: only $verified of $REQUIRED_COUNT required checks were evaluated"; exit 1; }';
+    const reconcileIdx = block.indexOf(reconcileLine, doneIdx);
+    expect(reconcileIdx, "reconciliation check after the requiredChecks loop not found").toBeGreaterThan(doneIdx);
+    return block.slice(start, reconcileIdx + reconcileLine.length);
   }
 
   // Fake `gh` answering `pr checks --json name,bucket` with a raw JSON array on stdout — the
@@ -792,10 +964,17 @@ describe("merge guard: requiredChecks loop refuses a configured check that never
   // straight through to `gh pr merge` with no output and exit 0. This is the same class but
   // stronger: RESOLVED is never assigned at all (the real cross-invocation pre-state), not
   // merely assigned empty.
+  // Important 3 (fix pass 4): the old assertion only checked `output.toContain("RESOLVED")`
+  // — but the OTHER FATAL this fence can emit ("FATAL: RESOLVED carries no requiredChecks
+  // array...") also contains that token, so deleting the `[ -n "$RESOLVED" ]` line entirely
+  // left this test green (the REQUIRED_COUNT guard below it still refuses, just with the
+  // wrong message). Anchor on the specific message the `[ -n "$RESOLVED" ]` line actually
+  // emits, so a mutation that deletes that exact line is caught here rather than papered over
+  // by the next guard down.
   test("refuses (does not silently fall through) when RESOLVED is entirely unset, not merely empty (Critical 1)", async () => {
     const { code, output } = await runLoopResolvedUnset([{ name: "build", bucket: "pass" }]);
     expect(code).not.toBe(0);
-    expect(output).toContain("RESOLVED");
+    expect(output).toContain("FATAL: RESOLVED unset");
   });
 
   // Fix pass 3: the second, independent half of the vacuity guard — $RESOLVED is genuinely
@@ -822,6 +1001,71 @@ describe("merge guard: requiredChecks loop refuses a configured check that never
     const { code, output } = await runLoop('not valid json', []);
     expect(code).not.toBe(0);
     expect(output).toContain("FATAL: RESOLVED carries no requiredChecks");
+  });
+
+  // Critical (fix pass 4): `jq`'s `length` builtin is defined on every JSON type, not just
+  // arrays — a `requiredChecks` value that is a STRING or a NUMBER produces a digits-only
+  // `REQUIRED_COUNT` (the string's character count, or the number itself) that satisfies the
+  // OLD `case ''|*[!0-9]*|0)` guard, while `.requiredChecks[]` then errors and the `while` loop
+  // runs zero times — the vacuous-pass Critical 1 already fixed once, reached by a third route.
+  // The reconciliation check alone is not enough here either: with a type-blind REQUIRED_COUNT,
+  // `verified` (0) never equals `REQUIRED_COUNT` (5), so a plain-`length` build would actually
+  // still be refused by the reconciliation — these two cases specifically pin the TYPE assert,
+  // by asserting the type-specific message, not merely a non-zero exit.
+  test("refuses with the requiredChecks-specific FATAL when requiredChecks is a string, not an array (Critical, fix pass 4)", async () => {
+    const { code, output } = await runLoop('{"requiredChecks":"build"}', [{ name: "build", bucket: "pass" }]);
+    expect(code).not.toBe(0);
+    expect(output).toContain("FATAL: RESOLVED carries no requiredChecks array");
+  });
+
+  test("refuses with the requiredChecks-specific FATAL when requiredChecks is a number, not an array (Critical, fix pass 4)", async () => {
+    const { code, output } = await runLoop('{"requiredChecks":42}', [{ name: "build", bucket: "pass" }]);
+    expect(code).not.toBe(0);
+    expect(output).toContain("FATAL: RESOLVED carries no requiredChecks array");
+  });
+
+  // Critical (fix pass 4): prove the reconciliation closes the class INDEPENDENTLY of the type
+  // guard above — mutate REQUIRED_COUNT back to the plain (type-blind) `.requiredChecks |
+  // length` form inline in the script under test, and confirm a mid-loop `gh` death (a check
+  // that never appears, so the loop refuses via the per-check guard before ever reaching the
+  // reconciliation) is still caught by the per-check guard, and — the actual reconciliation
+  // scenario — that a genuine iteration shortfall against a well-typed array is refused even
+  // when every check that DID run passed, proving the count comparison is a real, independent
+  // gate and not just inherited from the per-check guards.
+  test("reconciliation refuses an iteration shortfall even with the type guard reverted to plain `length` (Critical, fix pass 4)", async () => {
+    // Revert the type guard back to the pre-fix, type-blind form inline in the extracted
+    // fence text under test — proving the reconciliation below is a genuinely independent
+    // gate, not one that merely inherits its correctness from the type guard above it.
+    const script = extractRequiredChecksLoop().replace(
+      'if (.requiredChecks | type) == "array" then (.requiredChecks | length) else "bad" end',
+      ".requiredChecks | length",
+    );
+    expect(script).not.toContain('if (.requiredChecks | type) == "array"'); // the mutation actually applied
+    // Three configured checks, every one of which `gh` reports as passing — the per-check
+    // guards alone have nothing to refuse on. Truncate what the loop actually ITERATES (not
+    // `gh`'s answers) via `head -n 2`, modeling a `jq`/`gh` process that dies partway through
+    // emitting `.requiredChecks[]` — the loop runs to completion on 2 of 3 with every visited
+    // check passing, so only the reconciliation can catch the shortfall.
+    const binDir = makeFakeGh([
+      { name: "build", bucket: "pass" },
+      { name: "lint", bucket: "pass" },
+      { name: "test", bucket: "pass" },
+    ]);
+    const truncated = script.replace(
+      'done < <(echo "$RESOLVED" | jq -r \'.requiredChecks[]\')',
+      'done < <(echo "$RESOLVED" | jq -r \'.requiredChecks[]\' | head -n 2)',
+    );
+    const fullScript = `RESOLVED='{"requiredChecks":["build","lint","test"]}'\nREPO=org/repo\nPR=1\n${truncated}`;
+    const proc = Bun.spawn(["bash", "-c", fullScript], {
+      env: { PATH: `${binDir}:${process.env.PATH ?? ""}` },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const out = await new Response(proc.stdout).text();
+    const err = await new Response(proc.stderr).text();
+    const code = await proc.exited;
+    expect(code).not.toBe(0);
+    expect(out + err).toContain("REFUSING: only 2 of 3 required checks were evaluated");
   });
 
   // Important 2: a transient `gh` failure (secondary rate limit, 502, expired token) inside
@@ -859,10 +1103,23 @@ describe("§5 Linear status is parameterized on the configured mergedStatus, not
     return txt.slice(start, end);
   }
 
+  // Important 3 (fix pass 4): the old assertion anchored on the exact byte sequence
+  // `Set the story to **`Pre-QA`**` and separately checked `s5.toContain("$MERGED_STATUS")`
+  // — but that second check is satisfied by the `$MERGED_STATUS` token ANYWHERE in §5 (e.g.
+  // the heading), so a re-hardcode with different markdown emphasis (`Set the story to
+  // `Pre-QA`` — no bold) survived undetected. Anchor POSITIVELY on the instruction line
+  // itself via regex (so emphasis-style drift can't hide behind it), and separately assert
+  // that §5's INSTRUCTION TEXT — §5 minus the historical blockquote, which legitimately and
+  // deliberately preserves the literal `Pre-QA` as a fact about a specific past run — carries
+  // no `Pre-QA` literal at all.
   test("§5 sets the story to the configured $MERGED_STATUS, not the literal 'Pre-QA'", () => {
     const s5 = section5();
-    expect(s5).toContain("$MERGED_STATUS");
-    expect(s5).not.toContain("Set the story to **`Pre-QA`**");
+    expect(s5).toMatch(/Set the story to \*\*`\$MERGED_STATUS`\*\*/);
+    const instructionText = s5
+      .split("\n")
+      .filter((line) => !line.trimStart().startsWith(">"))
+      .join("\n");
+    expect(instructionText).not.toContain("Pre-QA");
   });
 
   test("§5's re-read-and-assert-it-stuck step asserts against $MERGED_STATUS, not the literal 'Pre-QA'", () => {

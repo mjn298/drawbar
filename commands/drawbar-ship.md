@@ -233,9 +233,34 @@ PR="<from the report>"
 # runs:
 RESOLVED="<Preflight's resolved_config JSON>"
 
+# MUST-CHECK bash-fence-cross-invocation-state-needs-unseeded-test (Important, fix pass 4):
+# $REPO and $BASE_BRANCH are the SAME cross-invocation dependency as $RESOLVED above — this
+# fence consumes both, including at the final merge step itself, but before this fix only
+# $RESOLVED was re-declared here. `REPO` in particular is a commonly-exported ambient shell
+# env-var name; an operator's own shell leaking one in would silently target every gate AND
+# the merge at the wrong repository, with no refusal. Derive both from the re-declared
+# $RESOLVED, the same way Preflight does, rather than trusting whatever is already in the
+# environment.
+# --- derive REPO and BASE_BRANCH from RESOLVED -------------------------------------------
+REPO=$(echo "$RESOLVED" | jq -r '.repo // empty')
+BASE_BRANCH=$(echo "$RESOLVED" | jq -r '.baseBranch // empty')
+for v in REPO BASE_BRANCH; do
+  val="${!v}"
+  [ -n "$val" ] && [ "$val" != "null" ] || { echo "FATAL: $v is empty or null after validation — refusing."; exit 1; }
+done
+# --- end derive REPO and BASE_BRANCH from RESOLVED ----------------------------------------
+
 # CI actually passed. The story-lead waited for checks to CONCLUDE; concluded is not green.
 bad=$(gh pr checks -R "$REPO" "$PR" --json bucket \
       --jq '[.[] | select(.bucket=="fail" or .bucket=="cancel")] | length')
+# Fail-CLOSED direction (Minor, fix pass 4, same shape as the `$seen` guard below): `$bad`
+# must be a genuine non-negative integer. A degraded `gh` (secondary rate limit, 502, expired
+# token) exits non-zero with EMPTY stdout — `[ "$bad" = "0" ]` happens to fail-closed on that
+# by accident ("" != "0"), but it reports "REFUSING:  failing/cancelled checks" with an empty
+# count, indistinguishable from a real bug in this fence. Diagnose it explicitly instead.
+case "$bad" in
+  ''|*[!0-9]*) echo "REFUSING: failing/cancelled check count could not be read (gh or jq returned '$bad')"; exit 1 ;;
+esac
 [ "$bad" = "0" ] || { echo "REFUSING: $bad failing/cancelled checks"; exit 1; }
 
 # requiredChecks (from the resolved config): every configured name must have actually RUN
@@ -250,12 +275,21 @@ bad=$(gh pr checks -R "$REPO" "$PR" --json bucket \
 # non-empty AND that it actually yields at least one check, before the loop is trusted at all
 # — the same shape as the `lc()` self-test and the `STORY` and `BASE_BRANCH` asserts below.
 [ -n "$RESOLVED" ] || { echo "FATAL: RESOLVED unset — requiredChecks gate would be vacuous"; exit 1; }
-REQUIRED_COUNT=$(echo "$RESOLVED" | jq -r '.requiredChecks | length' 2>/dev/null)
-case "$REQUIRED_COUNT" in ''|*[!0-9]*|0) echo "FATAL: RESOLVED carries no requiredChecks — requiredChecks gate would be vacuous"; exit 1 ;; esac
+# MUST-CHECK jq-length-is-type-blind (Critical, fix pass 4): `jq`'s `length` builtin is
+# defined on EVERY JSON type, not just arrays —
+# `{"requiredChecks":"build"} | .requiredChecks | length` returns 5 (the string's character
+# count), which satisfies a digits-only count check even though `.requiredChecks[]` then
+# ERRORS ("Cannot iterate over string") and emits nothing on stdout, so the `while` loop below
+# runs zero times and exits 0 — the exact vacuous-pass this guard exists to close, reached by
+# a route the count-only check never saw. Assert the TYPE is `array` first, not merely that
+# its `length` looks like a count.
+REQUIRED_COUNT=$(echo "$RESOLVED" | jq -r 'if (.requiredChecks | type) == "array" then (.requiredChecks | length) else "bad" end' 2>/dev/null)
+case "$REQUIRED_COUNT" in ''|*[!0-9]*|0) echo "FATAL: RESOLVED carries no requiredChecks array — requiredChecks gate would be vacuous"; exit 1 ;; esac
 
 # `while read` + process substitution, NOT `mapfile`/`readarray` — those need bash 4+, and
 # the `bash` an operator actually has on PATH (notably macOS's shipped `/bin/bash`) is
 # routinely 3.2.
+verified=0
 while IFS= read -r check; do
   # `gh`'s own `--jq` takes exactly ONE expression string — it has no `--arg` of its own
   # (unlike the real `jq` binary). Piping gh's raw JSON into a separate `jq --arg` process is
@@ -272,7 +306,13 @@ while IFS= read -r check; do
     ''|*[!0-9]*) echo "REFUSING: required check '$check' status could not be read (gh or jq returned '$seen')"; exit 1 ;;
   esac
   [ "$seen" -gt 0 ] || { echo "REFUSING: required check '$check' never ran / did not pass"; exit 1; }
+  verified=$((verified + 1))
 done < <(echo "$RESOLVED" | jq -r '.requiredChecks[]')
+# Reconciliation (Critical, fix pass 4): closes the whole class independent of the type guard
+# above — including a `jq`/`gh` failure that kills the loop partway through the list without
+# tripping either per-check guard. Count loop iterations and refuse unless it matches
+# $REQUIRED_COUNT exactly.
+[ "$verified" -eq "$REQUIRED_COUNT" ] || { echo "REFUSING: only $verified of $REQUIRED_COUNT required checks were evaluated"; exit 1; }
 
 # Identity: Linear ids are uppercase (<TEAM>-####), the branches its GitHub integration
 # generates are lowercase (<user>/<team>-####-…). Compare case-insensitively.
