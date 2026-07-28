@@ -1,3 +1,8 @@
 node_modules/
 *.db
 .claude/settings.local.json
+
+# The operator's real ship config carries real repo/team/status values — never tracked.
+# .drawbar/ship.config.example.json (placeholders only) IS tracked; this pattern is
+# specific enough that it does not shadow it.
+.drawbar/ship.config.json

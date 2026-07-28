@@ -27,41 +27,68 @@ story N assumes N−1 is on `main`.
 
 ## Preflight (halt on any failure)
 
-> **Do not run this command against any real repository until the CodeRabbit review-gate
-> fix (`<TEAM>-####`) has landed.** `EXPECTED_REPO` below gates repository *mismatch*, not
-> that defect — this repo is public, so treat the gate as accident containment, not a
-> security boundary.
+> The CodeRabbit review-gate predicate (`scripts/lib/coderabbit.ts`) is in place and merged
+> on `main` — see `drawbar-story-lead` §7. The config's validated `repo` identity below is
+> what anchors every `gh` call at the right target; this repo is public, so treat that
+> identity as accident containment, not a security boundary.
 
 ```bash
 command -v drawbar-kb >/dev/null || { echo "no drawbar-kb — run /drawbar-setup"; exit 1; }
 command -v gh        >/dev/null && gh auth status >/dev/null 2>&1 || { echo "gh not authed"; exit 1; }
 
-# Resolve both roots ABSOLUTELY so this runs from <env-repo>/ or <repo>/ alike.
-ENV_DIR=$PWD
-[ -d "$ENV_DIR/.drawbar/memory" ] || ENV_DIR=$(dirname "$PWD")     # invoked from <repo>/
-[ -d "$ENV_DIR/.drawbar/memory" ] || { echo "FATAL: no .drawbar/memory — run from <env-repo>/ or <repo>/"; exit 1; }
-PROJECT_DIR="${PROJECT_DIR:-$ENV_DIR/<repo>}"
-[ -d "$PROJECT_DIR/.git" ] || { echo "FATAL: no git repo at $PROJECT_DIR"; exit 1; }
+# MUST-CHECK repo-anchor-guard-is-what-gates-an-unfixed-vulnerability: fail closed if the
+# plugin root isn't set — nothing below can find ship-config.ts without it. Same guard
+# drawbar-story-lead §7 uses.
+: "${CLAUDE_PLUGIN_ROOT:?CLAUDE_PLUGIN_ROOT must be set}"
+
+# Locked 17: CONFIG comes from config, resolved EXPLICITLY. No walking up to a parent
+# directory, and no probing for a sibling knowledge-repo checkout anywhere in this file —
+# both are gone for good; every downstream value comes from the validated config instead.
+CONFIG="${DRAWBAR_SHIP_CONFIG:-$PWD/.drawbar/ship.config.json}"
+[ -f "$CONFIG" ] || { echo "FATAL: no config at $CONFIG — copy .drawbar/ship.config.example.json, fill in real values, and either place the copy there or set DRAWBAR_SHIP_CONFIG to point at it."; exit 1; }
+
+# Fetch the Linear facts THIS AGENT SESSION can see via MCP — ship-config.ts has no Linear
+# tools of its own, only the session driving this command does — and hand them to the
+# validator as JSON on stdin, the same convention `drawbar-kb add` uses:
+#   list_teams                                  -> feeds "teams": [...]
+#   list_issue_statuses for the configured team  -> feeds "statuses": [{"name":...,"type":...}, ...]
+# Assemble `{"teams":[...],"statuses":[...]}` and pipe it in. All five Locked-18 assertions —
+# repo identity, projectDir/envDir separation, team resolution, mergedStatus being type
+# `started`, and baseBranch being the repo's actual default branch — run inside
+# ship-config.ts; they are never reimplemented here in bash.
+RESOLVED=$(echo "$LINEAR_FACTS_JSON" | bun run "${CLAUDE_PLUGIN_ROOT}/scripts/lib/ship-config.ts" validate --config "$CONFIG") \
+  || { echo "FATAL: ship-config validation refused — see stderr above for the specific reason."; exit 1; }
+# Expected stdout on a pass (the `resolved_config` payload — every field present, none null):
+#   {"envDir":"/abs/path/to/knowledge-repo","projectDir":"/abs/path/to/code-repo",
+#    "repo":"<org>/<repo>","team":"<TEAM>","baseBranch":"main","mergedStatus":"<status>",
+#    "requiredChecks":["<check>"],"observed":{"projectDirRemote":"<org>/<repo>",
+#    "envDirRemote":"<org>/<knowledge-repo>","defaultBranch":"main"}}
+
+# --- derive from the resolved config -----------------------------------------------------
+ENV_DIR=$(echo "$RESOLVED" | jq -r '.envDir // empty')
+PROJECT_DIR=$(echo "$RESOLVED" | jq -r '.projectDir // empty')
+REPO=$(echo "$RESOLVED" | jq -r '.repo // empty')
+BASE_BRANCH=$(echo "$RESOLVED" | jq -r '.baseBranch // empty')
+
+# MUST-CHECK repo-anchor-guard-is-what-gates-an-unfixed-vulnerability: quote every one of
+# these, and assert each is non-empty and NOT the literal string "null" before anything below
+# depends on it — jq's `// empty` already collapses a JSON `null` to `""`, but a value that
+# somehow arrives as the STRING "null" (a malformed `resolved_config`) must not silently
+# satisfy a downstream substring/case guard either.
+for v in ENV_DIR PROJECT_DIR REPO BASE_BRANCH; do
+  val="${!v}"
+  [ -n "$val" ] && [ "$val" != "null" ] || { echo "FATAL: $v is empty or null after validation — refusing."; exit 1; }
+done
 KB="$ENV_DIR/.drawbar/memory"
+# --- end derive from the resolved config -------------------------------------------------
 
-# NEVER a bare `gh repo view`: <env-repo> is itself a git repo with a GitHub remote, so from
-# that cwd it resolves to <org>/<env-repo> and every `gh pr` call silently targets
-# the WRONG repository — gh succeeds, finds no matching PR, and the gate never satisfies.
-REPO=$(git -C "$PROJECT_DIR" remote get-url origin 2>/dev/null \
-       | sed -E 's#(git@|https://)github\.com[:/]##; s#\.git$##')
+[ -d "$PROJECT_DIR/.git" ] || { echo "FATAL: no git repo at $PROJECT_DIR"; exit 1; }
 
-# EXPECTED_REPO ("<org>/<repo>") is the ONLY thing standing between an anonymous PR and the
-# CodeRabbit verdict predicate (`scripts/lib/coderabbit.ts`, called from drawbar-story-lead
-# §7) — see that agent's file for why an unreachable gate there is a live vulnerability, not
-# a nicety. It is filled in properly by S3's
-# ship-config.ts; until then it MUST NOT default to a real value here. Fail closed: unset
-# or empty means REFUSE, never "allow anything."
-: "${EXPECTED_REPO:=}"
-[ -n "$EXPECTED_REPO" ] || { echo "FATAL: EXPECTED_REPO is unset — refusing to run without a configured target repo."; exit 1; }
-case "$REPO" in
-  "$EXPECTED_REPO") ;;
-  *) echo "FATAL: expected repo '$EXPECTED_REPO', got '${REPO:-<empty>}'."; exit 1 ;;
-esac
+# This repo is public. NEVER a bare `gh repo view`: $ENV_DIR is itself a git repo with a
+# GitHub remote, so from that cwd it resolves to the WRONG repository and every `gh pr` call
+# would silently target it, succeed, find no matching PR, and never satisfy the gate. The
+# validated $REPO above — resolved and checked by ship-config.ts, never re-derived here — is
+# what anchors every downstream `gh` call at the actually-configured project repo instead.
 ```
 
 Dirty `$PROJECT_DIR` tree → **do not halt blindly**; go to *Crash recovery* below. A dirty tree
@@ -181,16 +208,34 @@ bad=$(gh pr checks -R "$REPO" "$PR" --json bucket \
       --jq '[.[] | select(.bucket=="fail" or .bucket=="cancel")] | length')
 [ "$bad" = "0" ] || { echo "REFUSING: $bad failing/cancelled checks"; exit 1; }
 
+# requiredChecks (from the resolved config): every configured name must have actually RUN
+# and landed in a passing bucket — a check that never ran (renamed, or the workflow that
+# reports it never fired) must refuse, not be silently waved through just because nothing
+# failed or cancelled.
+# `while read` + process substitution, NOT `mapfile`/`readarray` — those need bash 4+, and
+# the `bash` an operator actually has on PATH (notably macOS's shipped `/bin/bash`) is
+# routinely 3.2.
+while IFS= read -r check; do
+  # `gh`'s own `--jq` takes exactly ONE expression string — it has no `--arg` of its own
+  # (unlike the real `jq` binary). Piping gh's raw JSON into a separate `jq --arg` process is
+  # what actually lets `$check` bind safely as a jq variable instead of being string-spliced
+  # into the filter.
+  seen=$(gh pr checks -R "$REPO" "$PR" --json name,bucket \
+         | jq --arg n "$check" '[.[] | select(.name==$n and .bucket=="pass")] | length')
+  [ "$seen" != "0" ] || { echo "REFUSING: required check '$check' never ran / did not pass"; exit 1; }
+done < <(echo "$RESOLVED" | jq -r '.requiredChecks[]')
+
 # Identity: Linear ids are uppercase (<TEAM>-####), the branches its GitHub integration
 # generates are lowercase (<user>/<team>-####-…). Compare case-insensitively.
 lc() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
 [ "$(lc ABC-1)" = "abc-1" ] || { echo "FATAL: lc() is broken — merge guard would be vacuous"; exit 1; }
 [ -n "$STORY" ] || { echo "FATAL: STORY unset — branch guard would be vacuous"; exit 1; }
+[ -n "$BASE_BRANCH" ] || { echo "FATAL: BASE_BRANCH unset — base guard would be vacuous"; exit 1; }
 
 read -r br base state < <(gh pr view -R "$REPO" "$PR" --json headRefName,baseRefName,state \
                           --jq '"\(.headRefName) \(.baseRefName) \(.state)"')
 case "$(lc "$br")" in *"$(lc "$STORY")"*) ;; *) echo "REFUSING: branch '$br' is not $STORY"; exit 1 ;; esac
-[ "$base"  = "main" ] || { echo "REFUSING: base is '$base', not main"; exit 1; }
+[ "$base"  = "$BASE_BRANCH" ] || { echo "REFUSING: base is '$base', not the configured '$BASE_BRANCH'"; exit 1; }
 [ "$state" = "OPEN" ] || { echo "REFUSING: PR state is '$state'"; exit 1; }
 
 gh pr merge -R "$REPO" "$PR" --squash --delete-branch
@@ -204,9 +249,9 @@ force-push, never touch `main` directly.
 > version was correct. The self-test settles that question in one line rather than by
 > archaeology — and would catch a real regression the same way.
 
-> Each merge queues a staging deploy through the project's `<ci-workflow>.yml`
-> (`cancel-in-progress: false`); merges serialize, so one deploy runs per story. Production
-> deploys are triggered manually — this loop cannot reach them.
+> This command merges exactly one story per invocation and never triggers a deployment
+> itself — sequential-only (see the Hard rules) is what keeps that true regardless of
+> whatever the target repo's own CI does on merge to its default branch.
 
 ## 5. Linear status — `Pre-QA`, and verify it stuck
 
@@ -295,7 +340,8 @@ then `ScheduleWakeup({stop: true})`.
 
 - Sequential. One story per invocation. Never parallel.
 - Halt on failure; never skip a story.
-- `--base main` always. Never stack.
+- `--base` is always the configured `baseBranch` (Preflight validates it against the repo's
+  actual default branch). Never stack.
 - Never `--no-verify`, never force-push, never commit to `main` directly.
 - Never merge a PR outside the T0 snapshot.
 - **Never set `Done` / `Ready For QA` / `Ready for Rollout` / `Rolled Out`** — and never
@@ -307,15 +353,20 @@ then `ScheduleWakeup({stop: true})`.
 
 ## Operator notes
 
-- **`EXPECTED_REPO=<org>/<repo>` and `PROJECT_DIR=<path-to-repo>` must be exported before
-  running.** Both fail closed when unset: `EXPECTED_REPO` refuses outright, and unset
-  `PROJECT_DIR` falls back to a literal `<repo>` path that has no `.git`, so it also
-  refuses. Unset is a deliberate refusal, not a bug — configure both first.
-- **Do not point `EXPECTED_REPO` at any real repository until the CodeRabbit review-gate
-  fix (`<TEAM>-####`) has landed.** Setting it to your own repo is a one-env-var opt-in
-  past the containment, not a security boundary — this repo is public.
-- Run from **either `<env-repo>/` or `<repo>/`** — preflight resolves `$ENV_DIR`,
-  `$PROJECT_DIR` and `$KB` absolutely, and nothing below uses a cwd-relative path.
+- **A config file must exist before running.** Copy `.drawbar/ship.config.example.json`,
+  fill in real `envDir` / `projectDir` / `repo` / `team` / `baseBranch` / `mergedStatus` /
+  `requiredChecks` values, and either save it at `<cwd>/.drawbar/ship.config.json` or point
+  `DRAWBAR_SHIP_CONFIG` at it. Preflight fails closed on a missing file, and
+  `ship-config.ts` fails closed on every one of the five Locked-18 assertions (repo identity,
+  `projectDir`/`envDir` separation, team resolution, `mergedStatus` type, `baseBranch` being
+  the repo default) — a copied-but-unedited example is refused outright (see the
+  `scaffolding` describe in `scripts/plugin.test.ts`).
+- **The example config's placeholder values are deliberately invalid** — this repo is
+  public, so a config that "just works" out of the box would be a one-file opt-in past the
+  repo-identity containment the config exists to provide.
+- Nothing in this command probes `$PWD` or a parent directory for `.drawbar/memory` or a
+  project checkout — `$ENV_DIR`, `$PROJECT_DIR`, `$REPO`, `$BASE_BRANCH` and `$KB` all come
+  from the validated config, resolved absolutely, regardless of the directory you run from.
 - Code git work targets `$PROJECT_DIR`; the knowledge sync targets `$ENV_DIR`. Separate repos.
 - Session must survive the night: `caffeinate -is`.
 - Permissions must be pre-approved or the loop stalls at the first `gh pr merge` until
