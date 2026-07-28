@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(drawbar-kb recall *)",
+      "Bash(drawbar-kb stats *)",
+      "Bash(command -v *)",
+      "Bash(bun test)",
+      "Bash(bun test *)",
+      "mcp__claude_ai_Linear__get_issue",
+      "mcp__claude_ai_Linear__list_issues",
+      "mcp__claude_ai_Linear__list_comments",
+      "mcp__claude_ai_Linear__list_issue_statuses",
+      "mcp__claude_ai_Linear__list_issue_labels"
+    ]
+  }
+}
