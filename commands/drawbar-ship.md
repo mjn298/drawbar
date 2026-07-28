@@ -50,9 +50,10 @@ KB="$ENV_DIR/.drawbar/memory"
 REPO=$(git -C "$PROJECT_DIR" remote get-url origin 2>/dev/null \
        | sed -E 's#(git@|https://)github\.com[:/]##; s#\.git$##')
 
-# EXPECTED_REPO ("<org>/<repo>") is the ONLY thing standing between an anonymous PR and
-# `cr_ready()` in drawbar-story-lead §7 — see that agent's file for why an unreachable gate
-# there is a live vulnerability, not a nicety. It is filled in properly by S3's
+# EXPECTED_REPO ("<org>/<repo>") is the ONLY thing standing between an anonymous PR and the
+# CodeRabbit verdict predicate (`scripts/lib/coderabbit.ts`, called from drawbar-story-lead
+# §7) — see that agent's file for why an unreachable gate there is a live vulnerability, not
+# a nicety. It is filled in properly by S3's
 # ship-config.ts; until then it MUST NOT default to a real value here. Fail closed: unset
 # or empty means REFUSE, never "allow anything."
 : "${EXPECTED_REPO:=}"
@@ -356,3 +357,16 @@ above is round *two*, after the fix push at 18:00:51. Three heuristics it replac
   merge* on exactly the large diffs where that costs most.
 
 Verified in the first real run: concluded `success` in ~3 minutes and re-armed per head sha.
+
+**Amendment (F14):** the commit status is still the right *signal* — this section's
+evidence for that stands — but `.state` alone is not the right *predicate*. A rate-limited
+review reports `state=success` with `description="Review rate limited"`: CodeRabbit never
+actually reviewed the diff, yet a `.state`-only gate (`success|failure|error` all satisfy it)
+treats that identically to a real pass. `scripts/lib/coderabbit.ts` replaces the `.state`
+check with an allowlist of the exact `(state, description)` pair above — `state=success` AND
+`description="Review completed"` — against the current head sha, taking the MAX `updated_at`
+among candidates rather than trusting API order (`| first` is not a defined ordering) and
+requiring unanimous agreement among any tied candidates — it no longer sorts. A same-second
+tie between `Review completed` and any other CodeRabbit status therefore can never pass;
+`TIMEOUT`/parked is expected in that case, not a bug. A rate-limited verdict parks the story
+instead of either passing or waiting forever; see drawbar-story-lead §7.

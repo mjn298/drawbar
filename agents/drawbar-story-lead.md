@@ -108,23 +108,72 @@ default branch — any other base silently gets neither.
 
 ## 7. Drive it green
 
-Wait for CI to conclude and for CodeRabbit's commit status on the current head:
+Wait for CI to conclude and for CodeRabbit's completion verdict on the current head. The
+verdict predicate has exactly one implementation in this repo —
+`${CLAUDE_PLUGIN_ROOT}/scripts/lib/coderabbit.ts` — and it is never reimplemented here in
+bash. Keying on `.state` alone is wrong: a rate-limited review reports `state=success` with
+`description="Review rate limited"`, which a `.state`-only gate cannot distinguish from a
+real pass. The module takes the MAX `updated_at` among candidate statuses (never `| first`
+on unspecified API order) and requires unanimous agreement among any tied candidates — it no
+longer sorts. Operator-relevant consequence: a same-second tie between `Review completed` and
+any other CodeRabbit status can never pass; `TIMEOUT`/parked is expected in that case, not a
+bug. Only the exact allowlisted pair (`state=success`, `description="Review completed"`)
+against the current head sha returns ok.
 
 ```bash
 DEADLINE=$(( $(date -u +%s) + 3600 ))
-cr_ready() {
-  local head st
-  head=$(gh api "repos/$REPO/pulls/$PR" --jq '.head.sha' 2>/dev/null); [ -n "$head" ] || return 1
-  st=$(gh api "repos/$REPO/commits/$head/statuses" \
-       --jq 'map(select(.context=="CodeRabbit")) | first | .state // "none"' 2>/dev/null)
-  case "$st" in success|failure|error) return 0 ;; *) return 1 ;; esac
-}
+STATUS="waiting"
+FETCH_FAILS=0
 while :; do
-  gh pr checks -R "$REPO" "$PR" --json bucket --jq 'all(.bucket!="pending")' 2>/dev/null | grep -q true && cr_ready && break
-  [ "$(date -u +%s)" -ge "$DEADLINE" ] && { echo "TIMEOUT"; break; }
+  # MUST-CHECK repo-anchor-guard-is-what-gates-an-unfixed-vulnerability: assert the anchor is
+  # non-empty before anything below depends on it, not just quote it.
+  : "${CLAUDE_PLUGIN_ROOT:?CLAUDE_PLUGIN_ROOT must be set}"
+  if gh pr checks -R "$REPO" "$PR" --json bucket --jq 'all(.bucket!="pending")' 2>/dev/null | grep -q true; then
+    # No `set -e` in this fence: an ordinary "not finished yet" poll exits non-zero by
+    # design, and `VERDICT=$(...)` would propagate that under `set -e`, killing the loop on
+    # its first iteration. If a future caller wraps this fence in `set -e`, guard this line
+    # with `|| true`.
+    VERDICT=$(bun run "${CLAUDE_PLUGIN_ROOT}/scripts/lib/coderabbit.ts" verdict --repo "$REPO" --pr "$PR")
+    # Expected output on a real pass:        {"ok":true}
+    # Expected output when rate-limited:     {"ok":false,"reason":"rate_limited"}
+    # Expected output while still in review: {"ok":false,"reason":"not_completed"}
+    # Expected output on infra failure:      {"ok":false,"reason":"fetch_failed"}
+    OK=$(echo "$VERDICT" | jq -r '.ok' 2>/dev/null)
+    REASON=$(echo "$VERDICT" | jq -r '.reason // empty' 2>/dev/null)
+    # A verdict that isn't a readable {"ok": true|false} parks immediately instead of
+    # burning the full deadline: `bun`/`jq`/the module itself failing silently must be
+    # diagnosable as "the gate is broken", never conflated with "CodeRabbit hasn't
+    # finished yet" (both otherwise look identical — a `TIMEOUT` an hour later).
+    case "$OK" in
+      true|false) ;;
+      *) STATUS="parked"; echo "VERDICT_UNAVAILABLE"; break ;;
+    esac
+    if [ "$OK" = "true" ]; then STATUS="ready"; break; fi
+    # Locked 7: a rate-limited review parks the story outright — no `@coderabbitai` command
+    # is ever issued to try to force a re-review, and waiting longer will not resolve it.
+    if [ "$REASON" = "rate_limited" ]; then STATUS="parked"; break; fi
+    # A parseable `fetch_failed` (e.g. `gh` missing, a transient 502) previously fell through
+    # to the ordinary poll-until-deadline path below — indistinguishable from "CodeRabbit
+    # hasn't finished yet" until the full hour elapsed. A transient failure is worth a
+    # retry; a persistently broken gate is not — bound consecutive occurrences instead of
+    # parking on the very first one, or burning the whole deadline on every one.
+    if [ "$REASON" = "fetch_failed" ]; then
+      FETCH_FAILS=$((FETCH_FAILS + 1))
+      if [ "$FETCH_FAILS" -ge 3 ]; then
+        STATUS="parked"; echo "FETCH_FAILED_REPEATED"; break
+      fi
+    else
+      FETCH_FAILS=0
+    fi
+  fi
+  if [ "$(date -u +%s)" -ge "$DEADLINE" ]; then STATUS="parked"; echo "TIMEOUT"; break; fi
   sleep 60
 done
 ```
+
+`STATUS=parked` — from either the rate-limited refusal above or the `TIMEOUT` branch — means
+this story is **not** `ready_to_merge`; report `status: parked` in §8 exactly as for any
+other unresolved gate. Only `STATUS=ready` may proceed past this section.
 
 The status is pinned to the head sha, so it re-arms on every push automatically.
 
