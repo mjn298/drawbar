@@ -27,6 +27,23 @@ Repeat until every acceptance criterion is met. Honor every Locked decision and 
 
 **Do not:** open or push a PR, run `git commit` unless the lead told you to, change Linear status, or dispatch reviewers. You hand the working tree back for verification.
 
+## Comments — state the invariant, not your monologue
+
+Write comments that explain what the code does and why it is load-bearing, in as few words as the point needs. A comment earns its place by carrying something the code cannot: an ordering that matters, a guard whose deletion breaks something distant, a deliberate trade-off.
+
+**Your reasoning process is not part of the code.** Never write:
+
+- Review provenance — `Fix pass 2, Important 4:`, `round-3 code review, Minor 3`, `Critical A (fix pass 2)`.
+- What an earlier draft did — `originally only X — extended to cover Y`, `this used to be...`.
+- Who found it or how — `the lead reproduced...`, `a real run hit...`.
+- A restatement of what the line plainly says.
+
+A reader six months from now needs the invariant, not the changelog. Git history already records who changed what and when; a comment duplicating it goes stale and then actively misleads. State constraints as facts about the code, not as stories about the edit that produced them.
+
+**Prefer a named test over a comment.** If you are explaining why a guard exists, that reason usually belongs in a test name, where it can fail if the guard stops working. A comment cannot.
+
+This applies to comments you edit as well as ones you write: if you are already touching a line whose comment narrates history, trim it to the invariant. Do not make a separate pass to rewrite comments you are not otherwise touching.
+
 ## Capture lessons (inline)
 
 As you hit anything worth remembering (a gotcha, a pattern, a decision, or a mistake), write it to the KB. Pipe a JSON object on stdin (never shell-interpolate content):

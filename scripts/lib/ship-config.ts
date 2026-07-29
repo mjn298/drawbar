@@ -1,17 +1,16 @@
 // Portability config for `/drawbar-ship`. Locked 17: `$ENV_DIR` (and every other
 // environment-specific value the runbooks used to hardcode or probe via `$PWD`) comes from
 // a validated config file, never from a parent-directory probe. This module owns two
-// distinct jobs, kept as two separate exported functions per the house style in
-// scripts/lib/coderabbit.ts:
+// distinct jobs, kept as two separate exported functions:
 //
 //   - `parseShipConfig` — STRUCTURAL validation only (shape, types, exact key set). Never
 //     touches the filesystem or any external tool, and never silently defaults a value.
-//   - `validateShipConfig` — the pure verdict function implementing Locked 18's five
-//     preflight assertions, with `git`/`gh` as injected `Runner`s (same signature
-//     coderabbit.ts uses) so the whole module is testable with `gh` and `git` absent from
-//     PATH. `linear` is injected DATA, not a runner: the Linear MCP is only reachable from
-//     the agent session, not from bash/TS, so the runbook fetches the facts and hands them
-//     in as JSON on stdin (see the CLI entry point below).
+//   - `validateShipConfig` — the pure verdict function implementing Locked 18's four
+//     preflight assertions, with `git`/`gh` as injected `Runner`s so the whole module is
+//     testable with `gh` and `git` absent from PATH. `linear` is injected DATA, not a
+//     runner: the Linear MCP is only reachable from the agent session, not from bash/TS, so
+//     the runbook fetches the facts and hands them in as JSON on stdin (see the CLI entry
+//     point below).
 //
 // `commands/drawbar-ship.md`'s Preflight section pipes the Linear facts into
 // `bun run .../ship-config.ts validate --config <path>` and reads `resolved_config` off
@@ -19,7 +18,6 @@
 
 import { readFileSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
-import { isValidRepo } from "./coderabbit";
 
 export interface ShipConfig {
   envDir: string;
@@ -27,16 +25,15 @@ export interface ShipConfig {
   repo: string;
   team: string;
   baseBranch: string;
-  mergedStatus: string;
   requiredChecks: string[];
 }
 
-// Exactly these seven keys — no more, no fewer. Declared once so the missing/unknown-key
+// Exactly these six keys — no more, no fewer. Declared once so the missing/unknown-key
 // checks in `parseShipConfig` and the CLI's JSON.stringify of `ResolvedConfig` cannot drift
 // from each other.
-const REQUIRED_KEYS = ["envDir", "projectDir", "repo", "team", "baseBranch", "mergedStatus", "requiredChecks"] as const;
+const REQUIRED_KEYS = ["envDir", "projectDir", "repo", "team", "baseBranch", "requiredChecks"] as const;
 type RequiredKey = (typeof REQUIRED_KEYS)[number];
-const STRING_KEYS: readonly RequiredKey[] = ["envDir", "projectDir", "repo", "team", "baseBranch", "mergedStatus"];
+const STRING_KEYS: readonly RequiredKey[] = ["envDir", "projectDir", "repo", "team", "baseBranch"];
 
 export type ParseReason =
   | "invalid_json"
@@ -55,13 +52,13 @@ export type ParseResult = { ok: true; config: ShipConfig } | { ok: false; reason
 //
 // MUST-CHECK path-segment-shape-check-must-also-reject-control-chars: reject C0 control
 // characters (including a literal newline) and DEL, and require non-empty after trimming.
-// Canonical implementation site for the whole repo — `run-state.ts` and `merge-guard.ts` used
-// to each carry their own byte-identical copy of this exact regex/predicate; a fix pass
-// consolidated all three into this ONE export, which they now import instead of redeclaring.
-// `parseShipConfig`'s own STRING_KEYS/`requiredChecks` checks below are what close the last
-// gap: every configured string value (envDir, projectDir, repo, team, baseBranch,
-// mergedStatus, and each requiredChecks entry) is fed back into agent-facing prose or a shell
-// invocation somewhere downstream, and used to admit control characters unchecked here.
+// Canonical implementation site for the whole repo — `run-state.ts` used to carry its own
+// byte-identical copy of this exact regex/predicate; a fix pass consolidated it into this ONE
+// export, which it now imports instead of redeclaring. `parseShipConfig`'s own
+// STRING_KEYS/`requiredChecks` checks below are what close the last gap: every configured
+// string value (envDir, projectDir, repo, team, baseBranch, and each requiredChecks entry) is
+// fed back into agent-facing prose or a shell invocation somewhere downstream, and used to
+// admit control characters unchecked here.
 //
 // MINOR (fix pass 2): originally only C0 controls (`\x00-\x1f`) and DEL (`\x7f`) — extended to
 // cover Unicode format/separator characters that are just as invisible in a terminal or a
@@ -100,21 +97,20 @@ export function sanitizeForOutput(v: unknown): string {
 // --- ref-name shape guard (Important 1, S6/PCO-351; relocated here fix pass 2) -----------
 //
 // Single-implementation-site sibling of the primitive above: `baseBranch` ends up as a
-// positional argument to `git fetch`/`git merge-base --is-ancestor` in merge-guard.ts. Without
-// a shape check, a value like `+refs/heads/attacker:refs/remotes/origin/main` is a REFSPEC, not
-// a plain branch name — `git fetch origin <that>` forcibly rewrites the local
-// `refs/remotes/origin/<base>` ref, which the ancestry assertion then evaluates against,
-// defeating Locked 10 for a sha that was never actually on the real base. A value like
-// `--upload-pack=<cmd>` is a git OPTION, executed by git itself for local-path and ssh remotes.
-// Array-form spawn (never `sh -c`) already stops shell injection; neither of these two attacks
-// is shell injection — they are git argv injection, which only a shape check on the value
-// itself closes.
+// positional argument to `git fetch`/`git merge-base --is-ancestor` at merge time (a later
+// consumer of this validated config). Without a shape check, a value like
+// `+refs/heads/attacker:refs/remotes/origin/main` is a REFSPEC, not a plain branch name —
+// `git fetch origin <that>` forcibly rewrites the local `refs/remotes/origin/<base>` ref,
+// which an ancestry assertion downstream then evaluates against, defeating Locked 10 for a
+// sha that was never actually on the real base. A value like `--upload-pack=<cmd>` is a git
+// OPTION, executed by git itself for local-path and ssh remotes. Array-form spawn (never
+// `sh -c`) already stops shell injection; neither of these two attacks is shell injection —
+// they are git argv injection, which only a shape check on the value itself closes.
 //
-// Lives here (not merge-guard.ts, which used to carry its own copy) so `validateShipConfig`
-// (T0/preflight) can apply the SAME check to `config.baseBranch` the merge-time guard applies
-// later — Minor, fix pass 2: a bad baseBranch used to pass preflight and only fail at merge
-// time, after the story was already implemented. merge-guard.ts imports this rather than
-// carrying a second copy.
+// Lives here so `validateShipConfig` (T0/preflight) can apply this check to
+// `config.baseBranch` before any merge-time consumer does — Minor, fix pass 2: a bad
+// baseBranch used to pass preflight and only fail at merge time, after the story was already
+// implemented.
 //
 // The `(?!-)` lookahead some earlier drafts of this regex carried is intentionally absent —
 // dead code: the character class `[A-Za-z0-9]` a value must START with already forbids a
@@ -123,6 +119,25 @@ export const REF_NAME_SHAPE = /^(?!.*\.\.)(?!.*@\{)[A-Za-z0-9][A-Za-z0-9._/-]*$/
 
 export function isValidRefName(v: string): boolean {
   return REF_NAME_SHAPE.test(v) && !v.endsWith(".lock");
+}
+
+// --- repo shape guard ----------------------------------------------------------------------
+//
+// `repo` ends up in a `gh repo view <repo>` argument below. Refuse a malformed shape before
+// any injected runner is ever called — a segment-level check (not a whole-string character
+// class): `.` and `..` both match `[A-Za-z0-9._-]+`, so a naive per-character check on the
+// whole string lets a two-segment repo whose segment IS `..` through even though it carries
+// no extra `/` — split on `/` and refuse any segment that is exactly `.` or `..`.
+//
+// Exported so `run-state.ts`'s `isValidResolvedConfig` can reuse this exact check on
+// `resolved_config.repo` rather than a second, hand-copied implementation of the same shape
+// check — this repo has a single-implementation-site regression test that scans for
+// duplicated predicates.
+const REPO_SEGMENT_SHAPE = /^(?!\.{1,2}$)[A-Za-z0-9._-]+$/;
+
+export function isValidRepo(repo: string): boolean {
+  const parts = repo.split("/");
+  return parts.length === 2 && parts.every((p) => REPO_SEGMENT_SHAPE.test(p));
 }
 
 // Structural validation ONLY — never resolves a git remote, never calls `gh`, never checks
@@ -202,7 +217,6 @@ export function parseShipConfig(text: string): ParseResult {
       repo: obj.repo as string,
       team: obj.team as string,
       baseBranch: obj.baseBranch as string,
-      mergedStatus: obj.mergedStatus as string,
       requiredChecks: requiredChecks as string[],
     },
   };
@@ -211,10 +225,8 @@ export function parseShipConfig(text: string): ParseResult {
 // Linear facts, injected as DATA (not a runner) — see the module comment above.
 export interface LinearFacts {
   teams: string[];
-  statuses: { name: string; type: string }[];
 }
 
-// Same injected-runner shape as scripts/lib/coderabbit.ts's `Runner`.
 export type Runner = (argv: string[]) => { code: number; stdout: string; stderr?: string };
 
 export interface ValidateInput {
@@ -237,8 +249,6 @@ export type Reason =
   | "repo_is_env_dir_remote"
   | "repo_mismatch"
   | "team_not_found"
-  | "merged_status_not_found"
-  | "merged_status_wrong_type"
   | "gh_failed"
   | "base_branch_not_default";
 
@@ -269,12 +279,13 @@ export function isCleanAbsolutePath(p: string): boolean {
   return !segments.includes("..");
 }
 
-// The `resolved_config` payload S5's run-state persists. Carries the seven configured
+// The `resolved_config` payload the run-state persists. Carries the six configured
 // values plus the OBSERVED facts validation resolved along the way (the projectDir's and
-// envDir's actual git remotes, and the repo's actual default branch), so a later step (S5,
-// at merge time) can re-assert them without re-running discovery from scratch. Documented
-// again, with the exact shape, in commands/drawbar-ship.md's Preflight section — keep both
-// in sync if this shape ever changes.
+// envDir's actual git remotes, and the repo's actual default branch), retained so a future
+// re-assertion step could use them without re-running discovery from scratch — that consumer
+// was deleted along with the merge path and does not exist today; `observed` has no consumer.
+// Documented again, with the exact shape, in commands/drawbar-ship.md's Preflight section —
+// keep both in sync if this shape ever changes.
 export interface ResolvedConfig extends ShipConfig {
   observed: {
     projectDirRemote: string;
@@ -290,7 +301,7 @@ export function resolvedConfig(
   return { ...config, observed };
 }
 
-// The pure verdict function implementing Locked 18's five preflight assertions. Order below
+// The pure verdict function implementing Locked 18's four preflight assertions. Order below
 // is deliberate, not incidental: the endpoint-injection guard (repo shape) and the two path
 // guards run BEFORE any runner is invoked at all (proven by a call-counter spy in tests).
 // The env-dir/project-dir remote comparisons run before the repo-vs-projectDir comparison
@@ -304,10 +315,7 @@ export function resolvedConfig(
 export function validateShipConfig({ config, linear, git, gh }: ValidateInput): ValidateResult {
   // Endpoint-injection guard (drawbar MUST-CHECK endpoint-injection-not-just-command-injection):
   // `repo` ends up in a `gh repo view <repo>` argument below. Refuse a malformed shape before
-  // any injected runner is ever called — a segment-level check (not a whole-string character
-  // class) so a two-segment repo whose segment IS `..` is still caught. Reuses
-  // scripts/lib/coderabbit.ts's `isValidRepo` rather than a second implementation of the
-  // same shape check.
+  // any injected runner is ever called — see `isValidRepo`'s own comment above.
   if (!isValidRepo(config.repo)) {
     return { ok: false, reason: "invalid_repo_shape", detail: config.repo };
   }
@@ -318,11 +326,10 @@ export function validateShipConfig({ config, linear, git, gh }: ValidateInput): 
     return { ok: false, reason: "env_dir_path_invalid", detail: config.envDir };
   }
   // Minor (fix pass 2): `baseBranch` reaches `git fetch`/`git merge-base --is-ancestor` as a
-  // positional argument at merge time (merge-guard.ts) — that module applies
-  // `isValidRefName`, but T0/preflight never did, so a shape-invalid value (a forced refspec,
-  // a git option flag) passed preflight and only failed once merge-guard.ts ran, AFTER the
-  // story had already been implemented. Applied here too, before any runner call — same
-  // primitive, not a second copy.
+  // positional argument at merge time — a shape-invalid value (a forced refspec, a git option
+  // flag) used to pass T0/preflight and only fail once a downstream consumer applied
+  // `isValidRefName`, AFTER the story had already been implemented. Applied here too, before
+  // any runner call — same primitive, not a second copy.
   if (!isValidRefName(config.baseBranch)) {
     return { ok: false, reason: "invalid_base_branch_shape", detail: config.baseBranch };
   }
@@ -386,23 +393,7 @@ export function validateShipConfig({ config, linear, git, gh }: ValidateInput): 
     return { ok: false, reason: "team_not_found", detail: config.team };
   }
 
-  // Assertion 4: `mergedStatus` exists and is type `started`. Two distinct reasons —
-  // "does not exist at all" is a different operator mistake from "exists but is the wrong
-  // kind of status" (e.g. pointed at a `completed`-type status by accident).
-  const statusEntry = linear.statuses.find((s) => s.name === config.mergedStatus);
-  if (!statusEntry) {
-    return { ok: false, reason: "merged_status_not_found", detail: config.mergedStatus };
-  }
-  if (statusEntry.type !== "started") {
-    return {
-      ok: false,
-      reason: "merged_status_wrong_type",
-      detail: `${config.mergedStatus} has type ${statusEntry.type}, not started`,
-    };
-  }
-
-  // Assertion 5: `baseBranch` must equal the repo's actual default branch — CodeRabbit only
-  // reviews default-branch PRs, so any other configured value silently parks every story.
+  // Assertion 4: `baseBranch` must equal the repo's actual default branch.
   const defaultBranchRes = gh(["repo", "view", config.repo, "--json", "defaultBranchRef", "--jq", ".defaultBranchRef.name"]);
   if (defaultBranchRes.code !== 0) {
     return { ok: false, reason: "gh_failed", detail: defaultBranchRes.stderr || "gh repo view failed" };
@@ -437,9 +428,9 @@ export function resolveConfigPath(env: Record<string, string | undefined>, cwd: 
 // --- CLI entry point --------------------------------------------------------------------
 //
 // `bun run ship-config.ts validate [--config <path>]`, reading the Linear facts JSON
-// (`{teams:[...], statuses:[{name,type},...]}`) on stdin — same convention as
-// `drawbar-kb add`. See commands/drawbar-ship.md's Preflight section for the exact
-// invocation and the expected stdout shape.
+// (`{teams:[...]}`) on stdin — same convention as `drawbar-kb add`. See
+// commands/drawbar-ship.md's Preflight section for the exact invocation and the expected
+// stdout shape.
 
 export type CliParse = { ok: true; config: string | undefined } | { ok: false; error: string };
 
@@ -489,11 +480,7 @@ function makeRealRunner(bin: string): Runner {
 function isLinearFacts(v: unknown): v is LinearFacts {
   if (typeof v !== "object" || v === null) return false;
   const obj = v as Record<string, unknown>;
-  if (!Array.isArray(obj.teams) || !obj.teams.every((t) => typeof t === "string")) return false;
-  if (!Array.isArray(obj.statuses)) return false;
-  return obj.statuses.every(
-    (s) => typeof s === "object" && s !== null && typeof (s as any).name === "string" && typeof (s as any).type === "string",
-  );
+  return Array.isArray(obj.teams) && obj.teams.every((t) => typeof t === "string");
 }
 
 // Every real I/O boundary is injectable, defaulting to the real implementation — the same
@@ -568,7 +555,7 @@ export async function main(deps: MainDeps = {}): Promise<number> {
   try {
     const raw: unknown = JSON.parse(stdinText);
     if (!isLinearFacts(raw)) {
-      writeStderr('refused: stdin is not valid Linear facts JSON ({"teams":[...],"statuses":[{"name":...,"type":...}]})\n');
+      writeStderr('refused: stdin is not valid Linear facts JSON ({"teams":[...]})\n');
       return 1;
     }
     linear = raw;
