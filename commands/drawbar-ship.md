@@ -168,8 +168,33 @@ without this the run order is whatever the API happens to hand back.
 > the same queue.
 
 Members with no relation between them keep their `list_issues` order — a stable tiebreak,
-not a judgment call. If the relations contain a cycle, halt and notify: that is a planning
-error no unattended run should paper over.
+not a judgment call.
+
+**Locked 11 — an empty relation set is not evidence of independence.** Establish each
+member's dependencies from **both** Linear's `blockedBy` relations **and** its own
+`## Dependencies` prose section, never from relations alone: "no edges returned" from the
+relation query is not the same fact as "no edges exist." Independence must be **stated**, not
+inferred from silence: a member counts as independent only when both sources give a positive
+artifact saying so — the relation query actually returned (even an empty result) **and** the
+issue carries a `## Dependencies` section (even one that states "none"). A member with **no**
+`## Dependencies` section at all halts, and a member whose relation query **errored** halts
+too — neither is evidence of independence, both are missing evidence.
+
+Distinguish the two by the **tool result itself**, not by its contents: a call that returned a
+result object — even one carrying an empty relation list — is a positive artifact; a call that
+raised an error, timed out, or returned no result object at all is a failed read. Record which
+of the two you observed for each member, so the halt condition is something you can actually
+evaluate rather than infer. An unrecordable premise is not a gate. If dependency information
+cannot be established for a snapshot member from either source, **halt and notify**.
+
+This halt applies to a **multi-member** snapshot, where ordering is what is being established.
+A single-member snapshot (`"invoked_as": "leaf"`) has no ordering to establish and does not
+halt on a missing section. Note the interaction with step 3: sub-issues this command files
+carry no `## Dependencies` section of their own, so step 3 writes one — otherwise a triaged
+finding becomes a `Todo` child, joins the next parent run's snapshot, and halts it.
+
+If the relations contain a cycle, halt and notify too: that is a planning error no unattended
+run should paper over.
 
 Also record `started_at` and `stories_done: []`.
 
@@ -192,23 +217,53 @@ deliberately **not** added to it.
 Next id in the snapshot not in `stories_done`, whose Linear status is still `Todo`.
 Snapshot exhausted → go to *Finishing the run*.
 
-**Blocker rule.** A `blockedBy` relation satisfies the gate if:
+**Blocker rule.** A `blockedBy` relation is resolved by exactly one of the following three
+clauses — but they do not all mean the same thing. Clauses 1-2 **clear** the blocker: the
+gate is satisfied, proceed with the current story. Clause 3 is different in kind, not just in
+number: it means your **pick** was wrong, not that the blocker cleared — its outcome is
+**re-pick, never proceed**.
 
-- the blocker is `Done` / `Rolled Out`, **or**
-- the blocker **has children** and all of its non-`Unplanned` children are `Done`.
+1. the blocker is `Done` / `Rolled Out`, **or**
+2. the blocker **has children** and all of its non-`Unplanned` children are `Done`, **or**
+3. **(re-pick, not a clearance)** the **unsatisfied** blocker is **itself a member of this
+   snapshot** and not yet in `stories_done`. Membership is **exact, case-sensitive equality**
+   against the `snapshot[]` array in the run-state file — a partial, prefix, or
+   case-insensitive match is **not** membership. The topological sort in step 0 was wrong, or
+   a relation was added mid-run. **Re-sort and continue**: re-sort the snapshot, **persist**
+   the new order and `order_rationale` to the state file (step 0 already requires the order
+   be persisted — a crash after an unpersisted re-sort would resume on the stale order), then
+   return to the **top of this step** and re-pick. The re-sort re-runs step 0's sort **in
+   full, including its cycle check** — a relation added mid-run is exactly what introduces a
+   cycle, and step 0's halt is the only thing that catches one. **Terminator:** **halt and
+   notify** if any story is picked twice within this step — not merely if the re-sort leaves
+   the pick unchanged. Comparing against the immediately-previous pick alone misses a
+   two-cycle: a mid-run `A blockedBy B` plus `B blockedBy A` yields X→Y→X→Y, where every
+   re-sort *does* change the pick and a previous-pick-only terminator never fires.
+   (Concrete case: a crash between step 5, which sets `$MERGED_STATUS`, and
+   step 7, which appends to `stories_done`, leaves an in-snapshot blocker that is neither in
+   `stories_done` nor `Todo`. Clause 3 matches, the re-sort puts it first, step 1's pick rule
+   then skips it because its status is not `Todo`, the same dependent gets picked again,
+   clause 3 matches again — forever, without the terminator.)
 
 Otherwise **halt and notify**. Never proceed past a blocker with `Todo` or `In Progress`
-children.
+children. An **unsatisfied** blocker **outside** the snapshot always halts — clause 3 never
+applies to it: clause 3 only ever re-picks, it can never itself clear a blocker, so a blocker
+genuinely outside the snapshot can only ever reach this halt.
 
-**One exception:** if the unsatisfied blocker is *itself a member of this snapshot* and not
-yet in `stories_done`, the topological sort in step 0 was wrong or a relation was added
-mid-run. Re-sort and continue rather than halting — an intra-snapshot blocker is a queue
-ordering problem, not a missing dependency. A blocker **outside** the snapshot always halts.
+> **Not yet covered: a blocker at `$MERGED_STATUS`.** Step 5 sets every story this command
+> merges to `$MERGED_STATUS` and is forbidden from setting `Done`, so a blocker this command
+> merged itself satisfies no clause above and halts the run — the H1 false halt. The fix is a
+> fourth clause accepting a blocker at `$MERGED_STATUS` whose merge commit is proven an
+> ancestor of the configured base branch on `origin`; it is deliberately **not** in this file
+> yet, because that
+> proof is a `gh`/`git` evidence protocol whose anchoring, sha-to-blocker binding, and
+> resolution precedence cannot be stated safely in prose alone. Until it lands, a dependency
+> chain still halts on its second story. Do not hand-write a substitute here.
 
-> The second clause exists because a real run hit a blocker sitting in `Unplanned` whose
-> seven children were all `Done` — a tracking issue, not live work. A literal gate ends the
-> night on bookkeeping; ignoring blockers ships on a real gap. This is the judgment nobody
-> is awake to make, so it is written down instead.
+> Clause 2 exists because a real run hit a blocker sitting in `Unplanned` whose seven
+> children were all `Done` — a tracking issue, not live work. A literal gate ends the night
+> on bookkeeping; ignoring blockers ships on a real gap. This is the judgment nobody is
+> awake to make, so it is written down instead.
 
 ## 2. Delegate the whole story
 
@@ -265,7 +320,14 @@ split is not working.
 **Mandatory, not discretionary.** For each entry in `out_of_scope`, `save_issue` a new
 sub-issue under the same parent: title naming the bug not the symptom; description with
 file:line, what is wrong, why it is out of scope here, and the PR that surfaced it; status
-`Todo`; label `found-in-review`.
+`Unplanned`; label `found-in-review`. Never file it `Todo` — `Unplanned → Todo` is the human
+triage gate, and this command has no authority to walk a finding through it unattended.
+
+**Give every filed sub-issue a `## Dependencies` section**, stating `none — filed from review
+of <PR>` when it has none. Step 0 halts on a snapshot member that carries no such section, and
+a finding filed here becomes exactly that member once a human triages it `Unplanned → Todo`.
+Omitting the section here is a halt on some later night, in a different command, with nothing
+pointing back to this step.
 
 Not added to the snapshot — they wait for the next run.
 
