@@ -2166,3 +2166,50 @@ describe("in_flight is cleared at all three Locked-13 narrative sites in command
     expect(crashSection).toContain("**clear `in_flight`** (`in_flight: null`) before halting");
   });
 });
+
+// Fix-pass discipline. These rules exist because a story's review loop ran three rounds, and
+// each fix pass introduced a Critical into the code IT had just written — culminating in an
+// arbitrary-code-execution sink created by plumbing that no finding had asked for. The cause was
+// briefs carrying twenty-plus items (Criticals through Minors) into a single "fix pass", which is
+// a second story wearing a fix pass's name. Pinned here, keyed on CONTENT rather than position,
+// so the constraint cannot be quietly dropped in an edit — same discipline as the Locked-13
+// narrative-site block above.
+describe("fix-pass scope discipline is documented in both the command and the agent", () => {
+  function normalized(relPath: string): string {
+    return readNonEmpty(join(root, relPath)).replace(/\s+/g, " ");
+  }
+
+  test("drawbar-work's review loop restricts a fix pass to Critical and Important findings", () => {
+    const txt = normalized("commands/drawbar-work.md");
+    expect(txt).toContain("Critical and Important findings only");
+    expect(txt).toContain("Minors do not go in");
+  });
+
+  test("drawbar-work tells the lead to cap the loop and escalate to the user with a cost estimate", () => {
+    const txt = normalized("commands/drawbar-work.md");
+    expect(txt).toContain("stop and go to the user before starting a third");
+    expect(txt).toContain("what it has cost so far");
+  });
+
+  test("drawbar-work's verification gate requires mutation-testing the guards, not just a green suite", () => {
+    const txt = normalized("commands/drawbar-work.md");
+    expect(txt).toContain("Mutation-test the load-bearing guards");
+    expect(txt).toContain("neuter each one and confirm a specific test fails");
+  });
+
+  test("story-implementer's fix mode forbids refactors and unrequested abstractions", () => {
+    const txt = normalized("agents/story-implementer.md");
+    expect(txt).toContain("Change only what the findings name");
+    expect(txt).toContain("Refactoring code the findings did not name");
+    expect(txt).toContain("Introducing a new abstraction");
+  });
+
+  test("story-implementer's fix mode requires asking rather than expanding scope and disclosing after", () => {
+    const txt = normalized("agents/story-implementer.md");
+    expect(txt).toContain("say so in your report and ask");
+    // Substring stops before the markdown emphasis that wraps "no finding named" — normalizing
+    // whitespace does not strip `**`, and which words an author bolds is an editorial accident.
+    expect(txt).toContain("anything you changed that");
+    expect(txt).toContain("no finding named");
+  });
+});
