@@ -52,7 +52,11 @@ export type Reason =
 
 export type Verdict = { ok: true } | { ok: false; reason: Reason; detail?: string };
 
-const CODERABBIT_CONTEXT = "CodeRabbit";
+// Exported (S6/PCO-351): scripts/lib/merge-guard.ts reuses this exact literal for its
+// "at least one non-CodeRabbit check exists" assertion (Locked 19) rather than a second,
+// hand-copied "CodeRabbit" string — this repo has a single-implementation-site regression
+// discipline for exactly this kind of shared constant.
+export const CODERABBIT_CONTEXT = "CodeRabbit";
 
 // An unparseable/empty `updated_at` must fail closed: it must never win the "latest" slot
 // over a genuinely-timestamped status. `fetchCodeRabbitStatuses` coerces a missing field to
