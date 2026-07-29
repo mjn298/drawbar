@@ -17,6 +17,16 @@ function readNonEmpty(path: string): string {
   return txt;
 }
 
+// Every top-level `## N.` heading in commands/drawbar-ship.md must occur exactly once — a
+// marker occurring more than once makes `indexOf` silently pick the FIRST occurrence, which
+// can truncate or mis-scope a slice built from it without any assertion noticing. Shared by
+// every describe below that slices this doc.
+function assertOccursOnce(marker: string): void {
+  const txt = readNonEmpty(join(root, "commands/drawbar-ship.md"));
+  const count = txt.split(marker).length - 1;
+  expect(count, `'${marker}' must occur exactly once in the doc, found ${count}`).toBe(1);
+}
+
 export function frontmatter(path: string): Record<string, string> {
   const txt = readFileSync(path, "utf8");
   const m = txt.match(/^---\n([\s\S]*?)\n---/);
@@ -1096,16 +1106,12 @@ describe("PCO-352 S7: blocker gate clauses, Locked-11 halt, Unplanned filing", (
   // than once makes `indexOf` silently pick the FIRST occurrence, which can truncate or
   // mis-scope the slice without any assertion above ever noticing. Each `## N.` heading here
   // is a top-level markdown heading and must be unique in the whole document — assert that
-  // BEFORE slicing, not merely trust it.
-  function assertOccursOnce(marker: string): void {
-    const txt = shipDoc();
-    const count = txt.split(marker).length - 1;
-    expect(count, `'${marker}' must occur exactly once in the doc, found ${count}`).toBe(1);
-  }
+  // BEFORE slicing, not merely trust it. (`assertOccursOnce` is the module-level helper above.)
 
   describe("step 3 files out-of-scope findings as Unplanned, never Todo (Locked 14)", () => {
-    // PCO-364 (R1): "## 4." no longer exists — §4 is deleted along with the merge machinery
-    // it held, and §5 with it, so §3 is immediately followed by §6 in the shipped doc.
+    // PCO-366 (R3) restored "## 4." and "## 5." between §3 and §6 — this slice now also
+    // covers their content, which is fine: the assertions below key on Unplanned/Todo
+    // content, neither of which §4/§5 introduce.
     function step3(): string {
       return slice("## 3.", "## 6.");
     }
@@ -1481,6 +1487,15 @@ describe("PCO-364 R1: the merge path and CodeRabbit gating are gone from the rep
     expect(offenders).toEqual([]);
   });
 
+  // PCO-366 (R3): §4's new PR-opening prose is exactly the kind of place `gh pr merge` could
+  // sneak back in unnoticed. Same precedent as the README.md membership assertion above:
+  // prove the file is actually a member of the scanned set, so a future exclusion-list
+  // change can't silently swallow it.
+  test("commands/drawbar-ship.md is a member of the gh-pr-merge scanned set", () => {
+    const scanned = scan(scannableFiles());
+    expect(scanned.some((f) => f.path === join(root, "commands/drawbar-ship.md"))).toBe(true);
+  });
+
   // REGRESSION (Critical 1): `git ls-files` names the index, not the working tree, so an
   // ordinary `git reset` leaves it listing a path gone from disk. Proves `scan()` skips that
   // path instead of letting `readFileSync` throw.
@@ -1547,5 +1562,165 @@ describe("PCO-365 R2 IMPORTANT 5: 'Never stack' is gone from the runbook's Hard 
     }
     expect(scanned, "scan collapsed to near-nothing — filter likely broken").toBeGreaterThan(20);
     expect(offenders).toEqual([]);
+  });
+});
+
+// PCO-366 (R3): §4/§5 were a documented gap left by R1 (the runbook jumped §3 -> §6). §4
+// becomes "open the stacked PR" (delegating base resolution and chain integrity to
+// stack.ts, never re-deriving either in bash); §5 becomes "post the summary comment, leave
+// In Progress" with no status transition of any kind.
+//
+// The executable fence that would resolve the base, assert chain integrity, and call `gh pr
+// create` is deliberately NOT specified in §4 — see MUST-CHECK
+// prose-cannot-hold-an-evidence-protocol-split-the-story and PCO-370 (sequenced with R4 /
+// PCO-367). Nothing below pins fenced bash content; every assertion here is a prose pin, plus
+// one absence check proving no fence has crept back in.
+//
+// Every pin below is on a CONTIGUOUS, whitespace-normalized phrase (never independent
+// tokens) per MUST-CHECK pco352-fixpass-prose-gate-mutation-must-cover-rephrase-not-only-delete:
+// a phrase demoted to a parenthetical aside, or a qualifier weakened, must fail the same test
+// a deletion does.
+describe("PCO-366 R3: ship §4/§5 — open the stacked PR, leave In Progress, pin the prose", () => {
+  // Raw slice (whitespace intact) — the no-bash-fence absence check below needs the literal
+  // ``` markers, which whitespace normalization would otherwise leave undisturbed anyway, but
+  // keeping this raw keeps the intent explicit.
+  function rawSlice(startMarker: string, endMarker: string): string {
+    assertOccursOnce(startMarker);
+    assertOccursOnce(endMarker);
+    const txt = readNonEmpty(join(root, "commands/drawbar-ship.md"));
+    const start = txt.indexOf(startMarker);
+    expect(start, `'${startMarker}' heading not found`).toBeGreaterThan(-1);
+    const end = txt.indexOf(endMarker, start);
+    expect(end, `'${endMarker}' heading not found after '${startMarker}'`).toBeGreaterThan(start);
+    return txt.slice(start, end);
+  }
+
+  // Whitespace-normalized — for prose phrase pins, same discipline as the established
+  // `section()` helper elsewhere in this file: markdown hard-wraps prose, so which words
+  // land on which line is an editorial accident, never itself worth pinning.
+  function normalizedSlice(startMarker: string, endMarker: string): string {
+    return rawSlice(startMarker, endMarker).replace(/\s+/g, " ");
+  }
+
+  function s4(): string {
+    return normalizedSlice("## 4.", "## 5.");
+  }
+  function s4Raw(): string {
+    return rawSlice("## 4.", "## 5.");
+  }
+  function s5(): string {
+    return normalizedSlice("## 5.", "## 6.");
+  }
+
+  test("§4 pins the stack.ts delegation and the explicit --base flag as one contiguous phrase", () => {
+    expect(s4()).toContain(
+      "resolves the base by delegating to `stack.ts` — never re-derived in bash — and " +
+        "opens the PR with an explicit `--base <base>` flag",
+    );
+  });
+
+  test("§4 documents the story-lead's own PR creation as a transitional duplicate removed by R4 (PCO-367)", () => {
+    expect(s4()).toContain(
+      "That call is a **transitional duplicate**: this step opens the PR that actually " +
+        "anchors the stack, and the story-lead's own PR creation is **removed entirely once " +
+        "R4 (PCO-367) lands**",
+    );
+  });
+
+  test("§4 states the flagged field is consumed against the ok | flagged contract R4 (PCO-367) lands", () => {
+    expect(s4()).toContain("written against the `ok | flagged` contract R4 (PCO-367) lands");
+  });
+
+  test("§4's flagged-PR-body pin: an Unresolved findings section, built before gh pr create runs, never appended after", () => {
+    expect(s4()).toContain(
+      "the PR body carries an `## Unresolved findings` section, built before `gh pr create` " +
+        "runs, never appended after",
+    );
+  });
+
+  // Fix pass (5c): §3 already files each out-of-scope finding as a Linear sub-issue carrying
+  // the full write-up. Republishing file:line / the finding body / a quoted source excerpt in
+  // a PUBLIC PR body announces an unpatched detail to every repo watcher before the operator's
+  // morning review, so §4 restricts the section to sub-issue ids and titles only.
+  test("§4 restricts '## Unresolved findings' to sub-issue ids and titles only, never the finding body/file:line/quoted source", () => {
+    expect(s4()).toContain(
+      "names each out-of-scope finding by its filed sub-issue id and title only — never the " +
+        "finding body, `file:line`, or a quoted source excerpt",
+    );
+  });
+
+  // MUST-CHECK pco352-fixpass-satisfies-the-gate-header-must-not-cover-a-repick-clause: the
+  // "no PR opened" and "PR opened" outcomes differ in KIND, not degree — never one shared
+  // "satisfied if any of the following" header.
+  test("§4's two outcomes are marked as differing in kind, not filed under one shared header", () => {
+    expect(s4()).toContain(
+      "These two outcomes differ in kind, not merely in degree — the header below names " +
+        "which one you're in; never file this under one shared \"satisfied if any of the " +
+        "following\" list.",
+    );
+  });
+
+  test("§4's 'no PR opened' outcome names the three required checks and is a halt distinct from flagged, with no anchor for the chain", () => {
+    expect(s4()).toContain(
+      "**Outcome A — no PR could be opened (halt, distinct from flagged).** A refusal at any " +
+        "of the three required checks — assert-chain refusing, resolve-base refusing, or " +
+        "`gh pr create` itself failing — means the chain has no anchor to stack the next " +
+        "story on.",
+    );
+  });
+
+  // Fix pass (5a): reviewer mutation-proved that replacing Outcome B with "Continue to §5."
+  // left the suite green — nothing pinned it at all. Pinned as one contiguous phrase covering
+  // the record statement, its {story, branch, pr, base, flagged} shape, and the JSON types
+  // run-state.ts's isValidStackEntry actually requires (`pr: number`, `flagged: boolean`),
+  // which nothing previously stated in prose.
+  test("§4's Outcome B records {story, branch, pr, base, flagged} in the stack array, with pr a JSON number and flagged a JSON boolean", () => {
+    expect(s4()).toContain(
+      "**Outcome B — the PR opened.** Record `{story, branch, pr, base, flagged}` in the run " +
+        "state's `stack` array — `pr` as a JSON number (a positive integer, never the string " +
+        "form) and `flagged` as a JSON boolean — then continue to §5.",
+    );
+  });
+
+  // MUST-CHECK prose-cannot-hold-an-evidence-protocol-split-the-story: the deferred fence's
+  // absence must be a WRITTEN reason, not silence, so a future reader does not hand-write a
+  // substitute. Deleting the block, or keeping a block that no longer names PCO-370 or the
+  // do-not-hand-write instruction, must fail this — it is one contiguous phrase, not
+  // independent tokens.
+  test("§4 states the executable fence is deliberately not specified, deferred to PCO-370 alongside R4, and forbids hand-writing a substitute", () => {
+    expect(s4()).toContain(
+      "**Deliberately not specified here: the executable fence.** This section's stacked-PR-" +
+        "opening logic — resolving the base, asserting chain integrity, and calling `gh pr " +
+        "create` — is deferred to **PCO-370** and must land together with **R4 (PCO-367)**; " +
+        "nobody should hand-write a substitute here in the meantime.",
+    );
+  });
+
+  // Mutation-proof against a trivial fence creeping back in while PCO-370 is still open —
+  // re-adding even a one-line ```bash``` fence must fail this.
+  test("§4 contains no bash fence at all — the executable PR-opening logic is deferred to PCO-370", () => {
+    expect(s4Raw()).not.toMatch(/```/);
+  });
+
+  test("§5 pins 'Leave the story In Progress. No status transition of any kind' as one contiguous phrase", () => {
+    expect(s5()).toContain("**Leave the story `In Progress`. No status transition of any kind**");
+  });
+
+  test("§5 pins the never-a-completed-status prohibition as one contiguous phrase", () => {
+    expect(s5()).toContain(
+      "never `Done`, `Ready for QA`, `Ready for Rollout`, `Rolled Out`, or any completed-type status",
+    );
+  });
+
+  // Fix pass (5b): replaces four independent toContain calls — satisfiable, per MUST-CHECK
+  // pco352-fixpass-prose-gate-mutation-must-cover-rephrase-not-only-delete, by rewriting §5 to
+  // say "Omit the stack position... omit the sub-issues... omit the mutation_pairs" while still
+  // matching all four fragments — with one contiguous phrase across the whole enumeration.
+  test("§5's comment names what shipped, the PR link, stack position, sub-issues filed, and mutation_pairs as one contiguous phrase", () => {
+    expect(s5()).toContain(
+      "what shipped, the PR link, the stack position (this story's place in the run's " +
+        "stack, e.g. \"position 3 of the run, based on `<BASE>`\"), the sub-issues filed in " +
+        "§3, and the story-lead's `mutation_pairs`.",
+    );
   });
 });
