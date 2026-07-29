@@ -152,6 +152,20 @@ with `git` genuinely removed and its absence asserted).
   reversion and confirming a test fails. Prose pins must survive a **rephrase**, not only a
   deletion.
 
+## This epic is not shipped by the thing it edits
+
+**`drawbar-ship` must not be run against this epic's own stories.** The work edits the running
+orchestrator: R1 deletes `merge-guard.ts` and `coderabbit.ts` while a live run's §4 may be
+calling them, and R3/R4 rewrite the very sections an in-flight run is reading. A run that
+shipped R1 would be sawing through the branch it is standing on.
+
+Implement R1–R6 with `/drawbar-work` or by hand, one at a time. The first legitimate use of the
+redesigned command is R6's attended end-to-end run, against an unrelated parent.
+
+The predecessor epic named this rule explicitly and it was correct to; it is repeated here
+because the hazard is strictly worse this time — the old epic mostly *added* guards, whereas
+this one deletes about 2,800 lines that a concurrent run would still be dispatching into.
+
 ## Sequencing
 
 | | Story | Why here |
