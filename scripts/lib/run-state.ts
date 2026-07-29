@@ -9,32 +9,37 @@
 // `parseShipConfig` in scripts/lib/ship-config.ts.
 //
 // This module owns two distinct jobs, kept as two separate concerns per the house style in
-// scripts/lib/coderabbit.ts and scripts/lib/ship-config.ts:
+// scripts/lib/ship-config.ts:
 //
 //   - `parseRunState` — structural validation of the pinned schema (Locked 12).
 //   - `dispatchVerdict` / `maybeDispatch` / `clearInFlight` — the pure verdict functions
 //     implementing `in_flight` as the authoritative duplicate-dispatch guard, with a
 //     staleness escape that routes to crash recovery instead of a no-op (Locked 13). `now`
 //     is always injected (epoch milliseconds), never read from the clock in the verdict
-//     path — the same discipline `coderabbit.ts`/`ship-config.ts` apply to `git`/`gh`
-//     runners. Nothing in this module shells out to `git` or `gh` at all, so the "tests pass
-//     with `gh`/`git` absent from PATH" proof (Locked 5) holds trivially.
+//     path — the same discipline `ship-config.ts` applies to `git`/`gh` runners. Nothing in
+//     this module shells out to `git` or `gh` at all, so the "tests pass with `gh`/`git`
+//     absent from PATH" proof (Locked 5) holds trivially.
 //
 // `resolved_config` reuses `ResolvedConfig` from scripts/lib/ship-config.ts's TYPE verbatim —
 // the shape that module's `validateShipConfig` produces — rather than inventing or
-// hand-copying a second shape for the same seven configured keys plus `observed`. Structural
-// validation of `resolved_config` is layered: `parseShipConfig` checks the seven configured
+// hand-copying a second shape for the same six configured keys plus `observed`. Structural
+// validation of `resolved_config` is layered: `parseShipConfig` checks the six configured
 // keys' types/non-emptiness only (it does NOT check `repo`'s owner/repo shape or that
 // `envDir`/`projectDir` are clean absolute paths — that is `validateShipConfig`'s job, which
 // this module never runs, since it never shells out to `git`/`gh`). `isValidResolvedConfig`
-// below layers `isValidRepo` (scripts/lib/coderabbit.ts) and `isCleanAbsolutePath`
-// (scripts/lib/ship-config.ts) on top, closing the endpoint-injection gap those two
-// path/shell sinks would otherwise leave open (MUST-CHECK
-// endpoint-injection-not-just-command-injection) — reused, not reimplemented, from their one
-// canonical site each.
+// below layers `isValidRepo`, `isCleanAbsolutePath`, and `isValidRefName` (all
+// scripts/lib/ship-config.ts) on top, closing the endpoint-injection gap those sinks would
+// otherwise leave open (MUST-CHECK endpoint-injection-not-just-command-injection) — reused,
+// not reimplemented, from their one canonical site each.
 
-import { parseShipConfig, isCleanAbsolutePath, isNonEmptyTrimmed, type ResolvedConfig } from "./ship-config";
-import { isValidRepo } from "./coderabbit";
+import {
+  parseShipConfig,
+  isCleanAbsolutePath,
+  isNonEmptyTrimmed,
+  isValidRepo,
+  isValidRefName,
+  type ResolvedConfig,
+} from "./ship-config";
 
 export interface InFlight {
   story: string;
@@ -78,9 +83,9 @@ const REQUIRED_KEYS = [
 
 const IN_FLIGHT_KEYS = ["story", "agent_dispatched_at"] as const;
 const MERGED_ENTRY_KEYS = ["pr", "merge_sha", "status"] as const;
-// The three OBSERVED facts `resolvedConfig()` (ship-config.ts) attaches alongside the seven
+// The three OBSERVED facts `resolvedConfig()` (ship-config.ts) attaches alongside the six
 // configured keys — validated here structurally, without inventing a parallel `ResolvedConfig`
-// parser: the seven configured keys are validated by reusing `parseShipConfig` itself below.
+// parser: the six configured keys are validated by reusing `parseShipConfig` itself below.
 const OBSERVED_KEYS = ["projectDirRemote", "envDirRemote", "defaultBranch"] as const;
 
 export type ParseReason =
@@ -115,11 +120,11 @@ export type ParseResult = { ok: true; state: RunState } | { ok: false; reason: P
 // endpoint-injection-not-just-command-injection).
 //
 // S6/PCO-351 fix pass (single-implementation-site): this module used to carry its own
-// byte-identical copy of this exact regex/predicate (as did merge-guard.ts) — both now import
-// `isNonEmptyTrimmed` from ship-config.ts, the one canonical implementation site, rather than
-// re-adding the same regex at each call site. Aliased on import: every call site in this file
-// already reads `isNonEmptyString`, and renaming ~15 call sites for a pure re-export would be
-// churn with no behavioral change.
+// byte-identical copy of this exact regex/predicate — it now imports `isNonEmptyTrimmed`
+// from ship-config.ts, the one canonical implementation site, rather than re-adding the same
+// regex at each call site. Aliased on import: every call site in this file already reads
+// `isNonEmptyString`, and renaming ~15 call sites for a pure re-export would be churn with no
+// behavioral change.
 const isNonEmptyString = isNonEmptyTrimmed;
 
 function isStringArray(v: unknown): v is string[] {
@@ -156,11 +161,10 @@ function fail(reason: ParseReason, detail: string): { ok: false; reason: ParseRe
 // S6/PCO-351 resolution (Locked 10): this PARSE-time shape stays permissive on purpose, so
 // `parseRunState` can still read the two legacy run-state files (abbreviated 8/9-char shas)
 // without refusing them outright. The strict, record-TIME assertion — exactly 40 hex
-// characters, and the full merge-commit oid rather than the PR head sha — is owned by
-// `scripts/lib/merge-guard.ts`'s `recordMergeSha`, which is the one call site that ever
-// WRITES a fresh `merge_sha`. A future pass MAY choose to tighten this parser too once every
-// legacy file has been migrated; until then, tightening it here would make `parseRunState`
-// refuse state files it must still be able to read.
+// characters, and the full merge-commit oid rather than the PR head sha — belongs to whatever
+// call site ever WRITES a fresh `merge_sha`. A future pass MAY choose to tighten this parser
+// too once every legacy file has been migrated; until then, tightening it here would make
+// `parseRunState` refuse state files it must still be able to read.
 //
 // `pr` (fix pass, IMPORTANT 6): must be a positive integer — `0`, negative values, and
 // non-integers (`1.5`) were all previously admitted.
@@ -180,20 +184,23 @@ function isValidMergedEntry(v: unknown): v is MergedEntry {
   return true;
 }
 
-// Reuses `parseShipConfig` for the seven configured keys' types/non-emptiness (never a
+// Reuses `parseShipConfig` for the six configured keys' types/non-emptiness (never a
 // hand-copied second implementation of that shape check — see the module comment above),
 // then validates the `observed` object added on top of it structurally.
 //
 // Fix pass (IMPORTANT 6): `parseShipConfig` alone does NOT validate `repo`'s owner/repo
-// shape or that `envDir`/`projectDir` are clean absolute paths (that is
-// `validateShipConfig`'s job, never run here). Layered on top, reusing each check's one
-// canonical implementation site rather than a second hand-copy:
-//   - `repo` → `isValidRepo` (scripts/lib/coderabbit.ts)
-//   - `envDir` / `projectDir` → `isCleanAbsolutePath` (scripts/lib/ship-config.ts)
+// shape, that `envDir`/`projectDir` are clean absolute paths, or that `baseBranch` is a
+// valid ref (that is `validateShipConfig`'s job, never run here). Layered on top, reusing
+// each check's one canonical implementation site rather than a second hand-copy — all from
+// scripts/lib/ship-config.ts:
+//   - `repo` → `isValidRepo`
+//   - `envDir` / `projectDir` → `isCleanAbsolutePath`
+//   - `baseBranch` → `isValidRefName`
 //
-// Exported (S6/PCO-351): `scripts/lib/merge-guard.ts` re-asserts `resolved_config` at merge
-// time (Locked 18) and reuses this exact predicate rather than a second hand-copy of the
-// same structural check — see that module's own comment for how it layers on top.
+// Fix pass (IMPORTANT 3): `baseBranch` is applied here too. `resolved_config` lives in the
+// agent-writable run-state JSON — `validateShipConfig` only ever re-asserts the
+// operator-authored config at T0; this is the one structural check still standing on the
+// mutable run-state copy.
 export function isValidResolvedConfig(v: unknown): v is ResolvedConfig {
   if (typeof v !== "object" || v === null || Array.isArray(v)) return false;
   const obj = v as Record<string, unknown>;
@@ -203,6 +210,7 @@ export function isValidResolvedConfig(v: unknown): v is ResolvedConfig {
   if (!isValidRepo(shipConfigResult.config.repo)) return false;
   if (!isCleanAbsolutePath(shipConfigResult.config.envDir)) return false;
   if (!isCleanAbsolutePath(shipConfigResult.config.projectDir)) return false;
+  if (!isValidRefName(shipConfigResult.config.baseBranch)) return false;
   if (typeof observed !== "object" || observed === null || Array.isArray(observed)) return false;
   const obs = observed as Record<string, unknown>;
   for (const key of OBSERVED_KEYS) {
@@ -361,8 +369,8 @@ export type DispatchVerdict =
 const FUTURE_TIMESTAMP_TOLERANCE_SECONDS = 5;
 
 // Pure verdict function. `now` (epoch milliseconds) is always injected, never read from the
-// clock here (Locked 5 style, applied to time the same way ship-config.ts/coderabbit.ts apply
-// it to `git`/`gh`).
+// clock here (Locked 5 style, applied to time the same way ship-config.ts applies it to
+// `git`/`gh`).
 //
 // Locked 13's wording is "exceeds 2x the heartbeat" — i.e. strict `>`. Exactly 2x is
 // DELIBERATELY still fresh (not stale): this is a deliberate boundary choice, pinned by tests
@@ -455,11 +463,10 @@ export function maybeDispatch(input: MaybeDispatchInput): MaybeDispatchResult {
   return { verdict, nextState };
 }
 
-// Clears `in_flight` — called on report (step 5/7), on park ("Parking a story"), and on halt
-// ("Crash recovery"), per Locked 13. One function, three call sites: the three tests in
-// run-state.test.ts exercise this pre-seeded with a non-null `in_flight` in each of those
-// three narrative contexts (MUST-CHECK vacuous-assertion-needs-preseed-state), not three
-// separate implementations of the same clear.
+// Clears `in_flight` — called on park ("Parking a story") and on halt ("Crash recovery"),
+// per Locked 13. The step-5/7 report-site clear this comment used to describe was deleted
+// along with the merge path (commands/drawbar-ship.md now says explicitly the report site
+// does NOT clear); one function, two surviving call sites.
 export function clearInFlight(state: RunState): RunState {
   return { ...state, in_flight: null };
 }

@@ -1,6 +1,6 @@
 // F8/S8 (PCO-353): the step 6 ("## 6. Capture and sync knowledge") sync loop, extracted whole
 // out of `commands/drawbar-ship.md`'s bash fence and put behind tests, same house style as
-// `scripts/lib/merge-guard.ts` and `scripts/lib/ship-config.ts`:
+// `scripts/lib/ship-config.ts`:
 //
 //   - `syncKnowledge` — the tolerant retry loop: stage, commit-if-staged, assert a clean
 //     precondition, rebase, push, and (only on a genuine push REJECTION) retry. Halts
@@ -399,8 +399,7 @@ function parseFlags(args: string[], allowed: readonly string[]): { ok: true; fla
 // a value from agent-writable state. The trust root for `--env-dir` is `commands/drawbar-ship.md`'s
 // own derivation from Preflight's already-validated `resolved_config` (itself checked against
 // the operator-authored config file by `ship-config.ts`'s `validateShipConfig`) — this CLI
-// trusts its caller to have done that, the same way `merge-guard.ts`'s `record-merge-sha --dir`
-// does for the project checkout path.
+// trusts its caller to have done that.
 export type SyncCliParse = { ok: true; envDir: string; dir: string; message: string } | { ok: false; error: string };
 
 export function parseSyncCliArgs(args: string[]): SyncCliParse {
@@ -568,9 +567,9 @@ export async function main(deps: MainDeps = {}): Promise<number> {
 }
 
 if (import.meta.main) {
-  // Copies ship-config.ts's/merge-guard.ts's `.catch` rationale verbatim: without it, an
-  // unexpected throw anywhere in main() not already caught internally becomes an UNHANDLED
-  // PROMISE REJECTION instead of a named refusal + non-zero exit.
+  // Copies ship-config.ts's `.catch` rationale verbatim: without it, an unexpected throw
+  // anywhere in main() not already caught internally becomes an UNHANDLED PROMISE REJECTION
+  // instead of a named refusal + non-zero exit.
   main()
     .then((code) => process.exit(code))
     .catch((err) => {

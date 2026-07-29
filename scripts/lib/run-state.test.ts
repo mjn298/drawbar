@@ -24,7 +24,6 @@ const VALID_RESOLVED_CONFIG: ResolvedConfig = {
   repo: "acme/widgets",
   team: "PLAT",
   baseBranch: "main",
-  mergedStatus: "Pre-QA",
   requiredChecks: ["build"],
   observed: {
     projectDirRemote: "acme/widgets",
@@ -208,6 +207,29 @@ describe("parseRunState — shape validation at the pure-function boundary (IMPO
     expect(result.ok).toBe(false);
     if (result.ok) return;
     expect(result.reason).toBe("invalid_resolved_config");
+  });
+
+  // IMPORTANT 3 (fix pass): `resolved_config.baseBranch` lives in the agent-writable
+  // run-state JSON — `isValidRefName` (ship-config.ts) must gate this mutable copy the same
+  // way `validateShipConfig` gates the operator-authored config at T0, not just the latter.
+  test("resolved_config.baseBranch carrying a git argv-injection shape (`--upload-pack=...`) is rejected", () => {
+    const malformed = {
+      ...VALID_RUN_STATE,
+      resolved_config: { ...VALID_RESOLVED_CONFIG, baseBranch: "--upload-pack=x" },
+    };
+    const result = parseRunState(JSON.stringify(malformed));
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.reason).toBe("invalid_resolved_config");
+  });
+
+  test("resolved_config.baseBranch carrying a valid ref shape is still accepted", () => {
+    const wellFormed = {
+      ...VALID_RUN_STATE,
+      resolved_config: { ...VALID_RESOLVED_CONFIG, baseBranch: "release/2026-07" },
+    };
+    const result = parseRunState(JSON.stringify(wellFormed));
+    expect(result.ok).toBe(true);
   });
 
   test("arg carrying a path-traversal shape is rejected with its own named reason", () => {
@@ -557,8 +579,8 @@ describe("in_flight — the authoritative duplicate-dispatch guard, with a stale
   // three hats. `clearInFlight` itself only needs ONE unit test; the risk the AC actually
   // cares about — a runbook narrative site silently losing its clear — is now covered
   // separately by the doc assertions in scripts/plugin.test.ts (see "IMPORTANT 5" there),
-  // which grep commands/drawbar-ship.md's report/park/halt sections directly, per the
-  // established pattern at plugin.test.ts's §5/mutation-gate/CodeRabbit-verbatim doc tests.
+  // which grep commands/drawbar-ship.md's park/halt sections directly, per the
+  // established pattern at plugin.test.ts's mutation-gate-verbatim doc tests.
   test("clearInFlight clears a genuinely non-null in_flight (Locked 13)", () => {
     const state: RunState = { ...BASE_STATE, in_flight: { story: "story-a", agent_dispatched_at: "2026-01-01T00:00:00Z" } };
     expect(state.in_flight).not.toBeNull(); // pre-state (MUST-CHECK vacuous-assertion-needs-preseed-state)
