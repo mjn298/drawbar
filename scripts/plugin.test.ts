@@ -2130,7 +2130,6 @@ describe("in_flight is cleared at all three Locked-13 narrative sites in command
   function section(startMarker: string, endMarker: string): string {
     const txt = readNonEmpty(join(root, "commands/drawbar-ship.md"));
     const start = txt.indexOf(startMarker);
-    expect(start, `'${startMarker}' heading not found`).toBeGreaterThan(-1);
     const end = txt.indexOf(endMarker, start);
     expect(end, `'${endMarker}' heading not found after '${startMarker}'`).toBeGreaterThan(start);
     return txt.slice(start, end).replace(/\s+/g, " ");
@@ -2211,5 +2210,311 @@ describe("fix-pass scope discipline is documented in both the command and the ag
     // whitespace does not strip `**`, and which words an author bolds is an editorial accident.
     expect(txt).toContain("anything you changed that");
     expect(txt).toContain("no finding named");
+  });
+});
+
+// PCO-352 (S7): H1 — the blocker gate step 5 mandates ($MERGED_STATUS) and step 1's original
+// two-clause rule could never accept, by construction — is fixed by rewriting the rule as four
+// prose clauses. Also: unavailable dependency information halts (Locked 11), and out-of-scope
+// findings are filed `Unplanned`, not `Todo` (Locked 14). All three assertions below key on
+// CONTENT within a bounded slice of the doc, never on the whole file, so a legitimate
+// `Unplanned`/`Todo` occurrence elsewhere (e.g. clause 2's non-`Unplanned` children wording)
+// can never make an assertion here vacuous.
+describe("PCO-352 S7: blocker gate clauses, Locked-11 halt, Unplanned filing", () => {
+  function shipDoc(): string {
+    return readNonEmpty(join(root, "commands/drawbar-ship.md"));
+  }
+
+  // Slices between two headings, asserting both are found and in order, mirroring the
+  // established `section()` helper above — kept local here rather than hoisted, since this
+  // describe is the only consumer and a shared helper across describes has previously made a
+  // marker rename in one place silently break an unrelated describe elsewhere in this file.
+  //
+  // Whitespace-normalized (single spaces), same discipline as the established `section()`
+  // helper elsewhere in this file: these are hard-wrapped prose paragraphs, so which words
+  // land on which markdown line is an editorial accident, not a property worth pinning.
+  function slice(startMarker: string, endMarker: string): string {
+    assertOccursOnce(startMarker);
+    assertOccursOnce(endMarker);
+    const txt = shipDoc();
+    const start = txt.indexOf(startMarker);
+    expect(start, `'${startMarker}' heading not found`).toBeGreaterThan(-1);
+    const end = txt.indexOf(endMarker, start);
+    expect(end, `'${endMarker}' heading not found after '${startMarker}'`).toBeGreaterThan(start);
+    const body = txt.slice(start, end).replace(/\s+/g, " ");
+    // MUST-CHECK vacuous-assertion-needs-preseed-state: a slice that turned out empty would
+    // make every "does not contain" assertion below vacuously true. `> 0` alone was DEAD CODE
+    // (fix pass, Important 9.3): the `toBeGreaterThan(start)` assert on `end` two lines up
+    // already throws whenever `end <= start`, so reaching this line means `end > start`, which
+    // makes `body.length >= 1` unconditional — `> 0` here could never fire. A floor set below
+    // the smallest real section (`## 3.` -> `## 4.` is ~733 chars normalized) but well above
+    // "near-empty" is what actually catches a genuinely gutted section.
+    expect(body.length).toBeGreaterThan(200);
+    return body;
+  }
+
+  // MUST-CHECK doc-fence-slice-marker-must-not-appear-in-comments: a marker that occurs more
+  // than once makes `indexOf` silently pick the FIRST occurrence, which can truncate or
+  // mis-scope the slice without any assertion above ever noticing. Each `## N.` heading here
+  // is a top-level markdown heading and must be unique in the whole document — assert that
+  // BEFORE slicing, not merely trust it.
+  function assertOccursOnce(marker: string): void {
+    const txt = shipDoc();
+    const count = txt.split(marker).length - 1;
+    expect(count, `'${marker}' must occur exactly once in the doc, found ${count}`).toBe(1);
+  }
+
+  describe("step 3 files out-of-scope findings as Unplanned, never Todo (Locked 14)", () => {
+    function step3(): string {
+      return slice("## 3.", "## 4.");
+    }
+
+    test("names Unplanned as the sub-issue status", () => {
+      expect(step3()).toContain("status `Unplanned`");
+    });
+
+    test("no longer instructs status Todo", () => {
+      const s3 = step3();
+      // Positive marker present first (vacuous-assertion guard) — Unplanned is asserted above
+      // too, but re-asserted here so this test fails independently of the one above if someone
+      // deletes only this test's premise.
+      expect(s3).toContain("Unplanned");
+      expect(s3).not.toContain("status `Todo`");
+    });
+  });
+
+  describe("step 1's blocker rule carries its three clauses (Locked 9, minus the deferred $MERGED_STATUS clause)", () => {
+    function step1(): string {
+      return slice("## 1.", "## 2.");
+    }
+
+    test("clause 1: Done / Rolled Out", () => {
+      expect(step1()).toContain("`Done` / `Rolled Out`");
+    });
+
+    test("clause 2: children all Done", () => {
+      const s1 = step1();
+      expect(s1).toContain("has children");
+      expect(s1).toContain("non-`Unplanned` children are `Done`");
+    });
+
+    test("clause 3: re-sort and continue for an in-snapshot blocker not yet in stories_done", () => {
+      const s1 = step1();
+      // Pinned as ONE phrase: a bare toContain("stories_done") is satisfied by unrelated
+      // prose elsewhere in this slice, so deleting the conjunct used to stay green.
+      expect(s1).toContain(
+        "the **unsatisfied** blocker is **itself a member of this snapshot** and not yet in `stories_done`",
+      );
+      expect(s1).toContain("**Re-sort and continue**");
+    });
+
+    // Critical 4 (fix pass): clause 3 sat inside the "satisfies the gate" list, reading as
+    // fail-open. Its outcome must be unambiguous: re-pick, never "blocker cleared, proceed".
+    test("Critical 4: clause 3's outcome is explicitly marked re-pick, not a clearance", () => {
+      const s1 = step1();
+      expect(s1).toContain("**(re-pick, not a clearance)**");
+      expect(s1).toContain("re-pick, never proceed");
+    });
+
+    test("Critical 4: clause 3 persists the re-sorted order and order_rationale before re-picking", () => {
+      const s1 = step1();
+      expect(s1).toContain("re-sort the snapshot, **persist** the new order and `order_rationale` to the state file");
+    });
+
+    test("Critical 4: clause 3 has a terminator that halts rather than livelocking when the re-sort doesn't change the pick", () => {
+      const s1 = step1();
+      expect(s1).toContain("**Terminator:**");
+      expect(s1).toContain(
+        "**halt and notify** if any story is picked twice within this step — not merely if the re-sort leaves the pick unchanged",
+      );
+      expect(s1).toContain("in full, including its cycle check");
+    });
+
+    // Important 8 (fix pass): clause 3's snapshot-membership test was unspecified — a partial,
+    // prefix, or case-insensitive match must not count as membership.
+    test("Important 8: clause 3 membership is exact, case-sensitive equality against snapshot[], never partial/prefix/case-insensitive", () => {
+      const s1 = step1();
+      expect(s1).toContain("exact, case-sensitive equality");
+      expect(s1).toContain("`snapshot[]` array");
+      expect(s1).toContain("is **not** membership");
+    });
+
+    // Important 9.1 (fix pass): the fail-closed default was completely unpinned — deleting the
+    // whole sentence left the suite green. Pin it as ONE contiguous sentence, not separate
+    // token checks.
+    test("Important 9.1: the fail-closed default sentence is pinned in full, not merely its tokens", () => {
+      const s1 = step1();
+      expect(s1).toContain(
+        "Otherwise **halt and notify**. Never proceed past a blocker with `Todo` or `In Progress` children.",
+      );
+    });
+
+    // Important 6 (fix pass): "A blocker outside the snapshot always halts" used to live
+    // inside the (now-deleted) exception paragraph, scoped to that exception. It now sits
+    // right after the general "Otherwise halt and notify", where the plain reading is an
+    // absolute rule contradicting clauses 1-3. Fixed wording: "unsatisfied" + explicit
+    // "clause 3 never applies to it".
+    test("Important 6: only an UNSATISFIED blocker outside the snapshot always halts — the sentence no longer reads as absolute", () => {
+      const s1 = step1();
+      expect(s1).toContain(
+        "An **unsatisfied** blocker **outside** the snapshot always halts — clause 3 never applies to it",
+      );
+    });
+
+    // Minor (the one deletion in this fix pass): the clause-4 blockquote duplicated the
+    // <TEAM>-C/<TEAM>-B anecdote already at step 0 AND disagreed with it (counterfactual there,
+    // history here). Deleted, not reworded — the clause-2 blockquote survives untouched.
+    test("Minor: the duplicate/disagreeing clause-4 blockquote anecdote is deleted", () => {
+      const s1 = step1();
+      expect(s1).not.toContain("Clause 3 is the fix for a real false halt");
+      // Clause-2's blockquote must still be present — this is a deletion of ONE blockquote,
+      // not both.
+      expect(s1).toContain("Clause 2 exists because a real run hit a blocker sitting in");
+    });
+  });
+
+  describe("step 0 records the Locked-11 both-sources dependency rule", () => {
+    function step0(): string {
+      return slice("## 0.", "## 1.");
+    }
+
+    test("reads both Linear relations and each member's Dependencies prose", () => {
+      const s0 = step0();
+      expect(s0).toContain("blockedBy");
+      expect(s0).toContain("## Dependencies");
+    });
+
+    test("an empty relation set is not evidence of independence, and unestablishable dependency info halts", () => {
+      const s0 = step0();
+      expect(s0.toLowerCase()).toContain("not evidence of independence");
+      expect(s0).toContain("If dependency information cannot be established for a snapshot member from either source, **halt and notify**");
+    });
+
+    test("the pre-existing cycle-halt sentence still survives adjacent to the new rule", () => {
+      const s0 = step0();
+      expect(s0).toContain("relations");
+      expect(s0).toContain("contain a cycle, halt and notify");
+    });
+
+    // Important 7 (fix pass): Locked 11 said "no edges returned" != "no edges exist" but never
+    // said what a member with NEITHER a blockedBy relation NOR a ## Dependencies section means
+    // — the natural (wrong) reading is "both silent, therefore independent". Require a
+    // positive artifact instead: independence must be STATED, not inferred from silence.
+    test("Important 7: a member with no ## Dependencies section at all halts — independence must be stated, not inferred", () => {
+      const s0 = step0();
+      expect(s0).toContain("Independence must be **stated**, not");
+      expect(s0).toContain("`## Dependencies` section at all halts");
+    });
+
+    test("Important 7: a member whose relation query ERRORED (not merely returned empty) halts too", () => {
+      const s0 = step0();
+      expect(s0).toContain("relation query **errored** halts");
+    });
+
+    // Round-2 security review: the rule originally called an errored query "indistinguishable"
+    // from a genuine empty result IN THE SAME SENTENCE that made erroring the halt condition —
+    // an unevaluatable premise, whose only available reading ("empty, therefore returned,
+    // therefore independent") is the exact fail-open Locked 11 exists to close. The
+    // discriminator must be observable, and recorded.
+    test("Locked 11's halt is evaluatable: the discriminator is the tool result itself, and it is recorded", () => {
+      const s0 = step0();
+      expect(s0).toContain("Distinguish the two by the **tool result itself**, not by its contents");
+      expect(s0).toContain("a call that returned a result object — even one carrying an empty relation list — is a positive artifact");
+      expect(s0).toContain("Record which");
+      expect(s0).toContain("An unrecordable premise is not a gate.");
+      expect(s0).not.toContain("indistinguishable");
+    });
+
+    // Round-2 code review (I1): step 0's halt collided with step 3's own sub-issue template —
+    // a found-in-review issue carries no `## Dependencies` section, so once a human triages it
+    // Unplanned -> Todo it becomes a snapshot member that halts the NEXT run. Two-sided fix:
+    // scope the halt to multi-member snapshots, and make step 3 emit the section.
+    test("I1: the missing-section halt is scoped to multi-member snapshots, so a leaf run does not halt on it", () => {
+      const s0 = step0();
+      expect(s0).toContain("This halt applies to a **multi-member** snapshot");
+      expect(s0).toContain('A single-member snapshot (`"invoked_as": "leaf"`) has no ordering to establish and does not');
+    });
+
+    test("I1: step 3 emits a ## Dependencies section on every sub-issue it files", () => {
+      const s3 = slice("## 3.", "## 4.");
+      expect(s3).toContain("**Give every filed sub-issue a `## Dependencies` section**");
+      expect(s3).toContain("Step 0 halts on a snapshot member that carries no such section");
+    });
+  });
+
+  // The $MERGED_STATUS-plus-ancestry clause (the actual H1 fix) is deliberately NOT in this
+  // file — see the PR and the follow-up story. Two review rounds put seven Criticals in it,
+  // every one in the `gh`/`git` evidence protocol rather than in the clause's logic. This test
+  // pins the ABSENCE plus the written reason, so the gap is a documented decision rather than
+  // something a later reader silently "restores" by hand-writing a substitute.
+  describe("the deferred $MERGED_STATUS clause is absent, and its absence is documented", () => {
+    test("step 1 does not hand-roll a merge-commit ancestry protocol", () => {
+      const s1 = slice("## 1.", "## 2.");
+      expect(s1).toContain("**Not yet covered: a blocker at `$MERGED_STATUS`.**");
+      expect(s1).toContain("Do not hand-write a substitute here.");
+      // The evidence protocol itself must be absent — not merely unmentioned.
+      expect(s1).not.toContain("gh pr list");
+      expect(s1).not.toContain("merge-base --is-ancestor");
+      expect(s1).not.toContain("merge_sha");
+    });
+  });
+});
+
+// PCO-352 (S7), Locked 4: the blocker gate stays PROSE. No `scripts/lib/` module implementing
+// it (or the topological sort) may be added by this story — anywhere under `scripts/`.
+//
+// scripts/lib/ currently carries EIGHT non-test .ts modules, split by provenance:
+//   - PRE_EXISTING (predate this epic; the KB CLI): store.ts, schema.ts, fts.ts, migrate.ts
+//   - EPIC_ADDED (PCO-345's five, added one story at a time): coderabbit.ts, ship-config.ts,
+//     run-state.ts, merge-guard.ts, kb-sync.ts
+// `kb-sync.ts` has not landed yet as of this story, so asserting `length === 5` (or `=== 9`)
+// is wrong in both directions — this test instead asserts every module actually on disk is a
+// member of the UNION of the two sets above (readdirSync, never a hardcoded snapshot list),
+// and separately confirms no blocker-gate/topo-sort-shaped module exists anywhere.
+describe("PCO-352 S7 Locked 4: no blocker-gate/topo-sort module is added; scripts/lib/ stays within its known set", () => {
+  const PRE_EXISTING = new Set(["store.ts", "schema.ts", "fts.ts", "migrate.ts"]);
+  const EPIC_ADDED = new Set(["coderabbit.ts", "ship-config.ts", "run-state.ts", "merge-guard.ts", "kb-sync.ts"]);
+
+  function libModules(): string[] {
+    const { readdirSync } = require("node:fs") as typeof import("node:fs");
+    return readdirSync(join(root, "scripts/lib"))
+      .filter((f) => f.endsWith(".ts") && !f.endsWith(".test.ts"));
+  }
+
+  test("every non-test .ts module in scripts/lib/ is pre-existing or one of the five epic-added modules", () => {
+    const modules = libModules();
+    expect(modules.length).toBeGreaterThan(0);
+    for (const m of modules) {
+      expect(PRE_EXISTING.has(m) || EPIC_ADDED.has(m), `unexpected module scripts/lib/${m} — not in the known set`).toBe(true);
+    }
+  });
+
+  test("every epic-added module present on disk has a co-located test file", () => {
+    const { existsSync } = require("node:fs") as typeof import("node:fs");
+    const modules = new Set(libModules());
+    for (const m of EPIC_ADDED) {
+      if (!modules.has(m)) continue; // kb-sync.ts: not landed yet — legitimately absent
+      const testFile = m.replace(/\.ts$/, ".test.ts");
+      expect(existsSync(join(root, "scripts/lib", testFile)), `missing ${testFile} for scripts/lib/${m}`).toBe(true);
+    }
+  });
+
+  test("no blocker-gate or topo-sort module exists anywhere under scripts/ (Locked 4)", () => {
+    const { readdirSync, statSync } = require("node:fs") as typeof import("node:fs");
+    const offenders: string[] = [];
+    const shapeRe = /blocker|topo/i;
+    function walk(dir: string) {
+      for (const entry of readdirSync(dir)) {
+        const p = join(dir, entry);
+        const st = statSync(p);
+        if (st.isDirectory()) {
+          walk(p);
+        } else if (shapeRe.test(entry)) {
+          offenders.push(p);
+        }
+      }
+    }
+    walk(join(root, "scripts"));
+    expect(offenders).toEqual([]);
   });
 });
