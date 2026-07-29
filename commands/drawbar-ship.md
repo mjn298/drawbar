@@ -145,7 +145,7 @@ rejects any other shape loudly, structural-only, never silently tolerating an un
   "snapshot": ["<story id>", ...],
   "stories_done": [],
   "in_flight": null,
-  "merged": {},
+  "stack": [],
   "subissues_filed": [],
   "resolved_config": { /* Preflight's $RESOLVED, verbatim — ship-config.ts's ResolvedConfig */ }
 }
@@ -430,8 +430,9 @@ then `ScheduleWakeup({stop: true})`.
 
 - Sequential. One story per invocation. Never parallel.
 - Halt on failure; never skip a story.
-- `--base` is always the configured `baseBranch` (Preflight validates it against the repo's
-  actual default branch). Never stack.
+- `--base` comes from `scripts/lib/stack.ts`'s `resolveBase`: the configured `baseBranch` for
+  the first story of a run, the previous story's recorded branch for every story after that
+  (Locked A). The run never merges.
 - Never `--no-verify`, never force-push, never commit to `main` directly.
 - **Never set `Done` / `Ready For QA` / `Ready for Rollout` / `Rolled Out`** — and never
   grant a subagent Linear authority.

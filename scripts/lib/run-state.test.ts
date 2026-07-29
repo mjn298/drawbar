@@ -42,9 +42,7 @@ const VALID_RUN_STATE: RunState = {
   snapshot: ["story-a", "story-b"],
   stories_done: ["story-a"],
   in_flight: { story: "story-b", agent_dispatched_at: "2026-01-01T01:00:00Z" },
-  merged: {
-    "story-a": { pr: 1, merge_sha: "abc1234de", status: "Pre-QA" },
-  },
+  stack: [{ story: "story-a", branch: "story-a-branch", pr: 1, base: "main", flagged: false }],
   subissues_filed: ["story-c"],
   resolved_config: VALID_RESOLVED_CONFIG,
 };
@@ -110,15 +108,36 @@ describe("parseRunState — structural validation only (Locked 12)", () => {
     expect(result.detail).toContain("extra_field");
   });
 
-  test("`merged` entries missing `merge_sha` are rejected", () => {
+  test("`stack` entries missing `branch` are rejected", () => {
     const malformed = {
       ...VALID_RUN_STATE,
-      merged: { "story-a": { pr: 1, status: "Pre-QA" } },
+      stack: [{ story: "story-a", pr: 1, base: "main", flagged: false }],
     };
     const result = parseRunState(JSON.stringify(malformed));
     expect(result.ok).toBe(false);
     if (result.ok) return;
-    expect(result.reason).toBe("invalid_merged_entry");
+    expect(result.reason).toBe("invalid_stack_entry");
+  });
+
+  // PCO-365 (R2): a state file written before the stacked-PR migration carries `merged`
+  // instead of `stack` — this must be diagnosable as "recreate/migrate this file," not a
+  // generic unknown-key complaint indistinguishable from an operator typo.
+  test("a run-state carrying the legacy `merged` key (old shape, `stack` absent) is rejected with its own named reason", () => {
+    const { stack, ...rest } = VALID_RUN_STATE;
+    const malformed = { ...rest, merged: {} };
+    const result = parseRunState(JSON.stringify(malformed));
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.reason).toBe("legacy_merged_key");
+    expect(result.detail).toContain("stacked-PR migration");
+  });
+
+  test("a run-state carrying BOTH the legacy `merged` key and the canonical `stack` key is still rejected as legacy_merged_key", () => {
+    const malformed = { ...VALID_RUN_STATE, merged: {} };
+    const result = parseRunState(JSON.stringify(malformed));
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.reason).toBe("legacy_merged_key");
   });
 
   // Fix pass, CRITICAL 1: an unparseable `agent_dispatched_at` must be rejected with its OWN
@@ -256,48 +275,92 @@ describe("parseRunState — shape validation at the pure-function boundary (IMPO
     expect(result.reason).toBe("invalid_arg");
   });
 
-  test("merged[x].merge_sha with a path-traversal shape (not hex) is rejected", () => {
+  test("stack[x].branch with a git argv-injection shape is rejected", () => {
     const malformed = {
       ...VALID_RUN_STATE,
-      merged: { "story-a": { pr: 1, merge_sha: "../../HEAD", status: "Pre-QA" } },
+      stack: [{ story: "story-a", branch: "--upload-pack=x", pr: 1, base: "main", flagged: false }],
     };
     const result = parseRunState(JSON.stringify(malformed));
     expect(result.ok).toBe(false);
     if (result.ok) return;
-    expect(result.reason).toBe("invalid_merged_entry");
+    expect(result.reason).toBe("invalid_stack_entry");
   });
 
-  test("merged[x].pr = -1 is rejected", () => {
+  test("stack[x].base with a git argv-injection shape is rejected", () => {
     const malformed = {
       ...VALID_RUN_STATE,
-      merged: { "story-a": { pr: -1, merge_sha: "abc1234de", status: "Pre-QA" } },
+      stack: [{ story: "story-a", branch: "story-a-branch", pr: 1, base: "--upload-pack=x", flagged: false }],
     };
     const result = parseRunState(JSON.stringify(malformed));
     expect(result.ok).toBe(false);
     if (result.ok) return;
-    expect(result.reason).toBe("invalid_merged_entry");
+    expect(result.reason).toBe("invalid_stack_entry");
   });
 
-  test("merged[x].pr = 1.5 (non-integer) is rejected", () => {
+  test("stack[x].pr = -1 is rejected", () => {
     const malformed = {
       ...VALID_RUN_STATE,
-      merged: { "story-a": { pr: 1.5, merge_sha: "abc1234de", status: "Pre-QA" } },
+      stack: [{ story: "story-a", branch: "story-a-branch", pr: -1, base: "main", flagged: false }],
     };
     const result = parseRunState(JSON.stringify(malformed));
     expect(result.ok).toBe(false);
     if (result.ok) return;
-    expect(result.reason).toBe("invalid_merged_entry");
+    expect(result.reason).toBe("invalid_stack_entry");
   });
 
-  test("merged[x].pr = 0 is rejected", () => {
+  test("stack[x].pr = 1.5 (non-integer) is rejected", () => {
     const malformed = {
       ...VALID_RUN_STATE,
-      merged: { "story-a": { pr: 0, merge_sha: "abc1234de", status: "Pre-QA" } },
+      stack: [{ story: "story-a", branch: "story-a-branch", pr: 1.5, base: "main", flagged: false }],
     };
     const result = parseRunState(JSON.stringify(malformed));
     expect(result.ok).toBe(false);
     if (result.ok) return;
-    expect(result.reason).toBe("invalid_merged_entry");
+    expect(result.reason).toBe("invalid_stack_entry");
+  });
+
+  test("stack[x].pr = 0 is rejected", () => {
+    const malformed = {
+      ...VALID_RUN_STATE,
+      stack: [{ story: "story-a", branch: "story-a-branch", pr: 0, base: "main", flagged: false }],
+    };
+    const result = parseRunState(JSON.stringify(malformed));
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.reason).toBe("invalid_stack_entry");
+  });
+
+  test("stack[x].flagged that is not a strict boolean is rejected", () => {
+    const malformed = {
+      ...VALID_RUN_STATE,
+      stack: [{ story: "story-a", branch: "story-a-branch", pr: 1, base: "main", flagged: "true" }],
+    };
+    const result = parseRunState(JSON.stringify(malformed));
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.reason).toBe("invalid_stack_entry");
+  });
+
+  test("stack that is an object keyed by story id (the old `merged` shape) rather than an array is rejected", () => {
+    const malformed = {
+      ...VALID_RUN_STATE,
+      stack: { "story-a": { story: "story-a", branch: "story-a-branch", pr: 1, base: "main", flagged: false } },
+    };
+    const result = parseRunState(JSON.stringify(malformed));
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.reason).toBe("invalid_stack");
+  });
+
+  test("a stack entry carrying an extra unknown key is rejected", () => {
+    const malformed = {
+      ...VALID_RUN_STATE,
+      stack: [{ story: "story-a", branch: "story-a-branch", pr: 1, base: "main", flagged: false, sha: "abc1234" }],
+    };
+    const result = parseRunState(JSON.stringify(malformed));
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.reason).toBe("invalid_stack_entry");
   });
 
   test("in_flight.story that is a single space (empty after trim) is rejected", () => {
@@ -637,14 +700,19 @@ describe("parseRunState — every ParseReason is exercised at least once (Covera
       reason: "invalid_in_flight",
     },
     {
-      name: "invalid_merged: merged is not an object keyed by story id",
-      text: () => JSON.stringify({ ...VALID_RUN_STATE, merged: "not-an-object" }),
-      reason: "invalid_merged",
+      name: "invalid_stack: stack is not an array",
+      text: () => JSON.stringify({ ...VALID_RUN_STATE, stack: "not-an-array" }),
+      reason: "invalid_stack",
     },
     {
-      name: "invalid_merged_entry: a merged entry is missing merge_sha",
-      text: () => JSON.stringify({ ...VALID_RUN_STATE, merged: { "story-a": { pr: 1, status: "Pre-QA" } } }),
-      reason: "invalid_merged_entry",
+      name: "invalid_stack_entry: a stack entry is missing branch",
+      text: () => JSON.stringify({ ...VALID_RUN_STATE, stack: [{ story: "story-a", pr: 1, base: "main", flagged: false }] }),
+      reason: "invalid_stack_entry",
+    },
+    {
+      name: "legacy_merged_key: the run-state carries the pre-migration `merged` key",
+      text: () => JSON.stringify({ ...VALID_RUN_STATE, merged: {} }),
+      reason: "legacy_merged_key",
     },
     {
       name: "invalid_subissues_filed: subissues_filed contains a non-string entry",
@@ -686,10 +754,13 @@ describe("parseRunState — every ParseReason is exercised at least once (Covera
     });
   }
 
-  // All 15 `ParseReason` values (13 original + 2 this fix pass added) are represented — this
-  // table has 16 rows because `not_object` is deliberately exercised twice (array root, bare
-  // number root), so the assertion is against the pinned literal list, not `cases.length`.
-  test("this table covers all 15 ParseReason values, not merely a subset", () => {
+  // All 16 `ParseReason` values (13 original - 2 removed by the PCO-365 merged->stack
+  // migration + 5 added: invalid_stack, invalid_stack_entry, legacy_merged_key were new;
+  // invalid_merged/invalid_merged_entry were deleted outright, not left dormant) are
+  // represented — this table has 17 rows because `not_object` is deliberately exercised
+  // twice (array root, bare number root), so the assertion is against the pinned literal
+  // list, not `cases.length`.
+  test("this table covers all 16 ParseReason values, not merely a subset", () => {
     const ALL_PARSE_REASONS = [
       "invalid_json",
       "not_object",
@@ -700,8 +771,9 @@ describe("parseRunState — every ParseReason is exercised at least once (Covera
       "invalid_snapshot",
       "invalid_stories_done",
       "invalid_in_flight",
-      "invalid_merged",
-      "invalid_merged_entry",
+      "invalid_stack",
+      "invalid_stack_entry",
+      "legacy_merged_key",
       "invalid_subissues_filed",
       "invalid_resolved_config",
       "invalid_in_flight_timestamp",

@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { parseShipConfig, validateShipConfig, type Runner } from "./lib/ship-config";
+import { REQUIRED_KEYS } from "./lib/run-state";
 
 const root = join(import.meta.dir, "..");
 
@@ -112,6 +113,10 @@ describe("ported files carry no private-org identifiers (leak regression)", () =
     // uppercase-team-prefix shape.
     "scripts/lib/run-state.ts",
     "scripts/lib/run-state.test.ts",
+    // PCO-365 (R2): the stack module and its tests — same lowercase-fixture-id discipline as
+    // run-state.test.ts. The leak scan errors on a missing path, so both must exist on disk.
+    "scripts/lib/stack.ts",
+    "scripts/lib/stack.test.ts",
   ];
   const ALL_FILES = [...DOC_FILES, ...SELF_FILES, ...NEW_PUBLIC_FILES];
 
@@ -1277,6 +1282,32 @@ describe("PCO-352 S7: blocker gate clauses, Locked-11 halt, Unplanned filing", (
       expect(s3).toContain("Step 0 halts on a snapshot member that carries no such section");
     });
   });
+
+  // PCO-365 (R2): §0 tells the runbook to CREATE the state file in this exact shape — left
+  // out of sync with `parseRunState`'s pinned schema, the runbook would create a file
+  // `parseRunState` refuses on its very next read. Extracted (never JSON.parse'd — the block
+  // is not valid JSON: it carries placeholder values, a `|` enum, and an inline comment) and
+  // compared against the exported `REQUIRED_KEYS` set so doc and parser can never drift again.
+  describe("step 0's state-file schema JSON block matches run-state.ts's REQUIRED_KEYS exactly", () => {
+    // `slice()` collapses all whitespace to single spaces (see its own comment above) — fine
+    // for prose containment checks, but it destroys the line structure this test needs to
+    // find top-level (two-space-indented) keys without descending into `resolved_config`'s
+    // nested shape. Reads the RAW doc text directly instead.
+    test("declares exactly REQUIRED_KEYS — no more, no fewer — and never the legacy `merged` key", () => {
+      assertOccursOnce("## 0.");
+      assertOccursOnce("## 1.");
+      const txt = shipDoc();
+      const start = txt.indexOf("## 0.");
+      const end = txt.indexOf("## 1.", start);
+      const s0Raw = txt.slice(start, end);
+      const codeBlock = s0Raw.match(/```\n\{[\s\S]*?\n\}\n```/);
+      expect(codeBlock, "no fenced JSON schema block found in §0").not.toBeNull();
+      const topLevelKeys = [...codeBlock![0].matchAll(/^ {2}"(\w+)":/gm)].map((m) => m[1]!);
+      expect(new Set(topLevelKeys)).toEqual(new Set(REQUIRED_KEYS));
+      expect(topLevelKeys).not.toContain("merged");
+      expect(topLevelKeys).toContain("stack");
+    });
+  });
 });
 
 // PCO-352 (S7), Locked 4: the blocker gate stays PROSE. No `scripts/lib/` module implementing
@@ -1293,7 +1324,7 @@ describe("PCO-352 S7: blocker gate clauses, Locked-11 halt, Unplanned filing", (
 // and separately confirms no blocker-gate/topo-sort-shaped module exists anywhere.
 describe("PCO-352 S7 Locked 4: no blocker-gate/topo-sort module is added; scripts/lib/ stays within its known set", () => {
   const PRE_EXISTING = new Set(["store.ts", "schema.ts", "fts.ts", "migrate.ts"]);
-  const EPIC_ADDED = new Set(["ship-config.ts", "run-state.ts", "kb-sync.ts"]);
+  const EPIC_ADDED = new Set(["ship-config.ts", "run-state.ts", "kb-sync.ts", "stack.ts"]);
 
   function libModules(): string[] {
     const { readdirSync } = require("node:fs") as typeof import("node:fs");
@@ -1490,5 +1521,31 @@ describe("PCO-364 R1: the merge path and CodeRabbit gating are gone from the rep
     expect(opening.length).toBeGreaterThan(500);
     expect(opening).toMatch(/never merges/i);
     expect(opening).not.toMatch(/merged on `main`/);
+  });
+});
+
+// PCO-365 (R2) IMPORTANT 5: the runbook's own Hard rules used to instruct "Never stack",
+// contradicting Locked A (the whole point of scripts/lib/stack.ts). Fails loudly if that
+// literal is ever reintroduced anywhere tracked, not just in the one file it was found in.
+describe("PCO-365 R2 IMPORTANT 5: 'Never stack' is gone from the runbook's Hard rules", () => {
+  test("the string `Never stack` appears nowhere in the repo", () => {
+    const proc = Bun.spawnSync(["git", "ls-files"], { cwd: root });
+    expect(proc.exitCode, `git ls-files failed: ${proc.stderr.toString()}`).toBe(0);
+    const files = proc.stdout
+      .toString()
+      .split("\n")
+      .map((l) => l.trim())
+      .filter((l) => l.length > 0 && l !== "scripts/plugin.test.ts")
+      .map((rel) => join(root, rel));
+    let scanned = 0;
+    const offenders: string[] = [];
+    for (const file of files) {
+      if (!existsSync(file)) continue; // tracked in the index, absent from the working tree
+      const text = readFileSync(file, "utf8");
+      scanned++;
+      if (text.includes("Never stack")) offenders.push(file);
+    }
+    expect(scanned, "scan collapsed to near-nothing — filter likely broken").toBeGreaterThan(20);
+    expect(offenders).toEqual([]);
   });
 });
