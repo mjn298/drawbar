@@ -325,6 +325,60 @@ Not added to the snapshot — they wait for the next run.
 > The reviewer agents explicitly "return categorized findings; do not write to Linear," and
 > the story-lead has no Linear tools. If you skip this, the finding dies with the session.
 
+## 4. Open the stacked PR
+
+The story-lead's own §6 already runs `gh pr create` against `$BASE_BRANCH` — the configured
+base, correct only for the first story of a run. That call is a **transitional duplicate**:
+this step opens the PR that actually anchors the stack, and the story-lead's own PR creation
+is **removed entirely once R4 (PCO-367) lands**, closing this overlap for good.
+
+This step resolves the base by delegating to `stack.ts` — never re-derived in bash — and
+opens the PR with an explicit `--base <base>` flag; `--base` is never omitted (Locked A): the
+default would silently fall back to the repo's default branch, producing a PR whose diff
+carries every earlier story's work too — green, plausible, and near-impossible to spot in
+the morning.
+
+**Deliberately not specified here: the executable fence.** This section's stacked-PR-opening
+logic — resolving the base, asserting chain integrity, and calling `gh pr create` — is
+deferred to **PCO-370** and must land together with **R4 (PCO-367)**; nobody should hand-write
+a substitute here in the meantime. Two reasons block it today: the story-lead currently cuts
+every branch from `main`, so a recorded chain would refuse `branch_moved` from the third story
+onward; and the story-lead still opens its own PR, so a second `gh pr create` here would
+collide with it for story 1.
+
+`FLAGGED` comes from the story-lead's §8 report `status` field — written against the `ok |
+flagged` contract R4 (PCO-367) lands (today's story-lead still reports `ready_to_merge |
+parked`; this step is already written against the contract its successor is landing). On a
+**flagged** story, the PR body carries an `## Unresolved findings` section, built before
+`gh pr create` runs, never appended after. That section names each out-of-scope finding by
+its filed sub-issue id and title only — never the finding body, `file:line`, or a quoted
+source excerpt; the full write-up already lives in the sub-issue §3 filed for it, and
+republishing it in a public PR body announces an unpatched detail to every repo watcher
+before the operator's morning review.
+
+**These two outcomes differ in kind, not merely in degree — the header below names which one
+you're in; never file this under one shared "satisfied if any of the following" list.**
+
+**Outcome A — no PR could be opened (halt, distinct from flagged).** A refusal at any of the
+three required checks — assert-chain refusing, resolve-base refusing, or `gh pr create`
+itself failing — means the chain has no anchor to stack the next story on. This is never the
+flagged case: go to *Parking a story*, with `parked_reason` naming which call refused.
+
+**Outcome B — the PR opened.** Record `{story, branch, pr, base, flagged}` in the run state's
+`stack` array — `pr` as a JSON number (a positive integer, never the string form) and
+`flagged` as a JSON boolean — then continue to §5.
+
+## 5. Post the summary comment, leave In Progress
+
+Post a `save_comment` on the story: what shipped, the PR link, the stack position (this
+story's place in the run's stack, e.g. "position 3 of the run, based on `<BASE>`"), the
+sub-issues filed in §3, and the story-lead's `mutation_pairs`.
+
+**Leave the story `In Progress`. No status transition of any kind** — never `Done`, `Ready
+for QA`, `Ready for Rollout`, `Rolled Out`, or any completed-type status. The operator's own
+review and merge is the only thing that ever moves it past `In Progress`; this step never
+does.
+
 ## 6. Capture and sync knowledge
 
 Inline KB writes made mid-run by the story-lead or implementer (`drawbar-kb add`) are **not**
@@ -374,9 +428,9 @@ for the full reasoning. There is no second, hand-copied bash implementation of a
 
 ## 7. Advance
 
-Append the story to `stories_done`. `in_flight` is **not** cleared here — the report-site
-clear lived entirely in the deleted §5 and does not exist yet (a later story restores it);
-today it is cleared only by *Parking a story* and *Crash recovery* below. `PushNotification`
+Append the story to `stories_done`. `in_flight` is **not** cleared here — §5 (post the
+summary comment) does not clear it either; it is cleared only by *Parking a story* and
+*Crash recovery* below. `PushNotification`
 one line: story id, PR link, sub-issues filed. `ScheduleWakeup`
 for the next story (under `/loop`), or report and finish.
 
