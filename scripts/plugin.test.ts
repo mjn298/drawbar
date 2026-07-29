@@ -2467,10 +2467,12 @@ describe("PCO-352 S7: blocker gate clauses, Locked-11 halt, Unplanned filing", (
 //   - PRE_EXISTING (predate this epic; the KB CLI): store.ts, schema.ts, fts.ts, migrate.ts
 //   - EPIC_ADDED (PCO-345's five, added one story at a time): coderabbit.ts, ship-config.ts,
 //     run-state.ts, merge-guard.ts, kb-sync.ts
-// `kb-sync.ts` has not landed yet as of this story, so asserting `length === 5` (or `=== 9`)
-// is wrong in both directions — this test instead asserts every module actually on disk is a
-// member of the UNION of the two sets above (readdirSync, never a hardcoded snapshot list),
-// and separately confirms no blocker-gate/topo-sort-shaped module exists anywhere.
+// `kb-sync.ts` landed in PCO-353 (S8) — all five EPIC_ADDED modules are now present. Still not
+// asserting `length === 5` (or `=== 9`): a literal count would be wrong again the moment any
+// future story adds a module, epic-added or not — this test instead asserts every module
+// actually on disk is a member of the UNION of the two sets above (readdirSync, never a
+// hardcoded snapshot list), and separately confirms no blocker-gate/topo-sort-shaped module
+// exists anywhere.
 describe("PCO-352 S7 Locked 4: no blocker-gate/topo-sort module is added; scripts/lib/ stays within its known set", () => {
   const PRE_EXISTING = new Set(["store.ts", "schema.ts", "fts.ts", "migrate.ts"]);
   const EPIC_ADDED = new Set(["coderabbit.ts", "ship-config.ts", "run-state.ts", "merge-guard.ts", "kb-sync.ts"]);
@@ -2493,7 +2495,7 @@ describe("PCO-352 S7 Locked 4: no blocker-gate/topo-sort module is added; script
     const { existsSync } = require("node:fs") as typeof import("node:fs");
     const modules = new Set(libModules());
     for (const m of EPIC_ADDED) {
-      if (!modules.has(m)) continue; // kb-sync.ts: not landed yet — legitimately absent
+      if (!modules.has(m)) continue; // defensive: every EPIC_ADDED module is on disk as of PCO-353 (S8), but the loop tolerates a future one still being absent mid-epic
       const testFile = m.replace(/\.ts$/, ".test.ts");
       expect(existsSync(join(root, "scripts/lib", testFile)), `missing ${testFile} for scripts/lib/${m}`).toBe(true);
     }

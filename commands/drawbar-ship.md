@@ -112,6 +112,14 @@ KB="$ENV_DIR/.drawbar/memory"
 # would silently target it, succeed, find no matching PR, and never satisfy the gate. The
 # validated $REPO above — resolved and checked by ship-config.ts, never re-derived here — is
 # what anchors every downstream `gh` call at the actually-configured project repo instead.
+
+# Locked 16 (S8, PCO-353, F8): the checks above cover $PROJECT_DIR — nothing above ever looks at
+# the KNOWLEDGE repo ($ENV_DIR), which is the one step 6's rebase actually depends on being
+# clean, `merge=union`-covered, and carrying a `.drawbar/runs/.gitignore`. Delegated whole to
+# `kb-sync.ts preflight` — no second, hand-copied bash implementation of any of its three
+# assertions here (single-implementation-site regression discipline).
+bun run "${CLAUDE_PLUGIN_ROOT}/scripts/lib/kb-sync.ts" preflight --env-dir "$ENV_DIR" --dir "$KB" \
+  || { echo "FATAL: kb-sync.ts preflight refused — see stderr above for the specific reason."; exit 1; }
 ```
 
 Dirty `$PROJECT_DIR` tree → **do not halt blindly**; go to *Crash recovery* below. A dirty tree
@@ -613,19 +621,45 @@ guarding against a duplicate of is now reported and done (Locked 13).
 
 ## 6. Capture and sync knowledge
 
-Write each entry in the report's `lessons` via `drawbar-kb add --dir "$KB"`, then:
+Inline KB writes made mid-run by the story-lead or implementer (`drawbar-kb add`) are **not**
+waited for or batched here — they are already on disk by the time this step runs. This step
+commits whatever is on disk (inline writes included) plus the report's own `lessons[]`,
+tolerantly retries against a concurrent push, and halts loud on genuine exhaustion rather than
+continuing silently (F8: the old loop's `break` fired only on success, so total failure once
+printed nothing and execution continued anyway).
 
 ```bash
-cd "$ENV_DIR"
-git add .drawbar/memory/knowledge.jsonl
-git commit -m "kb: <lesson> (<TEAM>-####)"
-for i in 1 2 3; do git pull --rebase && git push && break; sleep 5; done
-drawbar-kb reindex --dir "$KB"
+RESOLVED="<Preflight's resolved_config JSON>"     # see §4's cross-invocation note — re-declared
+ENV_DIR=$(echo "$RESOLVED" | jq -r '.envDir // empty')
+[ -n "$ENV_DIR" ] && [ "$ENV_DIR" != "null" ] || { echo "FATAL: ENV_DIR is empty or null after validation — refusing."; exit 1; }
+KB="$ENV_DIR/.drawbar/memory"
+: "${CLAUDE_PLUGIN_ROOT:?CLAUDE_PLUGIN_ROOT must be set}"
+STORY="<TEAM>-####"      # the story this iteration shipped
+
+# The report's `lessons` array, as JSON — the same shape `drawbar-kb add` accepts per entry,
+# wrapped in {"lessons":[...]}. `kb-sync.ts` reconciles each one against whatever is already on
+# disk by KEY, via store.ts's appendEntry — never re-derived or fought here.
+LESSONS_JSON='{"lessons":<the report'"'"'s lessons array, JSON>}'
+
+# Fail CLOSED on every one of: a non-zero exit from the module itself, or unparseable/empty
+# stdout — same discipline §4's merge-guard.ts delegation uses.
+SYNC_JSON=$(echo "$LESSONS_JSON" | bun run "${CLAUDE_PLUGIN_ROOT}/scripts/lib/kb-sync.ts" sync \
+              --env-dir "$ENV_DIR" --dir "$KB" --message "kb: $STORY sync")
+SYNC_EXIT=$?
+[ "$SYNC_EXIT" -eq 0 ] || { echo "REFUSING: kb-sync.ts sync exited $SYNC_EXIT — see stderr above ($SYNC_JSON)"; exit 1; }
+SYNC_OK=$(echo "$SYNC_JSON" | jq -r 'if (type=="object" and has("ok")) then .ok else "unparseable" end' 2>/dev/null)
+[ "$SYNC_OK" = "true" ] || { echo "REFUSING: kb-sync.ts sync was not ok ($SYNC_JSON)"; exit 1; }
 ```
 
-Commit **before** pulling so the entry replays on top; `.gitattributes` sets `merge=union`
-on the JSONL so the rebase resolves itself. `reindex` **last** — `index.db` is gitignored
-and derived, and a pull can bring in entries the local index has never seen.
+`kb-sync.ts` owns the whole sequence — stage (both `knowledge.jsonl` and
+`knowledge.archive.jsonl`), commit-if-staged, assert a clean precondition, rebase, push,
+retry-only-on-a-genuine-rejection, and `reindex` **last**, only after a successful push
+(`index.db` is gitignored and derived, and the rebase can bring in entries the local index has
+never seen). A non-zero `duplicateKeys` on a successful sync is a benign union-merge artifact
+of a concurrent supersede, not a failure — it is reported on stdout and warned on stderr, with
+an ATTENDED `drawbar-kb compact` named as the remedy; see the module's own top-of-file comment
+for the full reasoning. There is no second, hand-copied bash implementation of any of this here
+(single-implementation-site regression discipline).
 
 > **Never run `drawbar-kb archive` or `compact` here.** Both mutate the store with no
 > confirmation and no output that reads as destructive; `recall` searches active entries
