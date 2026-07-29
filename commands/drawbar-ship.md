@@ -300,9 +300,10 @@ Then dispatch **one** `drawbar-story-lead` agent (Opus). The brief must carry:
   Linear's `gitBranchName` from `get_issue`, which guarantees the PR auto-links
 - that it must **not** merge and has no Linear authority
 
-It returns the JSON report in its §8: `{status, pr, branch, mutation_pairs, out_of_scope,
-lessons, summary}`. **Do not ask it for the diff.** If you find yourself wanting one, the
-split is not working.
+It returns the JSON report in its §7: `{status, branch, base, findings, mutation_pairs,
+out_of_scope, lessons, summary}`. It carries no `pr` — it opens none; §4 below is what opens
+the PR and learns its number. **Do not ask it for the diff.** If you find yourself wanting
+one, the split is not working.
 
 `status: parked` → skip to *Parking a story*.
 

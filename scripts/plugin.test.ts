@@ -1,5 +1,5 @@
 import { test, expect, describe } from "bun:test";
-import { readFileSync, mkdtempSync, writeFileSync, chmodSync, existsSync, mkdirSync } from "node:fs";
+import { readFileSync, mkdtempSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -555,116 +555,22 @@ describe("Preflight's Linear-facts stdin shape matches ship-config.ts's isLinear
   });
 });
 
-// CRITICAL 1 (fix pass): `gh pr checks` buckets are `pass | fail | pending | skipping |
-// cancel` — "every check concluded" and "every check is green" are separate predicates,
-// and conflating them let a red or cancelled run (both ALREADY concluded, so no longer
-// `pending`) report ready, and let an empty check set (jq's `all` over `[]` is vacuously
-// true) report ready too. This harness extracts the real §7 fence's per-iteration decision
-// body (not a reimplementation of it) and drives it with a stubbed `gh` so both predicates
-// are proven against the real script, not a bench copy of the jq expression.
-describe("§7 drive-it-green fails closed on red/cancelled/empty checks (CRITICAL 1)", () => {
-  function extractDriveGreenBody(): string {
-    const txt = readNonEmpty(join(root, "agents/drawbar-story-lead.md"));
-    const start = txt.indexOf("# --- drive it green (§7)");
-    expect(start, "drive-it-green marker not found").toBeGreaterThan(-1);
-    const end = txt.indexOf("# --- end drive it green", start);
-    expect(end, "end-drive-it-green marker not found").toBeGreaterThan(start);
-    const block = txt.slice(start, end);
-    // Strip the `while :; do` / `done` wrapper so a single pass through the per-iteration
-    // decision can be driven directly, without an actual infinite loop / `sleep 60` in the
-    // test process.
-    const bodyStart = block.indexOf("while :; do");
-    expect(bodyStart, "while loop not found in §7 fence").toBeGreaterThan(-1);
-    const bodyOpen = block.indexOf("\n", bodyStart) + 1;
-    const bodyEnd = block.lastIndexOf("\ndone");
-    expect(bodyEnd, "closing `done` not found in §7 fence").toBeGreaterThan(bodyOpen);
-    // Stop before `sleep 60` — a real invocation of that line is exactly what a single-pass
-    // test must not do; everything ABOVE it (the concluded/green decision and the deadline
-    // check) is what this test drives, unmodified from the shipped fence.
-    const sleepIdx = block.indexOf("sleep 60", bodyOpen);
-    expect(sleepIdx, "`sleep 60` not found in §7 fence").toBeGreaterThan(bodyOpen);
-    return block.slice(bodyOpen, Math.min(bodyEnd, sleepIdx));
-  }
-
-  async function runScript(script: string, env: Record<string, string>): Promise<{ code: number; output: string }> {
-    const proc = Bun.spawn(["bash", "-c", script], {
-      env: { PATH: process.env.PATH ?? "", ...env },
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-    const out = await new Response(proc.stdout).text();
-    const err = await new Response(proc.stderr).text();
-    const code = await proc.exited;
-    return { code, output: out + err };
-  }
-
-  // Stubs `gh` (any invocation) to print the given `gh pr checks --json bucket` payload, then
-  // runs one pass of the real per-iteration body with $DEADLINE far in the future (so the
-  // TIMEOUT branch cannot fire) and echoes $STATUS at the end so the test can read it back —
-  // $STATUS itself is a bash variable, invisible to the exit code alone.
-  async function runIteration(bucketsJson: string): Promise<{ status: string; output: string }> {
-    const dir = mkdtempSync(join(tmpdir(), "drawbar-gh-stub-"));
-    const ghPath = join(dir, "gh");
-    writeFileSync(ghPath, `#!/bin/sh\ncat <<'EOF'\n${bucketsJson}\nEOF\n`);
-    chmodSync(ghPath, 0o755);
-    // The extracted body's `break` statements are only meaningful inside a loop — re-wrap it
-    // in one here (never part of what's extracted) so `break` behaves exactly as it does in
-    // the real fence, with a trailing `break` after it that guarantees a single pass
-    // regardless of which branch (if any) inside the body already broke out.
-    const script =
-      `STATUS="waiting"\n` +
-      `DEADLINE=$(( $(date -u +%s) + 3600 ))\n` +
-      `REPO="acme/widgets"\nPR="1"\n` +
-      `while :; do\n${extractDriveGreenBody()}\nbreak\ndone\n` +
-      `echo "FINAL_STATUS=$STATUS"`;
-    const { output } = await runScript(script, { PATH: `${dir}:${process.env.PATH ?? ""}` });
-    const m = output.match(/FINAL_STATUS=(\w*)/);
-    return { status: m ? m[1]! : "", output };
-  }
-
-  test("all checks pass -> ready", async () => {
-    const { status, output } = await runIteration('[{"bucket":"pass"}]');
-    expect(status).toBe("ready");
-    expect(output).not.toContain("CHECKS_FAILED");
-  });
-
-  test("one failing check among concluded checks -> parked, reason CHECKS_FAILED", async () => {
-    const { status, output } = await runIteration('[{"bucket":"pass"},{"bucket":"fail"}]');
-    expect(status).toBe("parked");
-    expect(output).toContain("CHECKS_FAILED");
-  });
-
-  test("a cancelled check -> parked, reason CHECKS_FAILED", async () => {
-    const { status, output } = await runIteration('[{"bucket":"cancel"}]');
-    expect(status).toBe("parked");
-    expect(output).toContain("CHECKS_FAILED");
-  });
-
-  test("empty check set -> not ready (vacuous `all` over [] must not satisfy either predicate)", async () => {
-    const { status, output } = await runIteration("[]");
-    expect(status).toBe("waiting");
-    expect(output).not.toContain("CHECKS_FAILED");
-    expect(output).not.toContain("TIMEOUT");
-  });
-
-  test("a still-pending check -> keeps waiting", async () => {
-    const { status, output } = await runIteration('[{"bucket":"pending"}]');
-    expect(status).toBe("waiting");
-    expect(output).not.toContain("CHECKS_FAILED");
-    expect(output).not.toContain("TIMEOUT");
-  });
-});
+// PCO-367 (R4) deleted the story-lead's §7 "Drive it green" section outright, and with it
+// the drive-it-green bash fence this file used to extract and drive against a stubbed `gh`.
+// The story-lead opens no PR, so it has no PR to poll: there is nothing left to wait on until
+// the caller's §4 runs. The absence of the section, its fence, and its two parking reasons is
+// asserted in the R4 describe near the bottom of this file — nothing here replaces the removed
+// harness, because the behavior it covered no longer exists anywhere in the plugin.
 
 // Fix pass (mutation-gate hole): no existing test asserted anything about the literal
-// `gh pr create` / Hard-rules text for `--base`, so a mutation replacing
-// `--base "$BASE_BRANCH"` with a bare `--base main` was invisible to the suite. These pin
-// the parameterized form and positively forbid the hardcoded one from reappearing in either
-// file. Anchored on files first proven non-empty via readNonEmpty, per MUST-CHECK
-// vacuous-assertion-needs-preseed-state.
+// `--base` text, so a mutation replacing `--base "$BASE_BRANCH"` with a bare `--base main`
+// was invisible to the suite. PCO-367 (R4) removed PR creation from the story-lead entirely,
+// so only the command side keeps a positive pin here; the story-lead side is now an absence
+// check (see the R4 describe). Anchored on files first proven non-empty via readNonEmpty, per
+// MUST-CHECK vacuous-assertion-needs-preseed-state.
 describe("PCO-348 fix pass: --base parameterization is not silently re-hardcoded", () => {
-  test("agents/drawbar-story-lead.md section 6 ships gh pr create with the configured base branch", () => {
+  test("agents/drawbar-story-lead.md never hardcodes a --base main anywhere", () => {
     const txt = readNonEmpty(join(root, "agents/drawbar-story-lead.md"));
-    expect(txt).toContain('gh pr create -R "$REPO" --base "$BASE_BRANCH"');
     expect(txt).not.toMatch(/--base\s+main\b/);
   });
 
@@ -1722,5 +1628,637 @@ describe("PCO-366 R3: ship §4/§5 — open the stacked PR, leave In Progress, p
         "stack, e.g. \"position 3 of the run, based on `<BASE>`\"), the sub-issues filed in " +
         "§3, and the story-lead's `mutation_pairs`.",
     );
+  });
+});
+
+// PCO-367 (R4): the story-lead becomes a function of a base branch that returns a two-state
+// verdict. Five changes, each pinned below:
+//   1. §2 cuts the story branch from the SUPPLIED base branch, never the repo default —
+//      `$BASE_BRANCH` now means "the base this story stacks on", i.e. the previous story's
+//      branch for every story after the first.
+//   2. §6 opens no pull request at all. The caller's §4 is the only step that may: leaving
+//      both would submit the identical head+base pair on the run's first story, GitHub
+//      refuses the second with a 422, and the run parks on story 1 every night.
+//   3. §7 "Drive it green" is deleted outright, with its CHECKS_FAILED / TIMEOUT parking
+//      reasons — an agent that opens no PR has no PR to poll. The report renumbers §8 -> §7.
+//   4. The report returns `ok | flagged | parked` and carries the findings that SURVIVED the
+//      one fix pass.
+//   5. Exactly one bounded fix pass; a second is explicitly prohibited.
+//
+// Every prose pin below is one CONTIGUOUS, whitespace-normalized phrase, never two
+// independent tokens, per MUST-CHECK
+// pco352-fixpass-prose-gate-mutation-must-cover-rephrase-not-only-delete: a hard conjunct
+// demoted to a parenthetical, or a qualifier weakened, must fail the same test a deletion
+// does. Every pin here was mutation-proved by REPHRASING the target, not only deleting it.
+//
+// Per MUST-CHECK prose-pins-dont-cover-the-bash-fence-they-describe, the base-branch checkout
+// is pinned on the literal invocation lines, never on the paragraph beside them.
+describe("PCO-367 R4: the story-lead takes a base branch, opens no PR, returns ok | flagged", () => {
+  const AGENT = "agents/drawbar-story-lead.md";
+
+  function agentDoc(): string {
+    return readNonEmpty(join(root, AGENT));
+  }
+
+  // Mirrors the file-level `assertOccursOnce` helper (which is hardcoded to
+  // commands/drawbar-ship.md) for the agent doc: a marker occurring more than once makes
+  // `indexOf` silently pick the FIRST occurrence, which can truncate or mis-scope a slice
+  // without any assertion noticing.
+  function rawSection(startMarker: string, endMarker: string | null): string {
+    const txt = agentDoc();
+    for (const marker of endMarker === null ? [startMarker] : [startMarker, endMarker]) {
+      const count = txt.split(marker).length - 1;
+      expect(count, `'${marker}' must occur exactly once in ${AGENT}, found ${count}`).toBe(1);
+    }
+    const start = txt.indexOf(startMarker);
+    expect(start, `'${startMarker}' not found in ${AGENT}`).toBeGreaterThan(-1);
+    if (endMarker === null) return txt.slice(start);
+    const end = txt.indexOf(endMarker, start);
+    expect(end, `'${endMarker}' not found after '${startMarker}' in ${AGENT}`).toBeGreaterThan(start);
+    return txt.slice(start, end);
+  }
+
+  // Whitespace-normalized, per MUST-CHECK doc-grep-assertion-must-normalize-whitespace:
+  // markdown hard-wraps prose, so which words land on which line is an editorial accident.
+  function section(startMarker: string, endMarker: string | null): string {
+    return rawSection(startMarker, endMarker).replace(/\s+/g, " ");
+  }
+
+  const received = () => section("## What you receive", "## 1.");
+  const s2 = () => section("## 2.", "## 3.");
+  const s4 = () => section("## 4.", "## 5.");
+  const s5 = () => section("## 5.", "## 6.");
+  const s6 = () => section("## 6.", "## 7.");
+  const report = () => section("## 7.", null);
+  const reportRaw = () => rawSection("## 7.", null);
+
+  // --- Change 1: the story-lead is a function of the base branch it is handed --------------
+
+  // A default-branch RE-PARENT in ANY of the spellings the file's own style would produce:
+  // bare, quoted, `-b`-prefixed, or via a remote-tracking ref. A bare /checkout\s+main\b/ was
+  // proved vacuous by mutation — `git checkout "main"` (the quoting every other argument in
+  // this file uses) walked straight through it.
+  //
+  // Fix pass (R4 review, Important): the verb alternation is the second half of that lesson.
+  // Pinning the token `checkout` pins a spelling, not the act the headline R4 guarantee is
+  // about ("cut from the supplied base, never the repo default"). Mutation proved it vacuous
+  // a second time: inserting `git -C "$PROJECT_DIR" reset --hard main` immediately above the
+  // `checkout -b "$BRANCH"` line — which re-parents every story onto the repo default, the
+  // exact failure §2 describes — left all 533 tests green. `prCreationPattern()` below already
+  // uses this shape for the two spellings of PR creation; this mirrors it.
+  const DEFAULT_BRANCH_REPARENT =
+    /(?:checkout|switch|reset\s+--hard|rebase|merge)\s+(?:-b\s+)?["']?(?:origin\/)?(?:main|master)\b/i;
+
+  test("the default-branch re-parent pattern matches every verb and spelling that re-parents a branch", () => {
+    for (const spelling of [
+      "checkout main",
+      'checkout "main"',
+      "checkout 'main'",
+      "checkout origin/main",
+      "checkout master",
+      "switch main",
+      'switch "main"',
+      "reset --hard main",
+      'reset --hard "origin/main"',
+      "rebase main",
+      "rebase origin/master",
+      "merge main",
+      "MERGE MASTER",
+    ]) {
+      expect(DEFAULT_BRANCH_REPARENT.test(spelling), `must match: ${spelling}`).toBe(true);
+    }
+    for (const miss of [
+      'checkout "$BASE_BRANCH"',
+      "checkout maintenance-branch",
+      'rebase "$BASE_BRANCH"',
+      'merge "$BASE_BRANCH"',
+      "merge mainline-tool",
+      "reset --soft main",
+    ]) {
+      expect(DEFAULT_BRANCH_REPARENT.test(miss), `must not match: ${miss}`).toBe(false);
+    }
+  });
+
+  // Line-anchored against the RAW section, not the whitespace-normalized one, and requiring the
+  // fail-closed guard on the same line. Proved by mutation: a plain `toContain` was satisfied by
+  // `# git -C "$PROJECT_DIR" checkout "$BASE_BRANCH"` sitting above a real checkout of something
+  // else — the tokens survived inside a comment while the actual invocation was gone.
+  test("§2 checks out the supplied base branch and cuts the story branch from it (literal, uncommented invocation lines, guarded fail-closed)", () => {
+    const raw = rawSection("## 2.", "## 3.");
+    expect(raw).toMatch(/^git -C "\$PROJECT_DIR" checkout "\$BASE_BRANCH" \|\| \{ [^\n]*exit 1; \}$/m);
+    expect(raw).toMatch(/^git -C "\$PROJECT_DIR" checkout -b "\$BRANCH"$/m);
+    // Bash discipline: guards are `positive || { …; exit 1; }`, never `negative && { … }`.
+    expect(raw).not.toMatch(/&&\s*\{/);
+  });
+
+  // The whitelist form of the pin above: it is not enough that the right checkout is present,
+  // nothing else may be checked out. Catches a default-branch checkout ADDED alongside the
+  // correct one, in any spelling, and catches the comment-out mutation from a second angle.
+  // Fix pass (R4 review, Important): enumerates every re-parenting VERB, not just `checkout` —
+  // `reset --hard`, `rebase` and `merge` re-parent the branch just as thoroughly and were all
+  // outside this whitelist.
+  test("§2 re-parents onto nothing but $BASE_BRANCH and the new story branch", () => {
+    const raw = rawSection("## 2.", "## 3.");
+    // Scoped to the EXECUTABLE fence, per MUST-CHECK
+    // prose-pins-dont-cover-the-bash-fence-they-describe: §2's prose deliberately names
+    // `git checkout .` and `git checkout --detach` as the fail-open spellings the shape gate
+    // exists to refuse, and `git checkout -- <file>` as a file revert — illustrations, not
+    // instructions. The whole-section absence check below (DEFAULT_BRANCH_REPARENT) still
+    // covers the prose for any default-branch ref.
+    const fences = [...raw.matchAll(/```bash\n([\s\S]*?)```/g)].map((m) => m[1]);
+    expect(fences.length, "§2 must carry exactly one bash fence").toBe(1);
+    const targets = [
+      ...fences[0]!.matchAll(/(?:checkout|switch|reset\s+--hard|rebase|merge)\s+(?:-b\s+)?(\S+)/g),
+    ].map((m) => m[1]);
+    expect(targets).toEqual(['"$BASE_BRANCH"', '"$BRANCH"']);
+  });
+
+  // Fix pass (R4 review, Important): the pull was the one fail-OPEN step in a fence whose whole
+  // thesis is fail-closed. Mutation proved the hole from both sides — deleting the
+  // `pull --ff-only` line outright left all 533 tests green, and nothing asserted the pull was
+  // guarded at all. $BASE_BRANCH is now a story branch the operator may have rebased, so a
+  // non-fast-forward is the realistic case, and an ignored one cuts $BRANCH from a stale local
+  // base: the silent re-parenting this section exists to prevent.
+  test("§2's base-branch pull is guarded fail-closed, like the checkout above it", () => {
+    const raw = rawSection("## 2.", "## 3.");
+    expect(raw).toMatch(/^git -C "\$PROJECT_DIR" pull --ff-only \|\| \{ [^\n]*exit 1; \}$/m);
+  });
+
+  // Fix pass (R4 review, Critical): `git checkout` accepts options and pathspecs, not only
+  // branch names, so the `|| { …; exit 1; }` guard on the line below fails OPEN on a
+  // $BASE_BRANCH that is not a branch. Verified on git 2.43.0: `git checkout .` reverts the
+  // working tree and exits 0; `git checkout --detach` detaches HEAD and exits 0. Either walks
+  // through the guard, and `checkout -b "$BRANCH"` then cuts the story branch from whatever
+  // HEAD happens to be. The shape gate must therefore run BEFORE anything is checked out —
+  // ordering is asserted, not just presence.
+  test("§2 fails closed on $BASE_BRANCH's ref shape before anything is checked out", () => {
+    const raw = rawSection("## 2.", "## 3.");
+    const guard = raw.indexOf('rev-parse --verify --quiet "refs/heads/$BASE_BRANCH"');
+    expect(guard, "no refs/heads shape gate on $BASE_BRANCH in §2").toBeGreaterThan(-1);
+    expect(
+      raw.slice(guard),
+      "the shape gate is not chained fail-closed",
+    ).toMatch(/^[\s\S]{0,400}?\|\| \{ [^\n]*exit 1; \}/);
+    const checkout = raw.indexOf('git -C "$PROJECT_DIR" checkout "$BASE_BRANCH"');
+    expect(checkout, "the base-branch checkout must come AFTER the shape gate").toBeGreaterThan(guard);
+  });
+
+  test("§2 keeps the imperative that the story branch is cut from nowhere else", () => {
+    expect(s2()).toContain(
+      "**Check out `$BASE_BRANCH` and cut `$BRANCH` from it.** Never from any other starting point.",
+    );
+  });
+
+  // Carried-over rules inside the sections R4 rewrote. They are not R4 changes, but a rewrite
+  // is exactly when carried-over prose gets quietly softened, and mutation confirmed every one
+  // of these could be weakened to "when convenient" with the suite still green.
+  test("§2 keeps the commit-each-increment rule and the delegation constraints on the implementer", () => {
+    const body = s2();
+    expect(body).toContain(
+      "**Commit each verified increment before doing anything destructive.**",
+    );
+    expect(body).toContain(
+      "Require it to show the RED run, and tell it not to commit, push, open a pull request, " +
+        "or run reviews.",
+    );
+  });
+
+  test("§2 does not re-parent onto the repo default branch", () => {
+    expect(s2()).not.toMatch(DEFAULT_BRANCH_REPARENT);
+  });
+
+  test("no default-branch re-parent survives anywhere in the agent file", () => {
+    expect(agentDoc()).not.toMatch(DEFAULT_BRANCH_REPARENT);
+  });
+
+  test("'What you receive' redefines $BASE_BRANCH as the base this story stacks on, not the repo default", () => {
+    expect(received()).toContain(
+      "**`$BASE_BRANCH` is the base this story stacks on — for every story after the first " +
+        "it is the previous story's branch, and it is NOT the repo's default branch.**",
+    );
+  });
+
+  // Fix pass (R4 review, Critical): R4 deleted the only statement of $BASE_BRANCH's provenance
+  // ("already validated by Preflight to be the repo's actual default") in the same diff that
+  // added the first git consumer of it, and replaced it with "for every story after the first
+  // it is the previous story's branch" — naming no producer and no validator. The only
+  // validated producer is `resolveBase`, gated by `isValidRefName`; the only other place the
+  // value lives is the agent-writable run-state `stack[]`, which is exactly the shape
+  // MUST-CHECK r3-must-not-source-project-dir-from-pasted-run-state warns about.
+  test("'What you receive' pins where $BASE_BRANCH must come from — a fresh resolve-base call, never the run-state file", () => {
+    const body = received();
+    expect(body).toContain(
+      "**`$BASE_BRANCH` must reach you from a fresh `stack.ts resolve-base` call made in the " +
+        "dispatching bash block, never lifted out of the run-state file by hand.**",
+    );
+    expect(body).toContain(
+      "`resolve-base` is the only producer that shape-gates the value with `isValidRefName`, " +
+        "and the run state it reads is agent-writable",
+    );
+  });
+
+  test("'What you receive' keeps the cut-from-what-you-are-handed rule and its re-parenting consequence", () => {
+    expect(received()).toContain(
+      "Cut from whatever you are handed and nothing else: substituting the repo default " +
+        "silently re-parents the story, and the pull request your caller opens then carries " +
+        "every earlier story's diff too",
+    );
+  });
+
+  // The frontmatter description is what the dispatcher reads when it picks this agent, and the
+  // opening line is what the agent reads first. Proved necessary by mutation: reverting both to
+  // their R3 wording ("branch from main … open the PR, drive CI green") left every other pin in
+  // this describe green.
+  test("the frontmatter description and the opening line state the R4 contract: supplied base, no PR, ok | flagged", () => {
+    const fm = agentDoc().match(/^---\n([\s\S]*?)\n---\n/);
+    expect(fm, "agent file must open with a YAML frontmatter block").not.toBeNull();
+    const desc = fm![1].replace(/\s+/g, " ");
+    expect(desc).toContain("branch from the supplied base");
+    expect(desc).toContain("Returns a compact structured report carrying an ok | flagged verdict.");
+    expect(desc).toContain("Opens no PR, never merges, never touches Linear.");
+    expect(desc).not.toMatch(/open the PR|drive CI green|branch from main/i);
+
+    expect(agentDoc().replace(/\s+/g, " ")).toContain(
+      "You orchestrate exactly one story, from the base branch you are handed to a pushed " +
+        "branch whose tests are verified, mutation-gated, and reviewed.",
+    );
+  });
+
+  test("the old, now-false 'validated by Preflight to be the repo's actual default' description of $BASE_BRANCH is gone", () => {
+    expect(agentDoc()).not.toContain("already validated by Preflight");
+    expect(agentDoc()).not.toContain("the repo's\nactual default");
+    expect(agentDoc().replace(/\s+/g, " ")).not.toContain("the configured base branch, already validated");
+  });
+
+  // --- Change 2: no PR creation anywhere ---------------------------------------------------
+
+  // Built from parts and matched with flexible whitespace / any casing, mirroring
+  // `ghPrMergePattern` above: a reflow to `gh  pr  create` or a recased `gh PR create` must
+  // not evade this. The `gh api … pulls` alternatives exist because mutation proved a
+  // `gh pr create`-only pattern vacuous: the REST spelling of the same act — POSTing to
+  // `pulls` — reintroduced PR creation with the whole suite still green.
+  function prCreationPattern(): RegExp {
+    return new RegExp(
+      [
+        ["gh", "pr", "create"].join("\\s+"),
+        ["gh", "api"].join("\\s+") + "[^\\n]*\\bpulls\\b",
+        "--method\\s+POST[^\\n]*\\bpulls\\b",
+      ].join("|"),
+      "i",
+    );
+  }
+
+  test("the pr-creation pattern matches reformatted/recased occurrences and the REST spelling", () => {
+    const re = prCreationPattern();
+    for (const hit of [
+      "gh pr create",
+      "gh  pr  create",
+      "gh PR create",
+      "gh\tpr\ncreate",
+      'gh api "repos/$REPO/pulls" -f head="$BRANCH"',
+      "gh api --method POST pulls",
+    ]) {
+      expect(re.test(hit), `must match: ${hit}`).toBe(true);
+    }
+    for (const miss of ["ghprcreate", "gh pr view", "gh api rate_limit"]) {
+      expect(re.test(miss), `must not match: ${miss}`).toBe(false);
+    }
+  });
+
+  test("no pull-request creation — `gh pr create` or the REST equivalent — appears anywhere in the agent file", () => {
+    expect(prCreationPattern().test(agentDoc())).toBe(false);
+  });
+
+  test("§6 is commit + push only, and says in one contiguous phrase that pushing is where the story-lead's work ends", () => {
+    const body = s6();
+    expect(body).toContain('git -C "$PROJECT_DIR" push -u origin "$BRANCH"');
+    expect(body).toContain(
+      "**You open no pull request — pushing the branch is where your work ends.**",
+    );
+  });
+
+  test("§6 names the concrete duplicate-PR failure (identical head+base pair, 422, run parks on story 1)", () => {
+    expect(s6()).toContain(
+      "both steps would submit the identical head+base pair on the run's first story, " +
+        "GitHub would refuse the second with a 422, and the run would park on story 1 every " +
+        "night.",
+    );
+  });
+
+  // Standing regression guard: no CodeRabbit gating was ever supposed to survive R1, and this
+  // rewrite is exactly the kind of edit that could reintroduce a stale reference to it. This
+  // already passes — it is here to keep passing.
+  test("no CodeRabbit reference survives anywhere in the agent file", () => {
+    // Spacing-tolerant: mutation proved `toContain("coderabbit")` blind to "Code Rabbit".
+    expect(agentDoc()).not.toMatch(/code\s*rabbit/i);
+  });
+
+  test("§6 says the caller's §4 is the ONLY step that may open the pull request", () => {
+    expect(s6()).toContain(
+      "opens the stacked pull request against the base *it* resolves, and it is the only " +
+        "step that may.",
+    );
+  });
+
+  // --- Change 3: §7 "Drive it green" is gone ----------------------------------------------
+
+  test("the 'Drive it green' section and its CI-polling fence are gone", () => {
+    const txt = agentDoc();
+    expect(txt).not.toMatch(/drive it green/i);
+    // Any CI-polling invocation, not just the one the deleted section happened to use:
+    // mutation proved that a `gh run watch` section titled "Get the branch to green" walked
+    // through a `gh pr checks`-only pin.
+    expect(txt).not.toMatch(/gh\s+(?:pr\s+checks|run\s+(?:watch|list|view))/i);
+    expect(txt).not.toMatch(/--watch\b/);
+  });
+
+  // Structural companion to the pin above: the section skeleton is fixed, so no section can be
+  // interposed, renumbered, retitled, or dropped without failing here. A deleted CI-polling
+  // step that comes back under any new name or number lands in this list.
+  test("the agent file's section skeleton is exactly the seven R4 sections, in order", () => {
+    const headings = [...agentDoc().matchAll(/^##\s+(.+)$/gm)].map((m) => m[1].trim());
+    expect(headings).toEqual([
+      "What you receive",
+      "1. Recall",
+      "2. Branch and implement",
+      "3. Verification gate",
+      "4. Mutation gate — tests must actually pin behavior",
+      "5. Review, and exactly one fix pass",
+      "6. Commit and push",
+      "7. Report — your entire final message",
+    ]);
+  });
+
+  test("neither CHECKS_FAILED nor TIMEOUT survives as a parking reason", () => {
+    const txt = agentDoc();
+    expect(txt).not.toContain("CHECKS_FAILED");
+    expect(txt).not.toContain("TIMEOUT");
+  });
+
+  test("the report section is renumbered to §7, and no §8 remains", () => {
+    const txt = agentDoc();
+    expect(txt).toContain("## 7. Report — your entire final message");
+    expect(txt).not.toContain("## 8.");
+    // The opening prose must point at the renumbered section, not the deleted §8.
+    expect(txt).toContain("Make it the report in §7, nothing else.");
+  });
+
+  // --- Change 4: the ok | flagged | parked contract ----------------------------------------
+
+  // Every field is pinned, not just the two the story changed. The cautionary tale this whole
+  // describe exists for is a payload silently emptied under a green suite; a schema pin that
+  // names only the fields someone remembered to think about is the same hole. Mutation proved
+  // `base` (an R4 addition), `parked_reason`, `mutation_pairs` and `summary` were all deletable
+  // with zero failures.
+  test("the report schema declares `ok | flagged | parked` and carries its full payload", () => {
+    const body = report();
+    expect(body).toContain('"status": "ok | flagged | parked"');
+    expect(body).toContain('"findings": [{"severity": "Critical | Important"');
+    expect(body).not.toContain("ready_to_merge");
+
+    expect(body).toContain('"story": "<TEAM>-####"');
+    expect(body).toContain('"branch": "<user>/<team>-####-slug"');
+    // `base` is the R4 addition: the report must name the branch actually cut from, so a
+    // re-parented story is visible to the caller rather than inferred.
+    expect(body).toContain('"base": "<the $BASE_BRANCH you cut from>"');
+    expect(body).toContain('"parked_reason": null');
+    expect(body).toContain('"mutation_pairs": [{"mutation": "...", "failing_test": "..."}]');
+    expect(body).toContain('"out_of_scope": [{"title": "..."');
+    expect(body).toContain('"lessons": [{"key": "kebab-key"');
+    expect(body).toContain('"summary": "two or three sentences"');
+  });
+
+  test("`ok` gets its own header naming its defining property — the fix pass closed everything", () => {
+    expect(report()).toContain("**`ok` — the fix pass closed everything, and nothing survives.**");
+  });
+
+  // Fix pass (R4 review, Important): `flagged` is scoped to surviving IMPORTANTS. A surviving
+  // Critical parks instead (§5) — see the Critical-parks pins below.
+  test("`flagged` gets its own header, and its downstream outcome (still pushed, caller still opens the PR, findings travel) is one contiguous phrase", () => {
+    const body = report();
+    expect(body).toContain(
+      "**`flagged` — Important findings survived the one fix pass.**",
+    );
+    expect(body).toContain(
+      "The branch is still pushed and your caller still opens the pull request; the " +
+        "surviving findings travel in `findings` so your caller can decide how to surface them.",
+    );
+  });
+
+  // Fix pass (R4 review, Critical): the sentence this replaces read "…so your caller's §4 can
+  // write them into the pull request body", which instructs the caller to do the one thing its
+  // own pinned rule forbids. commands/drawbar-ship.md §4 restricts `## Unresolved findings` to
+  // "each out-of-scope finding by its filed sub-issue id and title only — never the finding
+  // body, `file:line`, or a quoted source excerpt" (pinned verbatim earlier in this file),
+  // precisely because a public PR body opened before any human review announces an unpatched
+  // detail to every repo watcher. `findings[]` entries cannot even use that safe form: ship
+  // §3 files sub-issues for `out_of_scope` ONLY, so there is no sub-issue id to name them by.
+  // The story-lead therefore states the constraint and leaves the rendering rule to PCO-370.
+  test("§7's flagged paragraph no longer authorizes the caller to republish finding bodies in the public pull request", () => {
+    const body = report();
+    expect(body).not.toContain("can write them into the pull request body");
+    expect(body).toContain(
+      "**`detail` is for your caller's eyes, not for verbatim republication:** it carries " +
+        "`file:line` and the specifics of a defect nobody has patched, the pull request is " +
+        "public, and it is opened before any human has reviewed the story.",
+    );
+  });
+
+  test("`parked` gets its own header and means the story could not be completed at all", () => {
+    const body = report();
+    expect(body).toContain("**`parked` — the story could not be completed at all.**");
+    expect(body).toContain(
+      "The verify gate (§3) or the mutation gate (§4) could not be satisfied, or a Critical " +
+        "finding survived the one fix pass (§5). There is no branch to stack the next story on",
+    );
+  });
+
+  // MUST-CHECK pco352-fixpass-satisfies-the-gate-header-must-not-cover-a-repick-clause: `ok`
+  // and `flagged` have DIFFERENT downstream outcomes, so they must never sit under one shared
+  // "satisfied if any of the following" header. Three independent assertions, because each
+  // catches a different mutation:
+  //   (a) the prohibition itself, as one contiguous phrase;
+  //   (b) STRUCTURAL — each verdict starts its own top-level paragraph, so neither can have
+  //       been demoted to a bullet under a shared lead-in;
+  //   (c) OCCURRENCE-COUNTED — "any of the following" appears exactly once in the whole file,
+  //       and that one occurrence is inside the prohibition. Introducing a real shared header
+  //       makes it two and fails here even if (a) and (b) were somehow still satisfied.
+  test("the report states the three statuses differ in kind and forbids one shared header, as one contiguous phrase", () => {
+    expect(report()).toContain(
+      "The three statuses differ in kind, not in degree, and each gets its own header " +
+        'below. Never collapse them into one shared "satisfied if any of the following" list',
+    );
+  });
+
+  test("`ok` and `flagged` each start their own top-level paragraph — neither is a bullet under a shared lead-in", () => {
+    const raw = reportRaw();
+    expect(raw).toContain("\n\n**`ok` —");
+    expect(raw).toContain("\n\n**`flagged` —");
+    expect(raw).not.toMatch(/^\s*[-*]\s*\*\*`ok`/m);
+    expect(raw).not.toMatch(/^\s*[-*]\s*\*\*`flagged`/m);
+  });
+
+  test("'any of the following' occurs exactly once in the agent file, and only inside the prohibition", () => {
+    const txt = agentDoc().replace(/\s+/g, " ");
+    const occurrences = txt.split("any of the following").length - 1;
+    expect(
+      occurrences,
+      "a second 'any of the following' means a real shared header was introduced",
+    ).toBe(1);
+    expect(txt).toContain('Never collapse them into one shared "satisfied if any of the following" list');
+  });
+
+  // --- Change 5: exactly one fix pass, second round prohibited -----------------------------
+
+  test("§5 pins 'exactly one fix pass, Critical and Important only' as one contiguous phrase", () => {
+    expect(s5()).toContain(
+      "**Exactly one fix pass runs, and it carries Critical and Important findings only.**",
+    );
+  });
+
+  // Fix pass (R4 review, Important): the surviving-finding consequence is now SEVERITY-SPLIT.
+  // The prior §5 read "Loop until both come back clean", which is what kept an unfixed
+  // Critical out of a pushed branch and an open PR; the one-pass cap removed that control, and
+  // its replacement must be fail-CLOSED for the severity that was being gated (MUST-CHECK
+  // repo-anchor-guard-is-what-gates-an-unfixed-vulnerability), not allow-all.
+  test("§5 states the second-fix-pass prohibition as its own sentence, with the severity-split consequence attached", () => {
+    const body = s5();
+    expect(body).toContain("**A second fix pass is prohibited.**");
+    expect(body).toContain(
+      "Findings that survive the first one do not earn another attempt: they travel in the " +
+        "report's `findings` array, where your caller picks them up — a surviving Important " +
+        "sets `status: flagged`, a surviving Critical sets `status: parked`.",
+    );
+    // The paragraph's closing sentence is the one that removes the agent's discretion, and it
+    // was the unpinned end of the paragraph: mutation swapped it for "If a Critical finding
+    // survives, run one more fix pass rather than flagging" — a clean inversion of the rule,
+    // suite still green — because the two assertions above sit earlier in the same paragraph.
+    expect(body).toContain(
+      "Re-dispatching the reviewers for a second round is not a judgment call you get to make.",
+    );
+    // And no later sentence may hand it back: an escape hatch APPENDED to the paragraph leaves
+    // every contiguous-phrase pin above satisfied.
+    expect(body).not.toMatch(/\b(run|dispatch|allow)\b[^.]{0,80}\b(a second|another|one more)\b[^.]{0,40}\b(pass|round)\b(?![^.]{0,40}\bnot\b)/i);
+  });
+
+  // Fix pass (R4 review, Important): the one-pass cap, as shipped, let a Critical the single
+  // pass failed to close reach a pushed branch and an open public PR — and every later story
+  // stacks on that branch (ship.md Hard rules: base is "the previous story's recorded
+  // branch"), so the defect is inherited by the whole chain and reaches the operator as a
+  // merge-ready stack. `parked` is the fail-closed replacement: ship.md's *Parking a story*
+  // halts the run rather than stacking on it.
+  test("§5 parks a surviving Critical instead of flagging it — the one-pass cap never ships an unpatched Critical", () => {
+    const body = s5();
+    expect(body).toContain("**A surviving Critical parks the story — it is never `flagged`.**");
+    expect(body).toContain(
+      "Do not push, and leave your caller no pull request to open: set `status: parked` with " +
+        "`parked_reason` naming the surviving Critical, and carry the finding in `findings`.",
+    );
+    // The reason the bound is safe to keep — pinned so a later edit cannot quietly re-file a
+    // Critical under `flagged` while leaving the header above intact.
+    expect(body).toContain(
+      "An Important that outlives the one fix pass is a note on an open pull request; a " +
+        "Critical is an unpatched defect on a branch every later story would stack on.",
+    );
+  });
+
+  test("§5 no longer instructs an unbounded loop", () => {
+    expect(s5()).not.toContain("Loop until both come back clean");
+    expect(s5()).not.toMatch(/loop until/i);
+  });
+
+  test("§5 requires Minors to be batched or dropped, and named either way", () => {
+    expect(s5()).toContain(
+      "Minors are batched into a single follow-up note or dropped outright, and either way " +
+        "every Minor is named in your report's `summary`",
+    );
+  });
+
+  // --- Anti-regression for this very rewrite ------------------------------------------------
+
+  test("the §4 mutation gate survived the rewrite (heading, both enumeration rules, and the mutation_pairs tie-in)", () => {
+    const body = s4();
+    expect(body).toContain("## 4. Mutation gate — tests must actually pin behavior");
+    expect(body).toContain("**Per `Locked` decision:** mutate the source to violate it. A *named* test must fail.");
+    expect(body).toContain("mutate **each independently**");
+    expect(body).toContain("Record every `mutation → failing test` pair; it goes in your report.");
+    expect(body).toContain("If a mutation produces no failure, that is a missing test. Send it back before review.");
+  });
+
+  test("the §5 dual review survived the rewrite — both reviewers, in parallel, in one message", () => {
+    const body = s5();
+    expect(body).toContain(
+      "Dispatch **`code-reviewer`** and **`security-reviewer`** in parallel, in one message.",
+    );
+    expect(body).toContain(
+      "Give the code reviewer the acceptance criteria; give the security reviewer `$KB`.",
+    );
+    // The fix pass's own quality bar, carried over into the rewritten §5.
+    expect(body).toContain(
+      "require a red→green regression test for any real bug or security finding, then re-run " +
+        "§3 and §4 on the fixes",
+    );
+  });
+
+  test("§7 keeps the no-diffs-no-logs rule that makes the context split work", () => {
+    expect(report()).toContain(
+      "No diffs, no test logs, no review bodies — your caller must not need them.",
+    );
+  });
+
+  test("the §3 verification gate survived the rewrite", () => {
+    const body = section("## 3.", "## 4.");
+    expect(body).toContain("Confirm the RED runs were shown, not claimed.");
+    expect(body).toContain("Re-run the covering tests plus typecheck and lint yourself.");
+  });
+
+  test("the no-merge / no-Linear-tools boundary at the top survived the rewrite", () => {
+    const txt = agentDoc().replace(/\s+/g, " ");
+    expect(txt).toContain(
+      "**You do not open the pull request, you do not merge, and you do not have Linear tools.**",
+    );
+    expect(txt).toContain(
+      "it is the boundary that keeps a story agent from ever setting a completion status.",
+    );
+    // The sentence that assigns each of those responsibilities to the caller. Mutation weakened
+    // it to "usually opens … generally owns the merge" with everything else still green.
+    expect(txt).toContain(
+      "Your caller opens the stacked pull request, owns the merge, every Linear write, the " +
+        "knowledge-base push, and the burn-down state.",
+    );
+    expect(txt).toContain("Your final message IS your return value.");
+  });
+
+  // Producer/consumer agreement, same shape as the "Important 3" test above: commands/
+  // drawbar-ship.md §2 documents what the story-lead hands back, and the agent's §7 is what
+  // actually defines it. R4 changed that shape (gained `base` and `findings`, lost `pr`,
+  // renumbered §8 → §7) and both files were edited — but nothing pinned the caller's copy, so
+  // reverting it to the stale `§8: {status, pr, …}` wording left the suite fully green. The
+  // field list is DERIVED from ship.md and checked against the agent, so the two cannot drift
+  // in either direction.
+  test("commands/drawbar-ship.md documents the story-lead's return shape as its §7, and every field it names exists in that schema", () => {
+    const ship = readNonEmpty(join(root, "commands/drawbar-ship.md")).replace(/\s+/g, " ");
+    const m = ship.match(/It returns the JSON report in its §(\d+): `\{([^}]*)\}`/);
+    expect(m, "ship.md §2 must document the story-lead's return shape").not.toBeNull();
+
+    expect(m![1], "the story-lead's report section is §7 after R4").toBe("7");
+    const fields = m![2].split(",").map((f) => f.trim());
+    expect(fields).toContain("base");
+    expect(fields).toContain("findings");
+    expect(fields).toContain("status");
+    expect(fields).not.toContain("pr");
+
+    const schema = report();
+    for (const field of fields) {
+      expect(schema, `ship.md names '${field}', which must exist in the agent's §7 schema`)
+        .toContain(`"${field}":`);
+    }
+    // And the caller must say why `pr` is absent, so nobody "fixes" the omission later.
+    expect(ship).toContain("It carries no `pr` — it opens none; §4 below is what opens the PR");
+  });
+
+  test("the out_of_scope collection rule survived the rewrite into §5", () => {
+    expect(s5()).toContain("Collect them for `out_of_scope` in your report");
+    expect(s5()).toContain("Your caller files them in Linear.");
   });
 });
