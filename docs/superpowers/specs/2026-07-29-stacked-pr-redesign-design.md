@@ -127,10 +127,16 @@ in-flight story. A resumed run must confirm the recorded predecessor branch stil
 still points where the state file says, and refuse rather than guess. `assertChainIntact`
 exists for this.
 
-**Out-of-order merges by the operator** are explicitly out of scope. If the operator merges a
-middle PR in the morning, the remaining branches need rebasing — that is a human action, and
-the tool does not attempt to detect or repair it mid-run. A later story may add detection; it
-is not part of this design.
+**Merging is entirely the operator's responsibility, and the operator merges in order.** This
+is a contract, not a limitation to be engineered around later. `drawbar-ship` never merges,
+never verifies a merge, and never inspects whether one happened. The stack is built
+bottom-up and is merged bottom-up; keeping it mergeable is the operator's job.
+
+No detection or repair of out-of-order merges is contemplated — not in this design and not as
+a follow-up. Building that back in would re-introduce exactly the machinery this redesign
+deletes: to know whether a merge was clean or in order, the tool would need the merge-state
+gating that made the old design expensive and unwanted. If a stack ever does get merged out of
+order, the recovery is a human rebase, and the tool has no opinion about it.
 
 ## Testing
 
