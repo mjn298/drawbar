@@ -33,7 +33,7 @@
 // endpoint-injection-not-just-command-injection) — reused, not reimplemented, from their one
 // canonical site each.
 
-import { parseShipConfig, isCleanAbsolutePath, type ResolvedConfig } from "./ship-config";
+import { parseShipConfig, isCleanAbsolutePath, isNonEmptyTrimmed, type ResolvedConfig } from "./ship-config";
 import { isValidRepo } from "./coderabbit";
 
 export interface InFlight {
@@ -112,14 +112,15 @@ export type ParseResult = { ok: true; state: RunState } | { ok: false; reason: P
 // prose; `in_flight.story` and every entry of `snapshot[]` / `stories_done[]` /
 // `subissues_filed[]` are fed back into re-dispatch briefs and Linear mutations — a newline in
 // any of them is a path-shape and/or prompt-injection vector (MUST-CHECK
-// endpoint-injection-not-just-command-injection). Rejected here, at the ONE implementation
-// site every one of those fields is built on, rather than re-adding the same regex at each
-// call site.
-const CONTROL_CHAR_SHAPE = /[\x00-\x1f\x7f]/;
-
-function isNonEmptyString(v: unknown): v is string {
-  return typeof v === "string" && v.trim().length > 0 && !CONTROL_CHAR_SHAPE.test(v);
-}
+// endpoint-injection-not-just-command-injection).
+//
+// S6/PCO-351 fix pass (single-implementation-site): this module used to carry its own
+// byte-identical copy of this exact regex/predicate (as did merge-guard.ts) — both now import
+// `isNonEmptyTrimmed` from ship-config.ts, the one canonical implementation site, rather than
+// re-adding the same regex at each call site. Aliased on import: every call site in this file
+// already reads `isNonEmptyString`, and renaming ~15 call sites for a pure re-export would be
+// churn with no behavioral change.
+const isNonEmptyString = isNonEmptyTrimmed;
 
 function isStringArray(v: unknown): v is string[] {
   return Array.isArray(v) && v.every((s) => isNonEmptyString(s));
@@ -150,9 +151,16 @@ function fail(reason: ParseReason, detail: string): { ok: false; reason: ParseRe
 // (`/^[0-9a-f]{7,40}$/`) — NOT pinned to exactly 40 characters. The two observed fixtures
 // disagreed on abbreviated-sha length (9 vs 8 chars), so pinning a specific length would
 // refuse one legitimate shape or the other for no structural reason; a hex-shape check still
-// closes the endpoint-injection gap (`merge_sha` used to admit `"../../HEAD"` outright) while
-// staying compatible with S6/PCO-351 tightening this to the full 40-char merge-commit oid
-// (Locked 10 — that tightening is explicitly out of S5's scope).
+// closes the endpoint-injection gap (`merge_sha` used to admit `"../../HEAD"` outright).
+//
+// S6/PCO-351 resolution (Locked 10): this PARSE-time shape stays permissive on purpose, so
+// `parseRunState` can still read the two legacy run-state files (abbreviated 8/9-char shas)
+// without refusing them outright. The strict, record-TIME assertion — exactly 40 hex
+// characters, and the full merge-commit oid rather than the PR head sha — is owned by
+// `scripts/lib/merge-guard.ts`'s `recordMergeSha`, which is the one call site that ever
+// WRITES a fresh `merge_sha`. A future pass MAY choose to tighten this parser too once every
+// legacy file has been migrated; until then, tightening it here would make `parseRunState`
+// refuse state files it must still be able to read.
 //
 // `pr` (fix pass, IMPORTANT 6): must be a positive integer — `0`, negative values, and
 // non-integers (`1.5`) were all previously admitted.
@@ -182,7 +190,11 @@ function isValidMergedEntry(v: unknown): v is MergedEntry {
 // canonical implementation site rather than a second hand-copy:
 //   - `repo` → `isValidRepo` (scripts/lib/coderabbit.ts)
 //   - `envDir` / `projectDir` → `isCleanAbsolutePath` (scripts/lib/ship-config.ts)
-function isValidResolvedConfig(v: unknown): v is ResolvedConfig {
+//
+// Exported (S6/PCO-351): `scripts/lib/merge-guard.ts` re-asserts `resolved_config` at merge
+// time (Locked 18) and reuses this exact predicate rather than a second hand-copy of the
+// same structural check — see that module's own comment for how it layers on top.
+export function isValidResolvedConfig(v: unknown): v is ResolvedConfig {
   if (typeof v !== "object" || v === null || Array.isArray(v)) return false;
   const obj = v as Record<string, unknown>;
   const { observed, ...shipConfigCandidate } = obj;

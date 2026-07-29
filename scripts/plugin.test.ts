@@ -115,6 +115,11 @@ describe("ported files carry no private-org identifiers (leak regression)", () =
     // uppercase-team-prefix shape.
     "scripts/lib/run-state.ts",
     "scripts/lib/run-state.test.ts",
+    // PCO-351 (S6): the merge-guard module and its tests — every fixture id in the test file
+    // is deliberately kept to a single digit (e.g. "ABC-1"), which cannot match the issue-id
+    // rule's 2+-digit shape, matching ship-config.test.ts/run-state.test.ts's discipline.
+    "scripts/lib/merge-guard.ts",
+    "scripts/lib/merge-guard.test.ts",
   ];
   const ALL_FILES = [...DOC_FILES, ...SELF_FILES, ...NEW_PUBLIC_FILES];
 
@@ -202,6 +207,20 @@ describe("ported files carry no private-org identifiers (leak regression)", () =
           // the config path (preceded by a backtick, so the leading "." isn't trimmed off the
           // way it is at line 47), and a prose word/word pair. Neither is an org/repo slug.
           ".drawbar/ship.config.json",
+          // PCO-351 (S6) additions — this repo's own issue-prefix/id reference, and a prose
+          // word/word pair. Neither is an org/repo slug. (A fix pass removed a third entry,
+          // "5/7." — the section cross-reference it allowlisted was reworded to "step 5" to
+          // avoid the slash entirely, rather than widen this allowlist for a bare `<digit>/<digit>.`
+          // shape that could otherwise mask an unrelated leak later.)
+          "S6/PCO-351",
+          "unparseable/empty",
+          // PCO-351 fix pass additions — four more prose word/word pairs introduced by the
+          // fix-pass edits below (SNAPSHOT's non-empty assert, the merge_sha stdout echo, and
+          // the post-merge "Parking a story" carve-out). None is an org/repo slug.
+          "empty/unset",
+          "RESOLVED/SNAPSHOT",
+          "gone/closed",
+          "park/notify",
         ]);
         for (const line of txt.split("\n")) {
           for (const m of line.match(slugCandidate) ?? []) {
@@ -516,10 +535,10 @@ describe("config-driven preflight guard fails closed (PCO-348)", () => {
 describe("§4 derives REPO and BASE_BRANCH from RESOLVED, not ambient env (Important, fix pass 4)", () => {
   function extractMergeDeriveGuard(): string {
     const txt = readNonEmpty(join(root, "commands/drawbar-ship.md"));
-    const start = txt.indexOf("# --- derive REPO and BASE_BRANCH from RESOLVED");
-    expect(start, "merge derive-REPO/BASE_BRANCH marker not found").toBeGreaterThan(-1);
-    const end = txt.indexOf("# --- end derive REPO and BASE_BRANCH from RESOLVED", start);
-    expect(end, "merge derive-REPO/BASE_BRANCH end marker not found").toBeGreaterThan(start);
+    const start = txt.indexOf("# --- derive REPO, BASE_BRANCH, and PROJECT_DIR from RESOLVED");
+    expect(start, "merge derive-REPO/BASE_BRANCH/PROJECT_DIR marker not found").toBeGreaterThan(-1);
+    const end = txt.indexOf("# --- end derive REPO, BASE_BRANCH, and PROJECT_DIR from RESOLVED", start);
+    expect(end, "merge derive-REPO/BASE_BRANCH/PROJECT_DIR end marker not found").toBeGreaterThan(start);
     return txt.slice(start, end);
   }
 
@@ -553,24 +572,42 @@ describe("§4 derives REPO and BASE_BRANCH from RESOLVED, not ambient env (Impor
     expect(output).toContain("BASE_BRANCH is empty or null");
   });
 
+  // Critical A (fix pass 2): PROJECT_DIR joined REPO/BASE_BRANCH in this same derive-and-assert
+  // loop — a resolvedConfig missing it (or carrying the literal string "null") must refuse
+  // here too, mirroring the coverage REPO/BASE_BRANCH already had.
+  test("Critical A: refuses when RESOLVED carries no projectDir", async () => {
+    const { code, output } = await runDerive({ RESOLVED: '{"repo":"acme/widgets","baseBranch":"main"}' });
+    expect(code).not.toBe(0);
+    expect(output).toContain("PROJECT_DIR is empty or null");
+  });
+
+  test("Critical A: refuses when RESOLVED's projectDir is the literal string \"null\"", async () => {
+    const { code, output } = await runDerive({ RESOLVED: '{"repo":"acme/widgets","baseBranch":"main","projectDir":null}' });
+    expect(code).not.toBe(0);
+    expect(output).toContain("PROJECT_DIR is empty or null");
+  });
+
   // The actual gap this closes: a leaked/ambient $REPO in the operator's own shell must NOT
   // silently win over the validated value carried in $RESOLVED — every §4 harness before this
   // fix pre-seeded $REPO directly as an env var (see the STORY-guard describe below), which
   // cannot tell a derived value apart from an ambient one. This test seeds NEITHER: $REPO
   // comes ONLY from $RESOLVED, proving the derivation is what actually populates it.
-  test("derives REPO and BASE_BRANCH from RESOLVED alone, with no ambient REPO/BASE_BRANCH pre-seeded (Important, fix pass 4)", async () => {
-    const echoScript = `${extractMergeDeriveGuard()}\necho "GOT $REPO $BASE_BRANCH"`;
+  test("derives REPO, BASE_BRANCH, and PROJECT_DIR from RESOLVED alone, with no ambient pre-seeded values (Important, fix pass 4)", async () => {
+    const echoScript = `${extractMergeDeriveGuard()}\necho "GOT $REPO $BASE_BRANCH $PROJECT_DIR"`;
     const proc = Bun.spawn(["bash", "-c", echoScript], {
-      // No REPO or BASE_BRANCH key at all in env — the exact unseeded pre-state the gap
-      // allowed. $REPO must come ONLY from $RESOLVED below.
-      env: { PATH: process.env.PATH ?? "", RESOLVED: '{"repo":"acme/widgets","baseBranch":"trunk"}' },
+      // No REPO/BASE_BRANCH/PROJECT_DIR key at all in env — the exact unseeded pre-state the
+      // gap allowed. Every one of them must come ONLY from $RESOLVED below.
+      env: {
+        PATH: process.env.PATH ?? "",
+        RESOLVED: '{"repo":"acme/widgets","baseBranch":"trunk","projectDir":"/tmp/fixture-project-dir"}',
+      },
       stdout: "pipe",
       stderr: "pipe",
     });
     const out = await new Response(proc.stdout).text();
     const code = await proc.exited;
     expect(code).toBe(0);
-    expect(out).toContain("GOT acme/widgets trunk");
+    expect(out).toContain("GOT acme/widgets trunk /tmp/fixture-project-dir");
   });
 
   // Poisoned-ambient-env regression: an operator's shell exports $REPO (a common name) with a
@@ -582,7 +619,7 @@ describe("§4 derives REPO and BASE_BRANCH from RESOLVED, not ambient env (Impor
       env: {
         PATH: process.env.PATH ?? "",
         REPO: "attacker/evil", // ambient, poisoned
-        RESOLVED: '{"repo":"acme/widgets","baseBranch":"main"}',
+        RESOLVED: '{"repo":"acme/widgets","baseBranch":"main","projectDir":"/tmp/fixture-project-dir"}',
       },
       stdout: "pipe",
       stderr: "pipe",
@@ -595,18 +632,32 @@ describe("§4 derives REPO and BASE_BRANCH from RESOLVED, not ambient env (Impor
   });
 });
 
-// PCO-347 fix pass, Critical 1: `STORY=<TEAM>-####` in the merge block was UNQUOTED — bash
-// parses `<` and `>` as redirection there, silently assigning STORY="" and turning the
-// downstream branch-identity guard's `case *"$STORY"*` pattern into `**`, which matches any
-// branch. Quoting the assignment AND asserting STORY is non-empty are independent fixes;
-// this harness proves the second one actually gates an unrelated branch when STORY is empty
-// (a hand-run repro of the parsing bug alone is not a regression test).
-describe("merge guard fails closed when STORY is unset", () => {
-  // Extract from the lc() self-test through just before the real `gh pr merge` call, so the
-  // guard logic (lc self-test, STORY non-empty assertion, branch/base/state checks) runs for
-  // real while the destructive final command never executes. Mirrors extractGuard() above:
-  // pulled from the actual shipped doc, not hand-reimplemented.
-  function extractMergeGuard(): string {
+// S6/PCO-351: §4 no longer implements identity/base/state/checks/config-diff itself — the
+// ENTIRE verdict is delegated to a single `bun run .../merge-guard.ts verdict` invocation
+// (see scripts/lib/merge-guard.ts and its own test suite for the discriminating cases —
+// per-check buckets, branch/base/state variants, degraded `gh`, the F19 CodeRabbit-only
+// vacuity case, the ship.config.json diff refusal, the resolved_config re-assert, and the
+// merge_sha capture/ancestry assertions). What belongs HERE, in the real shipped fence, is
+// narrower and different in kind: proof that §4 actually WIRES UP the delegation correctly —
+// invokes the module, fails closed on every one of {non-ok verdict, unparseable/empty module
+// stdout, non-zero module exit}, never reaches `gh pr merge` on any refusal, still refuses
+// when STORY/BASE_BRANCH/RESOLVED are unset/empty before anything destructive, and contains
+// no `|| true` and no second hand-copied implementation of the checks that moved out.
+//
+// Real-fence execution throughout (extractMergeFence() below), same discipline as the
+// describes this replaces: a stub `scripts/lib/merge-guard.ts` under a temp
+// $CLAUDE_PLUGIN_ROOT stands in for the module (its OWN behavior is proven correct in
+// scripts/lib/merge-guard.test.ts), and a marker file it writes on invocation is what proves
+// "never reaches the module" for the pre-flight-style refusals, per MUST-CHECK
+// vacuous-assertion-needs-preseed-state.
+describe("§4 delegates the entire merge verdict to merge-guard.ts (S6/PCO-351)", () => {
+  // From the derive-REPO/BASE_BRANCH marker (shared with the "§4 derives REPO and
+  // BASE_BRANCH..." describe above) through just before the real `gh pr merge -R` call, so
+  // the guard logic runs for real while the destructive final command never executes. Starts
+  // AFTER the STORY/PR/RESOLVED/SNAPSHOT placeholder assignments — same reason the old
+  // extractMergeGuard() did — so a test's own env vars for those actually take effect rather
+  // than being clobbered by the literal placeholder text.
+  function extractMergeFence(): string {
     const txt = readNonEmpty(join(root, "commands/drawbar-ship.md"));
     const sectionStart = txt.indexOf("## 4. Merge");
     expect(sectionStart, "'## 4. Merge' heading not found").toBeGreaterThan(-1);
@@ -615,41 +666,83 @@ describe("merge guard fails closed when STORY is unset", () => {
     expect(fenceStart).toBeGreaterThan(-1);
     expect(fenceEnd).toBeGreaterThan(fenceStart);
     const block = txt.slice(fenceStart + 7, fenceEnd);
-    const guardStart = block.indexOf("lc() {");
-    expect(guardStart, "lc() self-test not found in the merge block").toBeGreaterThan(-1);
+    const guardStart = block.indexOf("# MUST-CHECK bash-fence-cross-invocation-state-needs-unseeded-test");
+    expect(guardStart, "cross-invocation derive-guard marker not found in the merge block").toBeGreaterThan(-1);
     const mergeIdx = block.indexOf("gh pr merge -R");
     expect(mergeIdx, "'gh pr merge -R' not found after the guard").toBeGreaterThan(guardStart);
     return block.slice(guardStart, mergeIdx);
   }
 
-  // Fake `gh` on PATH so the guard runs without a real PR or network access. Only `pr view`
-  // is needed here: the extracted fragment starts after the `gh pr checks` line, and the
-  // STORY-empty case never reaches `gh pr view` at all (the assertion fires first).
-  function makeFakeGh(env: { branch?: string; base?: string; state?: string }): string {
-    const dir = mkdtempSync(join(tmpdir(), "drawbar-gh-stub-"));
-    const gh = join(dir, "gh");
-    writeFileSync(
-      gh,
-      `#!/usr/bin/env bash\n` +
-        `if [ "$1" = "pr" ] && [ "$2" = "view" ]; then\n` +
-        `  echo "${env.branch ?? "user/other-branch"} ${env.base ?? "main"} ${env.state ?? "OPEN"}"\n` +
-        `fi\n`
-    );
-    chmodSync(gh, 0o755);
-    return dir;
+  function mergeFenceText(): string {
+    const txt = readNonEmpty(join(root, "commands/drawbar-ship.md"));
+    const sectionStart = txt.indexOf("## 4. Merge");
+    const fenceStart = txt.indexOf("```bash", sectionStart);
+    const fenceEnd = txt.indexOf("```", fenceStart + 7);
+    return txt.slice(fenceStart + 7, fenceEnd);
   }
 
-  async function runMergeGuard(
-    env: Record<string, string>,
-    ghEnv: { branch?: string; base?: string; state?: string } = {}
-  ): Promise<{ code: number; output: string }> {
-    const script = extractMergeGuard();
-    const binDir = makeFakeGh(ghEnv);
-    const proc = Bun.spawn(["bash", "-c", script], {
-      // Combined stdout+stderr: `echo` writes to stdout by default, and a test reading only
-      // stderr sees an empty string on a correctly-failing guard. See MUST-CHECK
-      // bash-echo-goes-to-stdout-not-stderr.
-      env: { PATH: `${binDir}:${process.env.PATH ?? ""}`, ...env },
+  // A stub `scripts/lib/merge-guard.ts` under a fresh temp plugin root — real `bun` executes
+  // it for real (never a fake `bun` on PATH), so this proves the fence's own fail-closed
+  // wiring around whatever the module answers, independent of the module's real logic. Writes
+  // a marker file on invocation so a test can prove (or disprove) the module was ever reached
+  // at all, distinct from merely asserting an exit code.
+  function makeStubPluginRoot(opts: { stdout?: string; exitCode?: number }): { root: string; markerPath: string } {
+    const dir = mkdtempSync(join(tmpdir(), "drawbar-plugin-root-"));
+    const libDir = join(dir, "scripts", "lib");
+    mkdirSync(libDir, { recursive: true });
+    const markerPath = join(dir, "invoked.marker");
+    const lines = [
+      `import { writeFileSync } from "node:fs";`,
+      `writeFileSync(${JSON.stringify(markerPath)}, "invoked");`,
+    ];
+    if (opts.stdout !== undefined) lines.push(`process.stdout.write(${JSON.stringify(opts.stdout)});`);
+    lines.push(`process.exit(${opts.exitCode ?? 0});`);
+    writeFileSync(join(libDir, "merge-guard.ts"), lines.join("\n") + "\n");
+    return { root: dir, markerPath };
+  }
+
+  // Critical A / Important E (fix pass 2): §4 now derives PROJECT_DIR and independently
+  // re-derives REPO from `git -C "$PROJECT_DIR" remote get-url origin` — a REAL git repo with a
+  // matching `origin` remote, not a bare directory, so the fixture below satisfies both new
+  // checks the same way a genuine `resolvedConfig.projectDir` checkout would.
+  const FIXTURE_PROJECT_DIR = (() => {
+    const dir = mkdtempSync(join(tmpdir(), "drawbar-fence-project-dir-"));
+    Bun.spawnSync(["git", "init", "-q"], { cwd: dir });
+    Bun.spawnSync(["git", "remote", "add", "origin", "https://github.com/org/repo.git"], { cwd: dir });
+    return dir;
+  })();
+
+  // Important B (fix pass 2): §4 asserts `[ -f "$CONFIG" ]` — a real file the fence's
+  // `DRAWBAR_SHIP_CONFIG` can point at, distinct from the repo's own
+  // `.drawbar/ship.config.json` (which does not exist in this checkout at all).
+  //
+  // Critical 1 (round-3 security review): the file is no longer empty. §4 now treats the
+  // operator-authored config — NOT the run-state — as the trust root for `projectDir`, because
+  // that path is handed to `git -C`, and running git inside a repo whose `.git` configuration an
+  // attacker controls is arbitrary code execution. So the config must carry a `projectDir` and a
+  // `repo` that the re-declared `$RESOLVED` agrees with, exactly as a real deployment would.
+  const FIXTURE_CONFIG_PATH = (() => {
+    const dir = mkdtempSync(join(tmpdir(), "drawbar-fence-config-"));
+    const p = join(dir, "ship.config.json");
+    writeFileSync(p, JSON.stringify({ projectDir: FIXTURE_PROJECT_DIR, repo: "org/repo" }));
+    return p;
+  })();
+
+  const VALID_RESOLVED_JSON = JSON.stringify({
+    repo: "org/repo",
+    baseBranch: "main",
+    requiredChecks: ["build"],
+    projectDir: FIXTURE_PROJECT_DIR,
+  });
+  const VALID_SNAPSHOT_JSON = '["ABC-1"]';
+
+  async function runFence(script: string, env: Record<string, string>): Promise<{ code: number; output: string }> {
+    // Append a sentinel AFTER the extracted fragment (which itself stops just before the real
+    // `gh pr merge -R` call) — its presence/absence in the output is what proves whether
+    // control reached "the point where `gh pr merge` would have run" without ever running it.
+    const full = `${script}\necho MERGE_REACHED`;
+    const proc = Bun.spawn(["bash", "-c", full], {
+      env: { PATH: process.env.PATH ?? "", ...env },
       stdout: "pipe",
       stderr: "pipe",
     });
@@ -659,65 +752,556 @@ describe("merge guard fails closed when STORY is unset", () => {
     return { code, output: out + err };
   }
 
-  test("refuses an unrelated branch when STORY is empty", async () => {
-    const { code, output } = await runMergeGuard(
-      { STORY: "", PR: "1", REPO: "org/repo", BASE_BRANCH: "main" },
-      { branch: "attacker/unrelated-branch" }
-    );
+  test("the shipped fence actually invokes merge-guard.ts for both the verdict and the merge_sha capture", () => {
+    const block = mergeFenceText();
+    expect(block).toContain('bun run "${CLAUDE_PLUGIN_ROOT}/scripts/lib/merge-guard.ts" verdict');
+    expect(block).toContain('bun run "${CLAUDE_PLUGIN_ROOT}/scripts/lib/merge-guard.ts" record-merge-sha');
+  });
+
+  test("fails closed on a non-ok verdict (module exits 0, JSON has ok:false)", async () => {
+    const { root, markerPath } = makeStubPluginRoot({ stdout: JSON.stringify({ ok: false, reason: "stub_refusal" }), exitCode: 0 });
+    const { code, output } = await runFence(extractMergeFence(), {
+      STORY: "ABC-1",
+      PR: "1",
+      RESOLVED: VALID_RESOLVED_JSON,
+      SNAPSHOT: VALID_SNAPSHOT_JSON,
+      CLAUDE_PLUGIN_ROOT: root,
+      DRAWBAR_SHIP_CONFIG: FIXTURE_CONFIG_PATH,
+    });
+    expect(code).not.toBe(0);
+    expect(output).toContain("verdict was not ok");
+    expect(existsSync(markerPath)).toBe(true); // the module WAS reached — this is its own answer, not a pre-flight refusal
+    expect(output).not.toContain("MERGE_REACHED");
+  });
+
+  test("fails closed on unparseable module stdout", async () => {
+    const { root } = makeStubPluginRoot({ stdout: "not valid json at all", exitCode: 0 });
+    const { code, output } = await runFence(extractMergeFence(), {
+      STORY: "ABC-1",
+      PR: "1",
+      RESOLVED: VALID_RESOLVED_JSON,
+      SNAPSHOT: VALID_SNAPSHOT_JSON,
+      CLAUDE_PLUGIN_ROOT: root,
+      DRAWBAR_SHIP_CONFIG: FIXTURE_CONFIG_PATH,
+    });
+    expect(code).not.toBe(0);
+    expect(output).toContain("verdict was not ok");
+    expect(output).not.toContain("MERGE_REACHED");
+  });
+
+  test("fails closed on empty module stdout", async () => {
+    const { root } = makeStubPluginRoot({ exitCode: 0 }); // no stdout at all
+    const { code, output } = await runFence(extractMergeFence(), {
+      STORY: "ABC-1",
+      PR: "1",
+      RESOLVED: VALID_RESOLVED_JSON,
+      SNAPSHOT: VALID_SNAPSHOT_JSON,
+      CLAUDE_PLUGIN_ROOT: root,
+      DRAWBAR_SHIP_CONFIG: FIXTURE_CONFIG_PATH,
+    });
+    expect(code).not.toBe(0);
+    expect(output).toContain("verdict was not ok");
+    expect(output).not.toContain("MERGE_REACHED");
+  });
+
+  test("fails closed on a non-zero module exit, even with syntactically valid ok:true JSON on stdout", async () => {
+    const { root } = makeStubPluginRoot({ stdout: JSON.stringify({ ok: true }), exitCode: 3 });
+    const { code, output } = await runFence(extractMergeFence(), {
+      STORY: "ABC-1",
+      PR: "1",
+      RESOLVED: VALID_RESOLVED_JSON,
+      SNAPSHOT: VALID_SNAPSHOT_JSON,
+      CLAUDE_PLUGIN_ROOT: root,
+      DRAWBAR_SHIP_CONFIG: FIXTURE_CONFIG_PATH,
+    });
+    expect(code).not.toBe(0);
+    expect(output).toContain("merge-guard.ts verdict exited 3");
+    expect(output).not.toContain("MERGE_REACHED");
+  });
+
+  test("an ok:true verdict with a zero exit lets the fence proceed to the merge step", async () => {
+    const { root } = makeStubPluginRoot({ stdout: JSON.stringify({ ok: true }), exitCode: 0 });
+    const { code, output } = await runFence(extractMergeFence(), {
+      STORY: "ABC-1",
+      PR: "1",
+      RESOLVED: VALID_RESOLVED_JSON,
+      SNAPSHOT: VALID_SNAPSHOT_JSON,
+      CLAUDE_PLUGIN_ROOT: root,
+      DRAWBAR_SHIP_CONFIG: FIXTURE_CONFIG_PATH,
+    });
+    expect(code).toBe(0);
+    expect(output).toContain("MERGE_REACHED");
+  });
+
+  test("still refuses when STORY is unset, and never reaches merge-guard.ts at all", async () => {
+    const { root, markerPath } = makeStubPluginRoot({ stdout: JSON.stringify({ ok: true }), exitCode: 0 }); // would say yes if ever asked
+    const { code, output } = await runFence(extractMergeFence(), {
+      STORY: "",
+      PR: "1",
+      RESOLVED: VALID_RESOLVED_JSON,
+      SNAPSHOT: VALID_SNAPSHOT_JSON,
+      CLAUDE_PLUGIN_ROOT: root,
+    });
     expect(code).not.toBe(0);
     expect(output).toContain("STORY unset");
+    expect(existsSync(markerPath)).toBe(false); // never reached the module
+    expect(output).not.toContain("MERGE_REACHED");
   });
 
-  test("passes when STORY matches the PR's branch and BASE_BRANCH matches the PR's base", async () => {
-    const { code } = await runMergeGuard(
-      { STORY: "ABC-1", PR: "1", REPO: "org/repo", BASE_BRANCH: "main" },
-      { branch: "someone/abc-1-slug" }
-    );
-    expect(code).toBe(0);
-  });
-
-  // PCO-348 (S3): `[ "$base" = "main" ]` became `[ "$base" = "$BASE_BRANCH" ]`, driven by the
-  // resolved config — exactly the vacuity trap the STORY assertion above already guards
-  // against. An unset $BASE_BRANCH must refuse outright, never silently match any base.
-  test("refuses any base when BASE_BRANCH is empty (would otherwise vacuously match)", async () => {
-    const { code, output } = await runMergeGuard(
-      { STORY: "ABC-1", PR: "1", REPO: "org/repo", BASE_BRANCH: "" },
-      { branch: "someone/abc-1-slug", base: "main" }
-    );
+  // Minor (fix pass 2): §4 asserted STORY/SNAPSHOT/CLAUDE_PLUGIN_ROOT non-empty but never PR —
+  // an unset $PR would otherwise reach `bun run .../merge-guard.ts verdict --pr ""`, refusing
+  // there instead of failing closed before spawning `bun` at all.
+  test("Minor: still refuses when PR is unset, and never reaches merge-guard.ts at all", async () => {
+    const { root, markerPath } = makeStubPluginRoot({ stdout: JSON.stringify({ ok: true }), exitCode: 0 }); // would say yes if ever asked
+    const { code, output } = await runFence(extractMergeFence(), {
+      STORY: "ABC-1",
+      PR: "",
+      RESOLVED: VALID_RESOLVED_JSON,
+      SNAPSHOT: VALID_SNAPSHOT_JSON,
+      CLAUDE_PLUGIN_ROOT: root,
+    });
     expect(code).not.toBe(0);
-    expect(output).toContain("BASE_BRANCH unset");
+    expect(output).toContain("PR unset");
+    expect(existsSync(markerPath)).toBe(false); // never reached the module
+    expect(output).not.toContain("MERGE_REACHED");
   });
 
-  test("refuses when BASE_BRANCH is set but the PR's actual base differs", async () => {
-    const { code, output } = await runMergeGuard(
-      { STORY: "ABC-1", PR: "1", REPO: "org/repo", BASE_BRANCH: "main" },
-      { branch: "someone/abc-1-slug", base: "develop" }
-    );
+  test("still refuses when RESOLVED carries no baseBranch, and never reaches merge-guard.ts at all", async () => {
+    const { root, markerPath } = makeStubPluginRoot({ stdout: JSON.stringify({ ok: true }), exitCode: 0 });
+    const { code, output } = await runFence(extractMergeFence(), {
+      STORY: "ABC-1",
+      PR: "1",
+      RESOLVED: '{"repo":"org/repo"}',
+      SNAPSHOT: VALID_SNAPSHOT_JSON,
+      CLAUDE_PLUGIN_ROOT: root,
+    });
     expect(code).not.toBe(0);
-    expect(output).toContain("REFUSING: base is 'develop'");
+    expect(output).toContain("BASE_BRANCH is empty or null");
+    expect(existsSync(markerPath)).toBe(false);
+    expect(output).not.toContain("MERGE_REACHED");
   });
 
-  // Fix pass (mutation-gate hole): every fixture above pins BASE_BRANCH to "main", so a
-  // hardcoded `[ "$base" = "main" ]` behaves identically to the parameterized
-  // `[ "$base" = "$BASE_BRANCH" ]` in every one of them — none of them can tell the two
-  // apart. These two use a non-"main" configured base to discriminate: under the
-  // hardcoded-`main` mutation, the first case (which must pass) wrongly refuses, and the
-  // second case (which must refuse) wrongly passes.
-  test("passes when BASE_BRANCH is a non-main value and matches the PR's actual base", async () => {
-    const { code } = await runMergeGuard(
-      { STORY: "ABC-1", PR: "1", REPO: "org/repo", BASE_BRANCH: "trunk" },
-      { branch: "someone/abc-1-slug", base: "trunk" }
-    );
-    expect(code).toBe(0);
-  });
-
-  test("refuses when BASE_BRANCH is a non-main value but the PR's actual base is main", async () => {
-    const { code, output } = await runMergeGuard(
-      { STORY: "ABC-1", PR: "1", REPO: "org/repo", BASE_BRANCH: "trunk" },
-      { branch: "someone/abc-1-slug", base: "main" }
-    );
+  test("still refuses when RESOLVED is entirely unset, and never reaches merge-guard.ts at all", async () => {
+    const { root, markerPath } = makeStubPluginRoot({ stdout: JSON.stringify({ ok: true }), exitCode: 0 });
+    const script = extractMergeFence();
+    const full = `STORY=ABC-1\nPR=1\nSNAPSHOT='${VALID_SNAPSHOT_JSON}'\nCLAUDE_PLUGIN_ROOT='${root}'\n${script}\necho MERGE_REACHED`;
+    // RESOLVED deliberately absent from env entirely — Bun.spawn's env fully replaces the
+    // child's environment, so omitting the key reliably leaves it unset (not merely empty).
+    const proc = Bun.spawn(["bash", "-c", full], { env: { PATH: process.env.PATH ?? "" }, stdout: "pipe", stderr: "pipe" });
+    const out = await new Response(proc.stdout).text();
+    const err = await new Response(proc.stderr).text();
+    const code = await proc.exited;
     expect(code).not.toBe(0);
-    expect(output).toContain("REFUSING: base is 'main'");
+    expect(out + err).toContain("empty or null after validation");
+    expect(existsSync(markerPath)).toBe(false);
+    expect(out + err).not.toContain("MERGE_REACHED");
+  });
+
+  test("the shipped fence contains no `|| true` anywhere", () => {
+    expect(mergeFenceText()).not.toContain("|| true");
+  });
+
+  // Guards against a reviewer's exact worry: a second, hand-copied bash implementation of the
+  // logic that moved into merge-guard.ts. None of these fragments should exist in the fence
+  // any more — they are now inside scripts/lib/merge-guard.ts exclusively.
+  test("the shipped fence contains no second, hand-copied implementation of identity/base/state/checks", () => {
+    const block = mergeFenceText();
+    expect(block).not.toContain("lc() {");
+    expect(block).not.toContain("gh pr checks -R");
+    // Important D (fix pass 2): a `gh pr view -R ... --json state,mergeCommit` call now
+    // legitimately exists in the `gh pr merge` failure handler — a POST-FAILURE diagnostic
+    // read, not a re-implementation of the identity/base/state VERDICT logic (which fetched
+    // `headRefName,baseRefName,state` and made an ok/refuse DECISION from it). Scoped to that
+    // specific old shape rather than banning the `gh pr view -R` substring outright.
+    expect(block).not.toContain("--json headRefName,baseRefName,state");
+    expect(block).not.toContain(".requiredChecks[]");
+  });
+
+  // Important 9: SNAPSHOT never had a non-empty assert — every prior fence test stubbed a
+  // module that ignores stdin entirely, so a regression removing this guard would have been
+  // invisible. Mirrors the STORY-unset test above.
+  test("still refuses when SNAPSHOT is unset, and never reaches merge-guard.ts at all (Important 9)", async () => {
+    const { root, markerPath } = makeStubPluginRoot({ stdout: JSON.stringify({ ok: true }), exitCode: 0 }); // would say yes if ever asked
+    const { code, output } = await runFence(extractMergeFence(), {
+      STORY: "ABC-1",
+      PR: "1",
+      RESOLVED: VALID_RESOLVED_JSON,
+      SNAPSHOT: "",
+      CLAUDE_PLUGIN_ROOT: root,
+    });
+    expect(code).not.toBe(0);
+    expect(output).toContain("SNAPSHOT unset");
+    expect(existsSync(markerPath)).toBe(false); // never reached the module
+    expect(output).not.toContain("MERGE_REACHED");
+  });
+
+  // Critical 1 (round-3 security review). §4 hands $PROJECT_DIR to `git -C`, and running git
+  // inside a repository whose `.git` configuration an attacker controls is arbitrary code
+  // execution — reproduced on git 2.50.1 via `core.sshCommand` plus an ssh-form `origin`, where a
+  // plain `git -C <evil> fetch origin -- main` executes the payload. So the run-state may not be
+  // the trust root for that path: §4 reads `projectDir`/`repo` from the operator-authored config
+  // file and requires $RESOLVED to agree.
+  //
+  // Every case below asserts the stub module's marker file is ABSENT — the refusal must land
+  // before the module is ever invoked, and (more importantly) before any git process is spawned
+  // against the attacker-named directory. Without these, the entire anchoring block is
+  // mutation-invisible: the round-3 review demonstrated that deleting §4's whole observed-REPO
+  // block left the suite at 517/517 green.
+  function tamperedResolved(overrides: Record<string, unknown>): string {
+    return JSON.stringify({ ...JSON.parse(VALID_RESOLVED_JSON), ...overrides });
+  }
+
+  function configAt(payload: Record<string, unknown>): string {
+    const dir = mkdtempSync(join(tmpdir(), "drawbar-anchor-cfg-"));
+    const p = join(dir, "ship.config.json");
+    writeFileSync(p, JSON.stringify(payload));
+    return p;
+  }
+
+  test("Critical 1: a run-state projectDir that disagrees with the config refuses before git or the module is ever reached", async () => {
+    const evilDir = mkdtempSync(join(tmpdir(), "drawbar-anchor-evil-"));
+    const { root, markerPath } = makeStubPluginRoot({ stdout: JSON.stringify({ ok: true }), exitCode: 0 });
+    const { code, output } = await runFence(extractMergeFence(), {
+      STORY: "ABC-1",
+      PR: "1",
+      RESOLVED: tamperedResolved({ projectDir: evilDir }),
+      SNAPSHOT: VALID_SNAPSHOT_JSON,
+      CLAUDE_PLUGIN_ROOT: root,
+      DRAWBAR_SHIP_CONFIG: FIXTURE_CONFIG_PATH,
+    });
+    expect(code).not.toBe(0);
+    expect(output).toContain("disagrees with");
+    expect(output).toContain(evilDir);
+    expect(existsSync(markerPath)).toBe(false);
+    expect(output).not.toContain("MERGE_REACHED");
+  });
+
+  test("Critical 1: a run-state repo that disagrees with the config refuses before the module is ever reached", async () => {
+    const { root, markerPath } = makeStubPluginRoot({ stdout: JSON.stringify({ ok: true }), exitCode: 0 });
+    const { code, output } = await runFence(extractMergeFence(), {
+      STORY: "ABC-1",
+      PR: "1",
+      // Discriminating on purpose (MUST-CHECK vacuous-assertion-needs-preseed-state): the
+      // run-state's repo is the one that MATCHES the fixture checkout's real `origin`, and the
+      // CONFIG names a different one. So the observed-remote check downstream would happily
+      // pass here — only the run-state-vs-config agreement check can catch this. An earlier
+      // version of this test used `repo: "attacker/evil"` in the run-state and passed for the
+      // wrong reason: neutering the agreement check left the suite fully green.
+      RESOLVED: tamperedResolved({ repo: "org/repo" }),
+      SNAPSHOT: VALID_SNAPSHOT_JSON,
+      CLAUDE_PLUGIN_ROOT: root,
+      DRAWBAR_SHIP_CONFIG: configAt({ projectDir: FIXTURE_PROJECT_DIR, repo: "attacker/evil" }),
+    });
+    expect(code).not.toBe(0);
+    expect(output).toContain("attacker/evil");
+    expect(existsSync(markerPath)).toBe(false);
+  });
+
+  test("Critical 1: a config projectDir that is not absolute refuses", async () => {
+    const { root, markerPath } = makeStubPluginRoot({ stdout: JSON.stringify({ ok: true }), exitCode: 0 });
+    const { code, output } = await runFence(extractMergeFence(), {
+      STORY: "ABC-1",
+      PR: "1",
+      RESOLVED: tamperedResolved({ projectDir: "relative/project" }),
+      SNAPSHOT: VALID_SNAPSHOT_JSON,
+      CLAUDE_PLUGIN_ROOT: root,
+      DRAWBAR_SHIP_CONFIG: configAt({ projectDir: "relative/project", repo: "org/repo" }),
+    });
+    expect(code).not.toBe(0);
+    expect(output).toContain("is not absolute");
+    expect(existsSync(markerPath)).toBe(false);
+  });
+
+  test("Critical 1: a config projectDir carrying a .. segment refuses", async () => {
+    const traversal = `${FIXTURE_PROJECT_DIR}/../elsewhere`;
+    const { root, markerPath } = makeStubPluginRoot({ stdout: JSON.stringify({ ok: true }), exitCode: 0 });
+    const { code, output } = await runFence(extractMergeFence(), {
+      STORY: "ABC-1",
+      PR: "1",
+      RESOLVED: tamperedResolved({ projectDir: traversal }),
+      SNAPSHOT: VALID_SNAPSHOT_JSON,
+      CLAUDE_PLUGIN_ROOT: root,
+      DRAWBAR_SHIP_CONFIG: configAt({ projectDir: traversal, repo: "org/repo" }),
+    });
+    expect(code).not.toBe(0);
+    expect(output).toContain(".. segment");
+    expect(existsSync(markerPath)).toBe(false);
+  });
+
+  // Important E's observed-remote check, now anchored at the CONFIG-derived projectDir. The
+  // fixture checkout's real `origin` is `org/repo`, so a config declaring a different repo must
+  // refuse — this is the case that was entirely uncovered before, and it needs BOTH the config
+  // and the run-state to agree with each other so the mismatch is genuinely the remote's.
+  test("Important E: a repo that disagrees with the project checkout's actual git remote refuses", async () => {
+    const { root, markerPath } = makeStubPluginRoot({ stdout: JSON.stringify({ ok: true }), exitCode: 0 });
+    const { code, output } = await runFence(extractMergeFence(), {
+      STORY: "ABC-1",
+      PR: "1",
+      RESOLVED: tamperedResolved({ repo: "other/elsewhere" }),
+      SNAPSHOT: VALID_SNAPSHOT_JSON,
+      CLAUDE_PLUGIN_ROOT: root,
+      DRAWBAR_SHIP_CONFIG: configAt({ projectDir: FIXTURE_PROJECT_DIR, repo: "other/elsewhere" }),
+    });
+    expect(code).not.toBe(0);
+    expect(output).toContain("repo_mismatch");
+    expect(existsSync(markerPath)).toBe(false);
+  });
+
+  test("Important E: a projectDir that is not a git repo at all refuses with the remote-lookup diagnostic", async () => {
+    const notARepo = mkdtempSync(join(tmpdir(), "drawbar-anchor-notgit-"));
+    const { root, markerPath } = makeStubPluginRoot({ stdout: JSON.stringify({ ok: true }), exitCode: 0 });
+    const { code, output } = await runFence(extractMergeFence(), {
+      STORY: "ABC-1",
+      PR: "1",
+      RESOLVED: tamperedResolved({ projectDir: notARepo }),
+      SNAPSHOT: VALID_SNAPSHOT_JSON,
+      CLAUDE_PLUGIN_ROOT: root,
+      DRAWBAR_SHIP_CONFIG: configAt({ projectDir: notARepo, repo: "org/repo" }),
+    });
+    expect(code).not.toBe(0);
+    expect(output).toContain("git remote get-url origin failed");
+    expect(existsSync(markerPath)).toBe(false);
+  });
+
+  // Critical 4: `MERGE_SHA=$(...)` is a command substitution — its value never otherwise
+  // leaves this Bash invocation. Without an explicit echo, step 5's instruction to record
+  // `$MERGE_SHA` names a shell variable from a FINISHED tool call, which is undeliverable.
+  test("Critical 4: the shipped fence echoes merge_sha=$MERGE_SHA on stdout after capturing it", () => {
+    expect(mergeFenceText()).toContain('echo "merge_sha=$MERGE_SHA"');
+  });
+
+  // Important 8: `gh pr merge`'s own exit status must be checked, with a named refusal —
+  // never falling through to record-merge-sha on a merge that never happened.
+  test("Important 8: the shipped fence checks gh pr merge's own exit status with a named refusal", () => {
+    const block = mergeFenceText();
+    expect(block).toMatch(/gh pr merge -R "\$REPO" "\$PR" --squash --delete-branch\s*\\?\s*\n\s*\|\|\s*\{[^}]*REFUSING/);
+  });
+
+  // Important 7 / Critical 4: real end-to-end execution of the SHIPPED fence text, past
+  // `gh pr merge` (no-op'd out — this test never hits real GitHub), through the real,
+  // unstubbed `scripts/lib/merge-guard.ts` for BOTH the verdict call and the post-merge
+  // `record-merge-sha` call, against a fake `gh`/`git` on PATH. This is what actually pins
+  // the flag names (`--repo`/`--pr`/`--story`/`--base`), the stdin shape
+  // (`resolvedConfig`/`snapshot`), and the post-merge block's existence — every prior fence
+  // test substituted a stub module that ignores its own argv/stdin entirely, so a renamed flag
+  // (e.g. `--story` -> `--issue`) went undetected by the whole suite.
+  //
+  // Important A (fix pass 2, comment correction): this comment used to claim `configPath` was
+  // pinned here too — it was not. The fake `gh api` fixture below only ever emits
+  // "src/index.ts", so a mutation replacing `--arg configPath "$CONFIG"` with `--arg configPath
+  // ""` in the shipped fence survived the whole suite undetected. The dedicated
+  // "I-A: configPath plumbing is genuinely end-to-end" test further below is what actually
+  // closes that gap — it drives a custom `DRAWBAR_SHIP_CONFIG` basename through the real fence,
+  // the real `ship-config.ts`-shaped `$CONFIG` derivation, the real `jq --arg configPath`, and
+  // the real `merge-guard.ts`, and asserts the config-diff refusal fires on it.
+  const REAL_MODULE_RESOLVED_JSON = JSON.stringify({
+    envDir: "/tmp/fixture-env-dir",
+    projectDir: "/tmp/fixture-project-dir",
+    repo: "org/repo",
+    team: "PLAT",
+    baseBranch: "main",
+    mergedStatus: "Pre-QA",
+    requiredChecks: ["build"],
+    observed: { projectDirRemote: "org/repo", envDirRemote: "org/repo-kb", defaultBranch: "main" },
+  });
+  // Critical 1 (round-3 security review): §4 takes `projectDir`/`repo` from the OPERATOR-AUTHORED
+  // config file and requires the run-state to agree, because that path is handed to `git -C`.
+  // These end-to-end tests drive a fully stubbed `git` on PATH (so the directory is never really
+  // opened) and therefore use a synthetic projectDir — this config has to name that same
+  // synthetic path, exactly as a real deployment's config names its real checkout.
+  const REAL_MODULE_CONFIG_PATH = (() => {
+    const dir = mkdtempSync(join(tmpdir(), "drawbar-fence-realcfg-"));
+    const p = join(dir, "ship.config.json");
+    writeFileSync(p, JSON.stringify({ projectDir: "/tmp/fixture-project-dir", repo: "org/repo" }));
+    return p;
+  })();
+
+  const FIXTURE_MERGE_SHA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+  // Fake `gh`/`git` covering every call the REAL merge-guard.ts makes across BOTH `verdict`
+  // and `record-merge-sha` — dispatch by subcommand, `pr merge`'s exit controlled by
+  // $MERGE_EXIT so the same fixture drives both the I7 happy path and the I8 failure path.
+  // `apiOutput` is the files-list this fixture's `gh api .../pulls/<pr>/files` returns —
+  // parameterized (Important A, fix pass 2) so the configPath end-to-end test below can drive
+  // a diff touching a CUSTOM-basename config file through it, rather than every caller being
+  // stuck with the hardcoded "src/index.ts" that never touches the configPath match at all.
+  function makeFakeGhAndGitForFullMergeFence(apiOutput = "src/index.ts"): string {
+    const dir = mkdtempSync(join(tmpdir(), "drawbar-full-merge-fence-"));
+    const ghPath = join(dir, "gh");
+    writeFileSync(
+      ghPath,
+      `#!/usr/bin/env bash\n` +
+        `if [ "$1" = "pr" ] && [ "$2" = "view" ]; then\n` +
+        // Important D (fix pass 2): the NEW post-failure diagnostic call
+        // (`--json state,mergeCommit`) must be told apart from record-merge-sha's own
+        // `--json mergeCommit` call — checked FIRST since it's the more specific substring.
+        `  if [[ "$*" == *"state,mergeCommit"* ]]; then\n` +
+        `    echo "OPEN "\n` +
+        `  elif [[ "$*" == *mergeCommit* ]]; then\n` +
+        `    echo "${FIXTURE_MERGE_SHA}"\n` +
+        `  else\n` +
+        // Critical B: the verdict's `gh pr view` now also requests `changedFiles` — a 4th
+        // space-separated token, well under the 3000-file cap.
+        `    echo "user/abc-1-slug main OPEN 5"\n` +
+        `  fi\n` +
+        // Important F: the independently-observed default-branch call.
+        `elif [ "$1" = "repo" ] && [ "$2" = "view" ]; then\n` +
+        `  echo "main"\n` +
+        `elif [ "$1" = "pr" ] && [ "$2" = "checks" ]; then\n` +
+        `  echo '[{"name":"build","bucket":"pass"},{"name":"CodeRabbit","bucket":"pass"}]'\n` +
+        `elif [ "$1" = "api" ]; then\n` +
+        `  echo "${apiOutput}"\n` +
+        `elif [ "$1" = "pr" ] && [ "$2" = "merge" ]; then\n` +
+        `  exit "\${MERGE_EXIT:-0}"\n` +
+        `else\n` +
+        `  echo "unexpected gh invocation in I7/I8 fixture: $*" >&2\n` +
+        `  exit 1\n` +
+        `fi\n`,
+    );
+    chmodSync(ghPath, 0o755);
+    const gitPath = join(dir, "git");
+    writeFileSync(
+      gitPath,
+      `#!/usr/bin/env bash\n` +
+        // Critical A / Important E (fix pass 2): every real call is now `-C <dir> <subcommand>
+        // ...` — anchored at `$3`, not `$1`. Covers both §4's own `git remote get-url origin`
+        // (Important E) and merge-guard.ts's `record-merge-sha` fetch/merge-base (Critical A).
+        `if [ "$1" = "-C" ]; then\n` +
+        `  sub="$3"\n` +
+        `  if [ "$sub" = "remote" ]; then\n` +
+        `    echo "https://github.com/org/repo.git"\n` +
+        `  elif [ "$sub" = "fetch" ]; then\n` +
+        `    exit 0\n` +
+        `  elif [ "$sub" = "merge-base" ]; then\n` +
+        `    exit 0\n` +
+        `  else\n` +
+        `    echo "unexpected git invocation in I7/I8 fixture: $*" >&2\n` +
+        `    exit 1\n` +
+        `  fi\n` +
+        `else\n` +
+        `  echo "unexpected git invocation in I7/I8 fixture: $*" >&2\n` +
+        `  exit 1\n` +
+        `fi\n`,
+    );
+    chmodSync(gitPath, 0o755);
+    return dir;
+  }
+
+  // Extracts the WHOLE §4 block (guard-start through the closing fence), unlike
+  // extractMergeFence() above which deliberately stops before `gh pr merge -R` — this is what
+  // lets I7/I8 exercise the real post-merge block.
+  function extractFullMergeFence(): string {
+    const block = mergeFenceText();
+    const guardStart = block.indexOf("# MUST-CHECK bash-fence-cross-invocation-state-needs-unseeded-test");
+    expect(guardStart, "cross-invocation derive-guard marker not found in the merge block").toBeGreaterThan(-1);
+    return block.slice(guardStart);
+  }
+
+  test("Important 7/Critical 4: the real fence, with the real merge-guard.ts, runs the verdict AND the post-merge merge_sha capture end to end", async () => {
+    const binDir = makeFakeGhAndGitForFullMergeFence();
+    // Matches the WHOLE `gh pr merge ... || { ...; exit 1; }` statement (Important 8's error
+    // handler is part of the same shell statement via the trailing `\` continuation) — a
+    // partial replacement leaving the `||` orphaned on its own line is a bash syntax error,
+    // not a semantic no-op.
+    const realMergeStatement = /gh pr merge -R "\$REPO" "\$PR" --squash --delete-branch[\s\S]*?exit 1;\s*\\?\s*\n?\s*\}/;
+    const script = extractFullMergeFence();
+    expect(realMergeStatement.test(script), "the real `gh pr merge -R ... || { ... }` statement must still be present to replace").toBe(true);
+    const noOpScript = script.replace(
+      realMergeStatement,
+      'true # I7 fixture: real merge replaced with a no-op — this test verifies the fence past this point, never a real GitHub merge',
+    );
+    const proc = Bun.spawn(["bash", "-c", `${noOpScript}\necho MERGE_SHA_STEP_REACHED`], {
+      env: {
+        PATH: `${binDir}:${process.env.PATH ?? ""}`,
+        STORY: "ABC-1",
+        PR: "1",
+        RESOLVED: REAL_MODULE_RESOLVED_JSON,
+        SNAPSHOT: '["ABC-1"]',
+        CLAUDE_PLUGIN_ROOT: root,
+        MERGE_EXIT: "0",
+        DRAWBAR_SHIP_CONFIG: REAL_MODULE_CONFIG_PATH,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const out = await new Response(proc.stdout).text();
+    const err = await new Response(proc.stderr).text();
+    const code = await proc.exited;
+    expect(code, `expected exit 0; got stderr:\n${err}\nstdout:\n${out}`).toBe(0);
+    expect(out).toContain(`merge_sha=${FIXTURE_MERGE_SHA}`);
+    expect(out).toContain("MERGE_SHA_STEP_REACHED");
+  });
+
+  // Important D (fix pass 2): the failure message was reworded — a non-zero `gh pr merge`
+  // exit no longer asserts "the PR was NOT merged" as fact; it now checks `gh pr view` and
+  // reports both possible outcomes. This test's fake `gh pr merge` fails WITHOUT ever having
+  // merged (MERGE_EXIT=1, and the fake `gh pr view --json state,mergeCommit` echoes "OPEN "),
+  // so the diagnostic should report the OPEN branch of that message.
+  test("Important 8/D: a failing `gh pr merge` refuses immediately, never reaches record-merge-sha, and reports the ambiguous-merge-state diagnostic", async () => {
+    const binDir = makeFakeGhAndGitForFullMergeFence();
+    const script = extractFullMergeFence();
+    const proc = Bun.spawn(["bash", "-c", `${script}\necho MERGE_SHA_STEP_REACHED`], {
+      env: {
+        PATH: `${binDir}:${process.env.PATH ?? ""}`,
+        STORY: "ABC-1",
+        PR: "1",
+        RESOLVED: REAL_MODULE_RESOLVED_JSON,
+        SNAPSHOT: '["ABC-1"]',
+        CLAUDE_PLUGIN_ROOT: root,
+        MERGE_EXIT: "1",
+        DRAWBAR_SHIP_CONFIG: REAL_MODULE_CONFIG_PATH,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const out = await new Response(proc.stdout).text();
+    const err = await new Response(proc.stderr).text();
+    const code = await proc.exited;
+    expect(code).not.toBe(0);
+    expect(out + err).toContain("REFUSING: gh pr merge exited non-zero");
+    expect(out + err).toContain("checked gh pr view: OPEN");
+    expect(out + err).toContain("the PR was NOT merged");
+    expect(out + err).not.toContain("MERGE_SHA_STEP_REACHED");
+    expect(out + err).not.toContain("merge_sha=");
+  });
+
+  // Important A (fix pass 2): the WHOLE C3(c) chain — `DRAWBAR_SHIP_CONFIG` -> `$CONFIG` ->
+  // stdin `configPath` -> merge-guard.ts's `configBasenames` match — had ZERO end-to-end
+  // coverage. Reproduced: mutating the shipped fence's `--arg configPath "$CONFIG"` to
+  // `--arg configPath ""` left the whole suite green before this test existed (see the report
+  // for the mutation run). Drives a CUSTOM config basename (not the hardcoded default
+  // `ship.config.json`) all the way from `DRAWBAR_SHIP_CONFIG` through the real fence and the
+  // real `merge-guard.ts`, and asserts the config-diff refusal actually fires on it.
+  test("Important A: configPath plumbing is genuinely end-to-end — a diff touching the DRAWBAR_SHIP_CONFIG-pointed custom-basename file is caught", async () => {
+    const cfgDir = mkdtempSync(join(tmpdir(), "drawbar-configpath-e2e-"));
+    const customConfigPath = join(cfgDir, "custom-ship-config.json");
+    // Carries the same projectDir/repo as REAL_MODULE_RESOLVED_JSON — §4's Critical-1 trusted
+    // anchors must agree before the verdict is ever reached, and this test is about the CUSTOM
+    // BASENAME reaching `configPath`, not about the anchor check.
+    writeFileSync(customConfigPath, JSON.stringify({ projectDir: "/tmp/fixture-project-dir", repo: "org/repo" }));
+    // The fake `gh api .../pulls/<pr>/files` echoes a diff touching exactly that custom
+    // basename — never the hardcoded default `ship.config.json` this fixture never uses.
+    const binDir = makeFakeGhAndGitForFullMergeFence("some/dir/custom-ship-config.json");
+    const script = extractMergeFence(); // stops before `gh pr merge -R` — the refusal fires inside verdict, before it
+    const proc = Bun.spawn(["bash", "-c", `${script}\necho MERGE_REACHED`], {
+      env: {
+        PATH: `${binDir}:${process.env.PATH ?? ""}`,
+        STORY: "ABC-1",
+        PR: "1",
+        RESOLVED: REAL_MODULE_RESOLVED_JSON,
+        SNAPSHOT: '["ABC-1"]',
+        CLAUDE_PLUGIN_ROOT: root,
+        DRAWBAR_SHIP_CONFIG: customConfigPath,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const out = await new Response(proc.stdout).text();
+    const err = await new Response(proc.stderr).text();
+    const code = await proc.exited;
+    expect(code).not.toBe(0);
+    expect(out + err).toContain("config_diff_touches_ship_config");
+    expect(out + err).not.toContain("MERGE_REACHED");
   });
 });
 
@@ -755,341 +1339,6 @@ describe("PCO-348 fix pass: --base parameterization is not silently re-hardcoded
     expect(listEnd, "end of the 'brief must carry' bullet list not found").toBeGreaterThan(listStart);
     const bulletList = txt.slice(idx, listEnd);
     expect(bulletList).toContain("$BASE_BRANCH");
-  });
-});
-
-// Minor (fix pass 4): `$bad` — the failing/cancelled check count immediately above the
-// requiredChecks loop — previously fail-closed on a degraded `gh` only by the accident that
-// `"" = "0"` is false, reporting "REFUSING:  failing/cancelled checks" with an empty count
-// indistinguishable from a real bug in this fence. Give it the same `case ''|*[!0-9]*)` "could
-// not be read" arm the `$seen` guard already has. Extracted for real from the shipped doc.
-describe("merge guard: $bad failing/cancelled check count fails closed on a degraded gh (Minor, fix pass 4)", () => {
-  function extractBadGuard(): string {
-    const txt = readNonEmpty(join(root, "commands/drawbar-ship.md"));
-    const sectionStart = txt.indexOf("## 4. Merge");
-    expect(sectionStart, "'## 4. Merge' heading not found").toBeGreaterThan(-1);
-    const fenceStart = txt.indexOf("```bash", sectionStart);
-    const fenceEnd = txt.indexOf("```", fenceStart + 7);
-    const block = txt.slice(fenceStart + 7, fenceEnd);
-    const start = block.indexOf('bad=$(gh pr checks -R "$REPO" "$PR" --json bucket');
-    expect(start, "$bad guard not found in the merge block").toBeGreaterThan(-1);
-    const endLine = '[ "$bad" = "0" ] || { echo "REFUSING: $bad failing/cancelled checks"; exit 1; }';
-    const endIdx = block.indexOf(endLine, start);
-    expect(endIdx, "closing $bad refusal not found").toBeGreaterThan(start);
-    return block.slice(start, endIdx + endLine.length);
-  }
-
-  // Fake `gh` answering `pr checks --json bucket --jq '...'` directly with the value the real
-  // `gh`'s embedded `--jq` would have already reduced it to (a bare count) — `gh`'s own `--jq`
-  // does its own filtering internally, unlike the separate `jq --arg` pipe the requiredChecks
-  // loop uses, so there is nothing further to filter here.
-  function makeFakeGh(stdout: string): string {
-    const dir = mkdtempSync(join(tmpdir(), "drawbar-bad-stub-"));
-    const gh = join(dir, "gh");
-    writeFileSync(
-      gh,
-      `#!/usr/bin/env bash\n` + `if [ "$1" = "pr" ] && [ "$2" = "checks" ]; then\n` + `  echo "${stdout}"\n` + `fi\n`,
-    );
-    chmodSync(gh, 0o755);
-    return dir;
-  }
-
-  // Important 2 regression, applied here: `gh pr checks` itself fails (secondary rate limit,
-  // 502, expired token) — exits non-zero with EMPTY stdout, exactly the degraded shape.
-  function makeFakeGhDegraded(): string {
-    const dir = mkdtempSync(join(tmpdir(), "drawbar-bad-degraded-"));
-    const gh = join(dir, "gh");
-    writeFileSync(gh, `#!/usr/bin/env bash\n` + `if [ "$1" = "pr" ] && [ "$2" = "checks" ]; then\n` + `  exit 1\n` + `fi\n`);
-    chmodSync(gh, 0o755);
-    return dir;
-  }
-
-  async function run(binDir: string): Promise<{ code: number; output: string }> {
-    const script = `REPO=org/repo\nPR=1\n${extractBadGuard()}`;
-    const proc = Bun.spawn(["bash", "-c", script], {
-      env: { PATH: `${binDir}:${process.env.PATH ?? ""}` },
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-    const out = await new Response(proc.stdout).text();
-    const err = await new Response(proc.stderr).text();
-    const code = await proc.exited;
-    return { code, output: out + err };
-  }
-
-  test("passes when there are no failing/cancelled checks", async () => {
-    const { code } = await run(makeFakeGh("0"));
-    expect(code).toBe(0);
-  });
-
-  test("refuses with the count when checks are failing/cancelled", async () => {
-    const { code, output } = await run(makeFakeGh("2"));
-    expect(code).not.toBe(0);
-    expect(output).toContain("REFUSING: 2 failing/cancelled checks");
-  });
-
-  test("refuses with a distinct 'could not be read' message when gh itself fails, rather than an empty-count REFUSING (Minor, fix pass 4)", async () => {
-    const { code, output } = await run(makeFakeGhDegraded());
-    expect(code).not.toBe(0);
-    expect(output).toContain("could not be read");
-  });
-});
-
-// PCO-348 (S3): `requiredChecks` is otherwise a dead config field — parsed, validated, and
-// carried through `resolved_config`, but nothing ever CONSUMES it — unless this loop
-// actually refuses on a configured check that never ran. Extracted for real from the shipped
-// doc (not hand-reimplemented), proving the one seam that stops it from being dead.
-describe("merge guard: requiredChecks loop refuses a configured check that never ran", () => {
-  // Fix pass 2, Critical 1: the start anchor is the comment block that already precedes the
-  // loop (present before AND after the fix) rather than "while IFS= read -r check; do" itself
-  // — so this extraction picks up the new pre-loop $RESOLVED vacuity guard once it exists,
-  // without needing a brand-new marker the pre-fix doc doesn't have yet (which would make a
-  // RED run fail on "marker not found" instead of on the real vacuous-pass behavior).
-  function extractRequiredChecksLoop(): string {
-    const txt = readNonEmpty(join(root, "commands/drawbar-ship.md"));
-    const sectionStart = txt.indexOf("## 4. Merge");
-    expect(sectionStart, "'## 4. Merge' heading not found").toBeGreaterThan(-1);
-    const fenceStart = txt.indexOf("```bash", sectionStart);
-    const fenceEnd = txt.indexOf("```", fenceStart + 7);
-    const block = txt.slice(fenceStart + 7, fenceEnd);
-    const start = block.indexOf("# requiredChecks (from the resolved config):");
-    expect(start, "requiredChecks section not found in the merge block").toBeGreaterThan(-1);
-    const doneLine = 'done < <(echo "$RESOLVED" | jq -r \'.requiredChecks[]\')';
-    const doneIdx = block.indexOf(doneLine, start);
-    expect(doneIdx, "closing 'done < <(...)' of the requiredChecks loop not found").toBeGreaterThan(start);
-    // Critical, fix pass 4: extend the extraction past `done < <(...)` to also capture the
-    // reconciliation check — count-of-iterations must equal $REQUIRED_COUNT — that closes the
-    // type-blind `jq length` gap independent of the type guard above it. Without this, the
-    // reconciliation is never exercised by the extracted fence at all.
-    const reconcileLine =
-      '[ "$verified" -eq "$REQUIRED_COUNT" ] || { echo "REFUSING: only $verified of $REQUIRED_COUNT required checks were evaluated"; exit 1; }';
-    const reconcileIdx = block.indexOf(reconcileLine, doneIdx);
-    expect(reconcileIdx, "reconciliation check after the requiredChecks loop not found").toBeGreaterThan(doneIdx);
-    return block.slice(start, reconcileIdx + reconcileLine.length);
-  }
-
-  // Fake `gh` answering `pr checks --json name,bucket` with a raw JSON array on stdout — the
-  // REAL `jq` on PATH (inherited below, never stripped for this describe block) is what does
-  // the filtering, exactly as the extracted fence itself pipes to it.
-  function makeFakeGh(checks: { name: string; bucket: string }[]): string {
-    const dir = mkdtempSync(join(tmpdir(), "drawbar-reqchecks-stub-"));
-    const gh = join(dir, "gh");
-    const jsonBody = JSON.stringify(checks).replace(/'/g, "'\\''");
-    writeFileSync(
-      gh,
-      `#!/usr/bin/env bash\n` +
-        `if [ "$1" = "pr" ] && [ "$2" = "checks" ]; then\n` +
-        `  echo '${jsonBody}'\n` +
-        `fi\n`,
-    );
-    chmodSync(gh, 0o755);
-    return dir;
-  }
-
-  // Important 2 regression: `gh pr checks` itself fails (secondary rate limit, 502, expired
-  // token mid-loop) — exits non-zero with EMPTY stdout, exactly the shape a transient `gh`
-  // failure produces. Distinct from makeFakeGh above, which always emits well-formed JSON.
-  function makeFakeGhDegraded(): string {
-    const dir = mkdtempSync(join(tmpdir(), "drawbar-reqchecks-degraded-"));
-    const gh = join(dir, "gh");
-    writeFileSync(
-      gh,
-      `#!/usr/bin/env bash\n` +
-        `if [ "$1" = "pr" ] && [ "$2" = "checks" ]; then\n` +
-        `  exit 1\n` +
-        `fi\n`,
-    );
-    chmodSync(gh, 0o755);
-    return dir;
-  }
-
-  async function runLoop(resolvedJson: string, checks: { name: string; bucket: string }[]): Promise<{ code: number; output: string }> {
-    const binDir = makeFakeGh(checks);
-    const script = `RESOLVED='${resolvedJson}'\nREPO=org/repo\nPR=1\n${extractRequiredChecksLoop()}`;
-    const proc = Bun.spawn(["bash", "-c", script], {
-      env: { PATH: `${binDir}:${process.env.PATH ?? ""}` },
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-    const out = await new Response(proc.stdout).text();
-    const err = await new Response(proc.stderr).text();
-    const code = await proc.exited;
-    return { code, output: out + err };
-  }
-
-  // Critical 1: run the extracted fence with $RESOLVED genuinely UNSET (never assigned in the
-  // script at all — not even `RESOLVED=""`), the exact pre-state a fresh, separate bash
-  // invocation of §4 actually starts from. Bun.spawn's `env` fully replaces the child's
-  // environment, so omitting the key reliably leaves it unset. See MUST-CHECK
-  // vacuous-assertion-needs-preseed-state: the OLD `runLoop` helper always pre-seeded
-  // RESOLVED, which is exactly the pre-state that is missing in production.
-  async function runLoopResolvedUnset(checks: { name: string; bucket: string }[]): Promise<{ code: number; output: string }> {
-    const binDir = makeFakeGh(checks);
-    const script = `REPO=org/repo\nPR=1\n${extractRequiredChecksLoop()}`;
-    const proc = Bun.spawn(["bash", "-c", script], {
-      env: { PATH: `${binDir}:${process.env.PATH ?? ""}` }, // RESOLVED deliberately absent
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-    const out = await new Response(proc.stdout).text();
-    const err = await new Response(proc.stderr).text();
-    const code = await proc.exited;
-    return { code, output: out + err };
-  }
-
-  test("refuses when the configured check never appears at all", async () => {
-    const { code, output } = await runLoop('{"requiredChecks":["build"]}', [{ name: "lint", bucket: "pass" }]);
-    expect(code).not.toBe(0);
-    expect(output).toContain("required check 'build' never ran");
-  });
-
-  test("refuses when the configured check ran but has not passed", async () => {
-    const { code, output } = await runLoop('{"requiredChecks":["build"]}', [{ name: "build", bucket: "pending" }]);
-    expect(code).not.toBe(0);
-    expect(output).toContain("required check 'build' never ran");
-  });
-
-  // Regression: `[ "$seen" = "0" ] && { ...; exit 1; }` leaves the loop's OWN exit status as
-  // 1 (false) on the last SUCCESSFUL check — `&&` short-circuits without running anything, so
-  // the last-executed command is the failed `[ "$seen" = "0" ]` test. Harmless in the real
-  // fence (later commands overwrite $?, and there's no `set -e`), but this isolated harness —
-  // which extracts the loop alone — is exactly the shape a future refactor that moves this
-  // loop to the end of the fence would hit for real. Fixed by flipping to the house
-  // `test || { ...; exit 1; }` style used everywhere else in this file, which exits 0 on its
-  // own when every check passes.
-  test("passes when every configured check ran and is in the pass bucket", async () => {
-    const { code } = await runLoop('{"requiredChecks":["build","lint"]}', [
-      { name: "build", bucket: "pass" },
-      { name: "lint", bucket: "pass" },
-    ]);
-    expect(code).toBe(0);
-  });
-
-  // Critical 1 (fix pass 2): the reviewer's verbatim repro — `RESOLVED="" bash v1.sh` falls
-  // straight through to `gh pr merge` with no output and exit 0. This is the same class but
-  // stronger: RESOLVED is never assigned at all (the real cross-invocation pre-state), not
-  // merely assigned empty.
-  // Important 3 (fix pass 4): the old assertion only checked `output.toContain("RESOLVED")`
-  // — but the OTHER FATAL this fence can emit ("FATAL: RESOLVED carries no requiredChecks
-  // array...") also contains that token, so deleting the `[ -n "$RESOLVED" ]` line entirely
-  // left this test green (the REQUIRED_COUNT guard below it still refuses, just with the
-  // wrong message). Anchor on the specific message the `[ -n "$RESOLVED" ]` line actually
-  // emits, so a mutation that deletes that exact line is caught here rather than papered over
-  // by the next guard down.
-  test("refuses (does not silently fall through) when RESOLVED is entirely unset, not merely empty (Critical 1)", async () => {
-    const { code, output } = await runLoopResolvedUnset([{ name: "build", bucket: "pass" }]);
-    expect(code).not.toBe(0);
-    expect(output).toContain("FATAL: RESOLVED unset");
-  });
-
-  // Fix pass 3: the second, independent half of the vacuity guard — $RESOLVED is genuinely
-  // NON-empty (the `[ -n "$RESOLVED" ]` assert above passes) but carries no usable
-  // `requiredChecks`. This is a live scenario because $RESOLVED is hand-carried into this
-  // fence by the agent (see the fence's own comment above `RESOLVED="<Preflight's ...>"`): a
-  // truncated or wrong paste yields non-empty JSON with no requiredChecks, and the loop below
-  // would run zero times, silently skipping the gate — the exact Critical already fixed
-  // above, reached by a second route. `REQUIRED_COUNT=... case ... in ''|*[!0-9]*|0)` is the
-  // guard under test; each of these three payload shapes must trip it.
-  test("refuses with the requiredChecks-specific FATAL when RESOLVED is non-empty but requiredChecks is an empty array (fix pass 3)", async () => {
-    const { code, output } = await runLoop('{"requiredChecks":[]}', []);
-    expect(code).not.toBe(0);
-    expect(output).toContain("FATAL: RESOLVED carries no requiredChecks");
-  });
-
-  test("refuses with the requiredChecks-specific FATAL when RESOLVED has no requiredChecks key at all (fix pass 3)", async () => {
-    const { code, output } = await runLoop('{}', []);
-    expect(code).not.toBe(0);
-    expect(output).toContain("FATAL: RESOLVED carries no requiredChecks");
-  });
-
-  test("refuses with the requiredChecks-specific FATAL when RESOLVED is non-JSON / malformed text (fix pass 3)", async () => {
-    const { code, output } = await runLoop('not valid json', []);
-    expect(code).not.toBe(0);
-    expect(output).toContain("FATAL: RESOLVED carries no requiredChecks");
-  });
-
-  // Critical (fix pass 4): `jq`'s `length` builtin is defined on every JSON type, not just
-  // arrays — a `requiredChecks` value that is a STRING or a NUMBER produces a digits-only
-  // `REQUIRED_COUNT` (the string's character count, or the number itself) that satisfies the
-  // OLD `case ''|*[!0-9]*|0)` guard, while `.requiredChecks[]` then errors and the `while` loop
-  // runs zero times — the vacuous-pass Critical 1 already fixed once, reached by a third route.
-  // The reconciliation check alone is not enough here either: with a type-blind REQUIRED_COUNT,
-  // `verified` (0) never equals `REQUIRED_COUNT` (5), so a plain-`length` build would actually
-  // still be refused by the reconciliation — these two cases specifically pin the TYPE assert,
-  // by asserting the type-specific message, not merely a non-zero exit.
-  test("refuses with the requiredChecks-specific FATAL when requiredChecks is a string, not an array (Critical, fix pass 4)", async () => {
-    const { code, output } = await runLoop('{"requiredChecks":"build"}', [{ name: "build", bucket: "pass" }]);
-    expect(code).not.toBe(0);
-    expect(output).toContain("FATAL: RESOLVED carries no requiredChecks array");
-  });
-
-  test("refuses with the requiredChecks-specific FATAL when requiredChecks is a number, not an array (Critical, fix pass 4)", async () => {
-    const { code, output } = await runLoop('{"requiredChecks":42}', [{ name: "build", bucket: "pass" }]);
-    expect(code).not.toBe(0);
-    expect(output).toContain("FATAL: RESOLVED carries no requiredChecks array");
-  });
-
-  // Critical (fix pass 4): prove the reconciliation closes the class INDEPENDENTLY of the type
-  // guard above — mutate REQUIRED_COUNT back to the plain (type-blind) `.requiredChecks |
-  // length` form inline in the script under test, and confirm a mid-loop `gh` death (a check
-  // that never appears, so the loop refuses via the per-check guard before ever reaching the
-  // reconciliation) is still caught by the per-check guard, and — the actual reconciliation
-  // scenario — that a genuine iteration shortfall against a well-typed array is refused even
-  // when every check that DID run passed, proving the count comparison is a real, independent
-  // gate and not just inherited from the per-check guards.
-  test("reconciliation refuses an iteration shortfall even with the type guard reverted to plain `length` (Critical, fix pass 4)", async () => {
-    // Revert the type guard back to the pre-fix, type-blind form inline in the extracted
-    // fence text under test — proving the reconciliation below is a genuinely independent
-    // gate, not one that merely inherits its correctness from the type guard above it.
-    const script = extractRequiredChecksLoop().replace(
-      'if (.requiredChecks | type) == "array" then (.requiredChecks | length) else "bad" end',
-      ".requiredChecks | length",
-    );
-    expect(script).not.toContain('if (.requiredChecks | type) == "array"'); // the mutation actually applied
-    // Three configured checks, every one of which `gh` reports as passing — the per-check
-    // guards alone have nothing to refuse on. Truncate what the loop actually ITERATES (not
-    // `gh`'s answers) via `head -n 2`, modeling a `jq`/`gh` process that dies partway through
-    // emitting `.requiredChecks[]` — the loop runs to completion on 2 of 3 with every visited
-    // check passing, so only the reconciliation can catch the shortfall.
-    const binDir = makeFakeGh([
-      { name: "build", bucket: "pass" },
-      { name: "lint", bucket: "pass" },
-      { name: "test", bucket: "pass" },
-    ]);
-    const truncated = script.replace(
-      'done < <(echo "$RESOLVED" | jq -r \'.requiredChecks[]\')',
-      'done < <(echo "$RESOLVED" | jq -r \'.requiredChecks[]\' | head -n 2)',
-    );
-    const fullScript = `RESOLVED='{"requiredChecks":["build","lint","test"]}'\nREPO=org/repo\nPR=1\n${truncated}`;
-    const proc = Bun.spawn(["bash", "-c", fullScript], {
-      env: { PATH: `${binDir}:${process.env.PATH ?? ""}` },
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-    const out = await new Response(proc.stdout).text();
-    const err = await new Response(proc.stderr).text();
-    const code = await proc.exited;
-    expect(code).not.toBe(0);
-    expect(out + err).toContain("REFUSING: only 2 of 3 required checks were evaluated");
-  });
-
-  // Important 2: a transient `gh` failure (secondary rate limit, 502, expired token) inside
-  // the per-check loop must be diagnosable as "could not be read", never silently conflated
-  // with "the check passed". `[ "$seen" != "0" ]` is the fail-OPEN direction: empty `$seen`
-  // makes that comparison true.
-  test("refuses with a distinct message when gh itself fails mid-loop, rather than treating a degraded read as a pass (Important 2)", async () => {
-    const binDir = makeFakeGhDegraded();
-    const script = `RESOLVED='{"requiredChecks":["build"]}'\nREPO=org/repo\nPR=1\n${extractRequiredChecksLoop()}`;
-    const proc = Bun.spawn(["bash", "-c", script], {
-      env: { PATH: `${binDir}:${process.env.PATH ?? ""}` },
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-    const out = await new Response(proc.stdout).text();
-    const err = await new Response(proc.stderr).text();
-    const code = await proc.exited;
-    expect(code).not.toBe(0);
-    expect(out + err).toContain("could not be read");
   });
 });
 
@@ -1897,6 +2146,18 @@ describe("in_flight is cleared at all three Locked-13 narrative sites in command
     const parkSection = section("## Parking a story", "## Crash recovery");
     expect(parkSection).toContain("clear `in_flight` in the state file");
     expect(parkSection).toContain("in_flight: null");
+  });
+
+  // Minor (fix pass 2): the I10 "Parking a story" carve-out (a refusal AFTER `gh pr merge` has
+  // already run means the PR is already merged — never re-merge, re-run record-merge-sha
+  // instead) was prose-only, with nothing pinning it — a future edit could silently drop the
+  // exception and the whole suite would stay green. Mirrors the sibling in_flight tests above.
+  test("Minor: the I10 'Parking a story' carve-out (a post-merge refusal is not an ordinary park) is pinned", () => {
+    const parkSection = section("## Parking a story", "## Crash recovery");
+    expect(parkSection).toContain("Exception");
+    expect(parkSection).toContain("already merged");
+    expect(parkSection).toContain("Do not re-merge");
+    expect(parkSection).toContain("record-merge-sha");
   });
 
   test("the halt branch of 'Crash recovery' clears in_flight", () => {
