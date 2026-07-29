@@ -61,9 +61,10 @@ For a story large enough to split into independent, non-conflicting slices, you 
 
 When the implementer returns, **you verify its work before review begins.** Do not take "done" on trust:
 
-- Read the report **and** the actual diff (`git diff`) — confirm they match.
+- Read the report **and** the actual diff (`git diff`) — confirm they match, and that nothing landed that the story did not ask for.
 - Confirm each **RED run was actually shown** (failing-then-passing output), not just claimed.
 - Re-run the **tests covering the change plus typecheck and lint yourself**, and confirm they are green.
+- **Mutation-test the load-bearing guards**: neuter each one and confirm a specific test fails. A guard whose deletion leaves the suite green is not tested, however many tests surround it — and this catches the failure mode a green suite is blind to, including guards that pass for the wrong reason.
 - Check **every acceptance criterion** is met and no Locked / `MUST-CHECK:` constraint was violated or silently worked around.
 
 If anything is missing, wrong, or unverifiable, **send it back**: re-dispatch `story-implementer` with the specific gaps. Only start the review loop once you have verified the story is complete and green. This gate is the point of splitting the roles — the implementer builds, the lead confirms.
@@ -77,7 +78,19 @@ Dispatch **two reviewers in parallel** on the story's diff, in a single message:
 
 They are independent on purpose: a single reviewer juggling spec + quality + tests under-weights security, which is how a committed credential slips through. Merge both reviews.
 
-**Fixes are implementation — delegate the substantive ones.** For findings that need a test or non-trivial logic, re-dispatch `story-implementer` **in fix mode**: hand it the merged Critical/Important findings and tell it this is a fix pass (address the findings, add a regression test red→green for any real bug/security finding, report just that — not the full story matrix). Then **re-run the step 5 verification gate** on its fixes and re-review until both reviewers come back clean.
+**Fixes are implementation — delegate the substantive ones.** For findings that need a test or non-trivial logic, re-dispatch `story-implementer` **in fix mode**: hand it the findings and tell it this is a fix pass (address them, add a regression test red→green for any real bug/security finding, report just that — not the full story matrix). Then **re-run the step 5 verification gate** on its fixes and re-review.
+
+**A fix pass carries Critical and Important findings only.** Minors do not go in. Batch them into a single cleanup pass at the end, or drop them — say which. This is the single biggest lever on how long a story takes: a brief carrying twenty-odd items is not a fix pass, it is a second story, and it will be implemented like one.
+
+**Keep the brief proportional.** State the findings, the reproduction, and the expected fix. Then state the constraint explicitly: *only* these findings, no refactors, no relocating shared helpers, no new abstractions, nothing opportunistic — `story-implementer`'s fix mode says the same thing, and the two need to agree. Code added during a fix pass is the least-reviewed code in the change; it lands after the reviewers have read the diff. On this project, scope-expanding fix passes have introduced Criticals worse than the ones they closed.
+
+**Verification between rounds is scoped, not a full re-derivation.** Re-running everything the implementer already ran is near-zero yield. What actually catches problems:
+
+- **Reproduce each Critical yourself** — before the fix (confirm the finding is real) and after (confirm it is closed). Reviewers are wrong often enough that this is not optional.
+- **Mutation-test the changed guards** — neuter each one and confirm a specific test fails. This is the highest-value check available to you: it catches guards that are dead, vacuous, or passing for the wrong reason, including in your own fixes.
+- **One full suite run**, and confirm the diff matches the report.
+
+**Cap the loop, and escalate with a cost estimate.** If a second review round finds new Criticals — especially ones introduced by the previous fix pass — stop and go to the user before starting a third. Report what has been found, what it has cost so far, and the options: keep iterating, ship with the finding documented, or have you apply the fix directly. A loop that keeps finding real Criticals is not evidence the loop is working; it is usually evidence the story was too big or the briefs are too broad, and that is the user's call to make, not yours.
 
 Small, obvious one-line corrections you may apply directly rather than round-tripping an agent — that latitude is for trivia only (a rename, a typo, a missing null-check with no behavior to test), not for anything a reviewer would want to see a test for. (Keep this loop — it catches real issues before the PR.)
 
