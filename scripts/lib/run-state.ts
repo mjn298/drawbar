@@ -46,10 +46,17 @@ export interface InFlight {
   agent_dispatched_at: string;
 }
 
-export interface MergedEntry {
+// PCO-365 (R2): the stacked-PR redesign replaces `merged: Record<story, MergedEntry>` with an
+// ORDERED array — a stack is a sequence, not a set, and `stack[i-1].branch` is exactly what
+// `resolveBase` (scripts/lib/stack.ts) uses to base story i. No `sha` field: chain integrity
+// is re-derived live from `git` (`assertChainIntact`) rather than pinned to a recorded commit,
+// so a legitimate rebase of an unflagged predecessor doesn't require a state-file rewrite.
+export interface StackEntry {
+  story: string;
+  branch: string;
   pr: number;
-  merge_sha: string;
-  status: string;
+  base: string;
+  flagged: boolean;
 }
 
 // The pinned schema (Locked 12), written literally.
@@ -61,14 +68,16 @@ export interface RunState {
   snapshot: string[];
   stories_done: string[];
   in_flight: InFlight | null;
-  merged: Record<string, MergedEntry>;
+  stack: StackEntry[];
   subissues_filed: string[];
   resolved_config: ResolvedConfig;
 }
 
 // Exactly these ten keys — no more, no fewer. Declared once so the missing/unknown-key
-// checks below cannot drift from the type declaration above.
-const REQUIRED_KEYS = [
+// checks below cannot drift from the type declaration above. Exported so
+// `scripts/plugin.test.ts` can assert the runbook's §0 doc block declares this exact key set,
+// rather than the two drifting independently (PCO-365).
+export const REQUIRED_KEYS = [
   "arg",
   "invoked_as",
   "started_at",
@@ -76,13 +85,13 @@ const REQUIRED_KEYS = [
   "snapshot",
   "stories_done",
   "in_flight",
-  "merged",
+  "stack",
   "subissues_filed",
   "resolved_config",
 ] as const;
 
 const IN_FLIGHT_KEYS = ["story", "agent_dispatched_at"] as const;
-const MERGED_ENTRY_KEYS = ["pr", "merge_sha", "status"] as const;
+const STACK_ENTRY_KEYS = ["story", "branch", "pr", "base", "flagged"] as const;
 // The three OBSERVED facts `resolvedConfig()` (ship-config.ts) attaches alongside the six
 // configured keys — validated here structurally, without inventing a parallel `ResolvedConfig`
 // parser: the six configured keys are validated by reusing `parseShipConfig` itself below.
@@ -98,8 +107,9 @@ export type ParseReason =
   | "invalid_snapshot"
   | "invalid_stories_done"
   | "invalid_in_flight"
-  | "invalid_merged"
-  | "invalid_merged_entry"
+  | "invalid_stack"
+  | "invalid_stack_entry"
+  | "legacy_merged_key"
   | "invalid_subissues_filed"
   | "invalid_resolved_config"
   | "invalid_in_flight_timestamp"
@@ -144,43 +154,37 @@ function isSafePathSegment(v: unknown): v is string {
   return !v.includes("/") && !v.includes("\\") && !v.includes("..");
 }
 
-const MERGE_SHA_SHAPE = /^[0-9a-f]{7,40}$/;
-
 function fail(reason: ParseReason, detail: string): { ok: false; reason: ParseReason; detail: string } {
   return { ok: false, reason, detail };
 }
 
-// Validates a `merged` entry against exactly `{pr, merge_sha, status}` — no more, no fewer.
+// Validates a `stack` entry against exactly `{story, branch, pr, base, flagged}` — no more,
+// no fewer (PCO-365).
 //
-// `merge_sha` (fix pass, IMPORTANT 6): checked against a hex-shape regex
-// (`/^[0-9a-f]{7,40}$/`) — NOT pinned to exactly 40 characters. The two observed fixtures
-// disagreed on abbreviated-sha length (9 vs 8 chars), so pinning a specific length would
-// refuse one legitimate shape or the other for no structural reason; a hex-shape check still
-// closes the endpoint-injection gap (`merge_sha` used to admit `"../../HEAD"` outright).
+// `branch`/`base` reach a `git -C <projectDir> ...` argv in `scripts/lib/stack.ts`'s
+// `assertChainIntact` — `isValidRefName` (ship-config.ts) gates both, same discipline
+// `resolved_config.baseBranch` already gets below (MUST-CHECK
+// endpoint-injection-not-just-command-injection).
 //
-// S6/PCO-351 resolution (Locked 10): this PARSE-time shape stays permissive on purpose, so
-// `parseRunState` can still read the two legacy run-state files (abbreviated 8/9-char shas)
-// without refusing them outright. The strict, record-TIME assertion — exactly 40 hex
-// characters, and the full merge-commit oid rather than the PR head sha — belongs to whatever
-// call site ever WRITES a fresh `merge_sha`. A future pass MAY choose to tighten this parser
-// too once every legacy file has been migrated; until then, tightening it here would make
-// `parseRunState` refuse state files it must still be able to read.
+// `pr`: must be a positive integer — `0`, negative values, and non-integers (`1.5`) are all
+// refused, same discipline the deleted `isValidMergedEntry` applied to its own `pr` field.
 //
-// `pr` (fix pass, IMPORTANT 6): must be a positive integer — `0`, negative values, and
-// non-integers (`1.5`) were all previously admitted.
-function isValidMergedEntry(v: unknown): v is MergedEntry {
+// `flagged`: strictly boolean — the string `"true"` is not the boolean `true`.
+function isValidStackEntry(v: unknown): v is StackEntry {
   if (typeof v !== "object" || v === null || Array.isArray(v)) return false;
   const obj = v as Record<string, unknown>;
-  for (const key of MERGED_ENTRY_KEYS) {
+  for (const key of STACK_ENTRY_KEYS) {
     if (!(key in obj)) return false;
   }
-  const known: readonly string[] = MERGED_ENTRY_KEYS;
+  const known: readonly string[] = STACK_ENTRY_KEYS;
   for (const key of Object.keys(obj)) {
     if (!known.includes(key)) return false;
   }
+  if (!isNonEmptyString(obj.story)) return false;
+  if (typeof obj.branch !== "string" || !isNonEmptyString(obj.branch) || !isValidRefName(obj.branch)) return false;
+  if (typeof obj.base !== "string" || !isNonEmptyString(obj.base) || !isValidRefName(obj.base)) return false;
   if (typeof obj.pr !== "number" || !Number.isInteger(obj.pr) || obj.pr <= 0) return false;
-  if (typeof obj.merge_sha !== "string" || !MERGE_SHA_SHAPE.test(obj.merge_sha)) return false;
-  if (!isNonEmptyString(obj.status)) return false;
+  if (typeof obj.flagged !== "boolean") return false;
   return true;
 }
 
@@ -237,6 +241,18 @@ export function parseRunState(text: string): ParseResult {
     return fail("not_object", "run-state root must be a JSON object");
   }
   const obj = parsed as Record<string, unknown>;
+
+  // PCO-365 (R2): checked BEFORE the generic missing/unknown-key loops below, and regardless
+  // of whether `stack` is also present — a state file predating the merged->stack migration
+  // must never be diagnosed as an ordinary missing_key (`stack` absent) or unknown_key
+  // (`merged` present alongside a since-added `stack`); both are the SAME defect from an
+  // operator's point of view and deserve the one recognizable reason.
+  if ("merged" in obj) {
+    return fail(
+      "legacy_merged_key",
+      "run-state carries a legacy `merged` key — this state file predates the stacked-PR migration (merged -> stack) and cannot be read; recreate the run or migrate the file by hand.",
+    );
+  }
 
   for (const key of REQUIRED_KEYS) {
     if (!(key in obj)) {
@@ -299,12 +315,14 @@ export function parseRunState(text: string): ParseResult {
     }
   }
 
-  if (typeof obj.merged !== "object" || obj.merged === null || Array.isArray(obj.merged)) {
-    return fail("invalid_merged", "merged must be an object keyed by story id");
+  // `stack` is an ORDERED array (a set could not represent "story i's predecessor"), never an
+  // object — the pre-migration `merged` shape used to be keyed by story id.
+  if (!Array.isArray(obj.stack)) {
+    return fail("invalid_stack", "stack must be an array of {story, branch, pr, base, flagged} entries");
   }
-  for (const [storyId, entry] of Object.entries(obj.merged as Record<string, unknown>)) {
-    if (!isValidMergedEntry(entry)) {
-      return fail("invalid_merged_entry", `merged["${storyId}"] must be exactly {pr, merge_sha, status}`);
+  for (let i = 0; i < obj.stack.length; i++) {
+    if (!isValidStackEntry(obj.stack[i])) {
+      return fail("invalid_stack_entry", `stack[${i}] must be exactly {story, branch, pr, base, flagged}`);
     }
   }
 
@@ -326,7 +344,7 @@ export function parseRunState(text: string): ParseResult {
       snapshot: obj.snapshot as string[],
       stories_done: obj.stories_done as string[],
       in_flight: obj.in_flight as InFlight | null,
-      merged: obj.merged as Record<string, MergedEntry>,
+      stack: obj.stack as StackEntry[],
       subissues_filed: obj.subissues_filed as string[],
       resolved_config: obj.resolved_config as ResolvedConfig,
     },
