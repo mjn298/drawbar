@@ -123,7 +123,17 @@ KB="$ENV_DIR/.drawbar/memory"
 # clean, `merge=union`-covered, and carrying a `.drawbar/runs/.gitignore`. Delegated whole to
 # `kb-sync.ts preflight` — no second, hand-copied bash implementation of any of its three
 # assertions here (single-implementation-site regression discipline).
+# `--config-path` is REQUIRED and is the TRUST ROOT for `--env-dir`: kb-sync.ts re-reads the
+# operator-authored config itself (via ship-config.ts's `parseShipConfig`) and refuses unless
+# the config's `envDir` equals the `--env-dir` it was handed — so a wrong or planted `$ENV_DIR`
+# cannot reach a single `git -C` call. It also pins WHICH file may vouch (the one this
+# environment's own `$DRAWBAR_SHIP_CONFIG`/`$PWD` resolve to) and re-runs the tracked-config
+# refusal above with its own injected runner, so naming a planted config as its own trust root is
+# refused too. `$CONFIG_REAL` (not `$CONFIG`) is passed because the flag requires a clean absolute
+# path and `DRAWBAR_SHIP_CONFIG` may legitimately be relative; the module compares the two
+# symlink-resolved, so both forms agree.
 bun run "${CLAUDE_PLUGIN_ROOT}/scripts/lib/kb-sync.ts" preflight --env-dir "$ENV_DIR" --dir "$KB" \
+    --config-path "$CONFIG_REAL" \
   || { echo "FATAL: kb-sync.ts preflight refused — see stderr above for the specific reason."; exit 1; }
 ```
 
@@ -621,11 +631,51 @@ continuing silently (F8: the old loop's `break` fired only on success, so total 
 printed nothing and execution continued anyway).
 
 ```bash
-RESOLVED="<Preflight's resolved_config JSON>"     # separate Bash invocation from Preflight's — no shell state survives across tool calls, so re-declared
+: "${CLAUDE_PLUGIN_ROOT:?CLAUDE_PLUGIN_ROOT must be set}"
+
+# --- the trust root, re-derived here (separate Bash invocation from Preflight's — no shell
+# --- state survives across tool calls, so $CONFIG must be re-declared, not remembered) -------
+#
+# $CONFIG is re-resolved from $PWD here, so BOTH of Preflight's guards run again, verbatim —
+# MUST-CHECK cross-invocation-guard-applies-per-variable-not-per-fence: the re-declare-AND-assert
+# discipline applies to every variable a later fence re-derives, and $CONFIG's assertion IS the
+# tracked-config refusal. §6 runs AFTER §4/§5's branch work, so "Preflight already checked" does
+# not cover a `.drawbar/ship.config.json` that appears mid-run, and this fence's $PWD need not be
+# Preflight's. Dropping the guards lets a branch under review plant a config and feed its own
+# `envDir` into `--env-dir` and `git -C`; an equality guard does not help, because both sides then
+# agree — on the attacker's directory. (The tracked-config refusal keeps Preflight's
+# `&& { ... } || true` shape deliberately: it is the same guard, not a reworded copy of it, and it
+# is asked about the symlink-resolved path for the reason Preflight's copy spells out.)
+#
+# Cross-reference: this fallback duplicates ship-config.ts's `resolveConfigPath` and Preflight's
+# own copy of it — keep all three in sync if the default location or the env-var name changes.
+# If DRAWBAR_SHIP_CONFIG is used at all it must be EXPORTED, not merely set in this fence:
+# kb-sync.ts re-derives the same default from the environment IT inherits and refuses a
+# `--config-path` that disagrees.
+CONFIG="${DRAWBAR_SHIP_CONFIG:-$PWD/.drawbar/ship.config.json}"
+[ -f "$CONFIG" ] || { echo "FATAL: no config at $CONFIG — copy .drawbar/ship.config.example.json, fill in real values, and either place the copy there or set DRAWBAR_SHIP_CONFIG to point at it."; exit 1; }
+CONFIG_REAL=$(readlink -f "$CONFIG") || { echo "FATAL: cannot resolve $CONFIG to a real path — refusing."; exit 1; }
+git -C "$(dirname "$CONFIG_REAL")" ls-files --error-unmatch "$CONFIG_REAL" >/dev/null 2>&1 \
+  && { echo "FATAL: $CONFIG is tracked by git — a committed ship config is never trusted. Untrack it (git rm --cached) and keep it out of version control."; exit 1; } \
+  || true
+
+RESOLVED="<Preflight's resolved_config JSON>"     # re-declared for the same reason
 ENV_DIR=$(echo "$RESOLVED" | jq -r '.envDir // empty')
 [ -n "$ENV_DIR" ] && [ "$ENV_DIR" != "null" ] || { echo "FATAL: ENV_DIR is empty or null after validation — refusing."; exit 1; }
+# The non-emptiness check above is a typo guard, NOT a security boundary, and this fence no
+# longer pretends otherwise. `$RESOLVED` is a prose placeholder THIS MODEL fills in from its own
+# context, so `$ENV_DIR` is agent-held mutable state, and it reaches `git -C` inside kb-sync.ts —
+# an arbitrary-code-execution sink (git reads the named directory's own repository config, which
+# supplies `core.sshCommand` on a pull and a `reference-transaction` hook on a successful push). What
+# actually contains that is `--config-path` below: kb-sync.ts parses $CONFIG_REAL with
+# ship-config.ts's `parseShipConfig` and REFUSES unless the config's `envDir` equals the
+# `--env-dir` it was handed. That equality is only worth anything because the module also pins
+# WHICH file may vouch — it must be the one this environment's own $DRAWBAR_SHIP_CONFIG/$PWD
+# resolve to, and it must not be tracked by git — so naming a planted config as its own trust root
+# no longer works. The guards above are this fence's half of that: they refuse a tracked config
+# before it is ever passed, and they are the reason a `--config-path` reaching the module has
+# already been checked twice.
 KB="$ENV_DIR/.drawbar/memory"
-: "${CLAUDE_PLUGIN_ROOT:?CLAUDE_PLUGIN_ROOT must be set}"
 STORY="<TEAM>-####"      # the story this iteration shipped
 
 # The report's `lessons` array, as JSON — the same shape `drawbar-kb add` accepts per entry,
@@ -636,7 +686,8 @@ LESSONS_JSON='{"lessons":<the report'"'"'s lessons array, JSON>}'
 # Fail CLOSED on every one of: a non-zero exit from the module itself, or unparseable/empty
 # stdout.
 SYNC_JSON=$(echo "$LESSONS_JSON" | bun run "${CLAUDE_PLUGIN_ROOT}/scripts/lib/kb-sync.ts" sync \
-              --env-dir "$ENV_DIR" --dir "$KB" --message "kb: $STORY sync")
+              --env-dir "$ENV_DIR" --dir "$KB" --message "kb: $STORY sync" \
+              --config-path "$CONFIG_REAL")
 SYNC_EXIT=$?
 [ "$SYNC_EXIT" -eq 0 ] || { echo "REFUSING: kb-sync.ts sync exited $SYNC_EXIT — see stderr above ($SYNC_JSON)"; exit 1; }
 SYNC_OK=$(echo "$SYNC_JSON" | jq -r 'if (type=="object" and has("ok")) then .ok else "unparseable" end' 2>/dev/null)

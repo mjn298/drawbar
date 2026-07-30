@@ -3442,3 +3442,112 @@ describe("PCO-367 R4: the story-lead takes a base branch, opens no PR, returns o
     expect(s5()).toContain("Your caller files them in Linear.");
   });
 });
+
+// --- PCO-371 R7: §6 re-runs BOTH of Preflight's $CONFIG guards, verbatim -----------------------
+//
+// §6 newly re-resolves `CONFIG="${DRAWBAR_SHIP_CONFIG:-$PWD/.drawbar/ship.config.json}"` and hands
+// it to kb-sync.ts as the TRUST ROOT for an arbitrary-code-execution sink (`git -C $ENV_DIR`), but
+// shipped with only `[ -f ]` and `readlink -f` — the tracked-config refusal was missing. §4's own
+// comment states the consequence for exactly this scenario: "Dropping them lets a branch under
+// review plant `.drawbar/ship.config.json` and feed its own `projectDir` into `--project-dir` and
+// `git -C`; an equality guard does not help, because both sides then agree — on the attacker's
+// directory."
+//
+// "Preflight already checked" is not an answer: §6 is a separate Bash tool call whose `$PWD` need
+// not match Preflight's, it runs AFTER §4/§5's branch work (so a config can appear mid-run), and
+// crash-recovery paths re-enter mid-runbook. MUST-CHECK config-file-must-not-be-tracked-by-git and
+// MUST-CHECK cross-invocation-guard-applies-per-variable-not-per-fence.
+//
+// Derived from Preflight's text rather than hand-copied here, exactly like the §4 pin above, so
+// "the same guard" is a fact this test establishes instead of a claim a comment makes.
+describe("PCO-371 R7: §6's $CONFIG guards are Preflight's, byte-identically", () => {
+  function shipDoc(): string {
+    return readNonEmpty(join(root, "commands/drawbar-ship.md"));
+  }
+
+  // The ONE bash fence in §6.
+  function sectionSixFence(): string {
+    for (const m of ["## 6. Capture and sync knowledge", "## 7. Advance"]) assertOccursOnce(m);
+    const txt = shipDoc();
+    const start = txt.indexOf("## 6. Capture and sync knowledge");
+    const end = txt.indexOf("## 7. Advance", start);
+    expect(end, "§7 heading not found after §6").toBeGreaterThan(start);
+    const fences = [...txt.slice(start, end).matchAll(/```bash\n([\s\S]*?)```/g)].map((m) => m[1]!);
+    expect(fences.length, "§6 must carry exactly one bash fence").toBe(1);
+    return fences[0]!;
+  }
+
+  function preflightFenceR7(): string {
+    const txt = shipDoc();
+    const sectionStart = txt.indexOf("## Preflight (halt on any failure)");
+    expect(sectionStart, "Preflight heading not found").toBeGreaterThan(-1);
+    const fenceStart = txt.indexOf("```bash", sectionStart);
+    const fenceEnd = txt.indexOf("```", fenceStart + 7);
+    expect(fenceEnd).toBeGreaterThan(fenceStart);
+    return txt.slice(fenceStart + 7, fenceEnd);
+  }
+
+  // Exactly one line starting with `prefix` — a SECOND assignment further down would silently
+  // overwrite the pinned one, and a `toContain` on the first would never notice.
+  function oneLineR7(block: string, prefix: string, label: string): string {
+    const hits = block.split("\n").filter((l) => l.startsWith(prefix));
+    expect(hits.length, `${label}: expected exactly one line starting with ${JSON.stringify(prefix)}, found ${hits.length}`).toBe(1);
+    return hits[0]!;
+  }
+
+  const trackedPrefix = 'git -C "$(dirname "$CONFIG_REAL")" ls-files --error-unmatch';
+
+  function trackedGuard(block: string, label: string): string {
+    const lines = block.split("\n");
+    const start = lines.findIndex((l) => l.startsWith(trackedPrefix));
+    expect(start, `${label}: tracked-config guard not found`).toBeGreaterThan(-1);
+    const end = lines.findIndex((l, i) => i >= start && l.trim() === "|| true");
+    expect(end, `${label}: tracked-config guard's '|| true' not found`).toBeGreaterThan(start);
+    return lines.slice(start, end + 1).join("\n");
+  }
+
+  test("CRITICAL: §6 carries the tracked-config refusal at all", () => {
+    // The pin the R5 diff added (kb-sync.test.ts, "§6 re-declares CONFIG") only asserted that the
+    // string `CONFIG_REAL` appears, so it passed with BOTH guards absent. This is the assertion
+    // that does not.
+    const f = sectionSixFence();
+    expect(f).toContain(trackedPrefix);
+  });
+
+  test("all four lines are Preflight's, byte for byte", () => {
+    const f = sectionSixFence();
+    const pf = preflightFenceR7();
+    expect(oneLineR7(f, 'CONFIG="${DRAWBAR_SHIP_CONFIG', "§6's CONFIG resolution")).toBe(
+      oneLineR7(pf, 'CONFIG="${DRAWBAR_SHIP_CONFIG', "Preflight's CONFIG resolution"),
+    );
+    expect(oneLineR7(f, '[ -f "$CONFIG" ]', "§6's config-file-existence guard")).toBe(
+      oneLineR7(pf, '[ -f "$CONFIG" ]', "Preflight's config-file-existence guard"),
+    );
+    // The symlink resolution is part of the guard, not a convenience: a committed directory symlink
+    // otherwise makes `--error-unmatch` exit 1 for a config that IS committed, and the refusal
+    // never fires. Pinned on both sides so §6 cannot keep the `git -C` line while dropping the
+    // resolution it depends on.
+    expect(oneLineR7(f, "CONFIG_REAL=", "§6's config path resolution")).toBe(
+      oneLineR7(pf, "CONFIG_REAL=", "Preflight's config path resolution"),
+    );
+    expect(trackedGuard(f, "§6")).toBe(trackedGuard(pf, "Preflight"));
+  });
+
+  test("the guards run BEFORE the two things that consume $CONFIG_REAL", () => {
+    const f = sectionSixFence();
+    expect(f.indexOf("CONFIG_REAL=")).toBeLessThan(f.indexOf(trackedPrefix));
+    // ...and before the kb-sync invocation whose --config-path they protect.
+    const syncCall = f.indexOf('kb-sync.ts" sync');
+    expect(syncCall, "§6's kb-sync sync invocation not found").toBeGreaterThan(-1);
+    expect(f.indexOf(trackedPrefix)).toBeLessThan(syncCall);
+  });
+
+  test("§6 states that DRAWBAR_SHIP_CONFIG must be EXPORTED, because the module re-derives the anchor", () => {
+    // kb-sync.ts's trust root refuses a `--config-path` that disagrees with what
+    // `resolveConfigPath` derives from the environment IT inherits — so a DRAWBAR_SHIP_CONFIG that
+    // is set but not exported makes every run refuse `config_path_not_anchored`. That operational
+    // consequence has to be written down where the operator will see it.
+    const f = sectionSixFence();
+    expect(f).toContain("EXPORTED");
+  });
+});
