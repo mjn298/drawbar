@@ -13,7 +13,13 @@ Implement one story, test-first. The **Opus lead** orchestrates: it takes the st
 ```bash
 command -v drawbar-kb >/dev/null 2>&1 || { echo "drawbar-kb not found — run /drawbar-setup"; exit 1; }
 [ -d "$PWD/.drawbar/memory" ] || { echo "no .drawbar/memory — run /drawbar-setup"; exit 1; }
+command -v linear >/dev/null 2>&1 || echo "WARNING: no \`linear\` CLI — every review will report spec_source: \"brief\" and no story can come back clean"
 ```
+
+The `linear` warning is a warning and not an exit on purpose: a brief-sourced review is degraded but
+honest, and §6 already refuses to treat it as a clean pass. What the operator must never have to
+guess is *why* every story came back caveated — "this machine has no CLI" and "this story has real
+caveats" are the same output without this line.
 
 ## 1. Pick the story
 
@@ -76,7 +82,13 @@ Dispatch **two reviewers in parallel** on the story's diff, in a single message:
 - `code-reviewer` — spec compliance, code quality, and tests (pass it the acceptance criteria).
 - `security-reviewer` — security only: committed secrets/credentials, authz/tenant isolation, injection, data exposure (pass it the `.drawbar/memory` path so it can recall `MUST-CHECK security` constraints).
 
-They are independent on purpose: a single reviewer juggling spec + quality + tests under-weights security, which is how a committed credential slips through. Merge both reviews.
+Pass both the project directory as `$PROJECT_DIR`: each pins the commit it read with `git -C "$PROJECT_DIR" rev-parse HEAD`, and a subagent's working directory is not guaranteed to be the project's. Tell both that the diff they are reading is **uncommitted** — step 4 told the implementer not to commit and step 8 is where the first commit happens — so the sha they capture names the commit this work sits on top of and none of the work itself, which is exactly what their own contract says to report and to say plainly.
+
+They are independent on purpose: a single reviewer juggling spec + quality + tests under-weights security, which is how a committed credential slips through. Merge both reviews — by `dedup_key`, not by hand: two findings sharing one `dedup_key` are one finding, and every collapse you make is named in the report so a duplicate is never dropped silently.
+
+**A malformed reviewer report is not an approval — treat it as a failed review.** A report is malformed when it omits `spec_source`, omits `reviewed_sha`, carries a finding without a `dedup_key`, or — from the security-reviewer alone, whose contract is the only one that defines the field — returns an empty `findings` list alongside an empty or absent `checked`. `agents/security-reviewer.md` says that last payload is malformed and that its caller must treat it as one; **you are that caller**, and this is where that obligation is discharged. An empty finding list from a reviewer that cannot say what it read is indistinguishable from a reviewer that never ran, so it does not count toward the two reviews this step requires: do not open a PR on the strength of it, and stop and tell the user which reviewer returned what.
+
+**A reviewer reporting `spec_source: "brief"` reviewed a summary, not the spec.** It could not reach Linear, so an AMENDED banner, a superseded section, or a struck decision in the story's description was invisible to it and the design it approved may already have been replaced. Say so in your report and in the PR body; never treat that review as a clean pass.
 
 **Fixes are implementation — delegate the substantive ones.** For findings that need a test or non-trivial logic, re-dispatch `story-implementer` **in fix mode**: hand it the findings and tell it this is a fix pass (address them, add a regression test red→green for any real bug/security finding, report just that — not the full story matrix). Then **re-run the step 5 verification gate** on its fixes and re-review.
 

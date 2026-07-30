@@ -1633,7 +1633,16 @@ describe("PCO-366 R3: ship §4/§5 — open the stacked PR, leave In Progress, p
   test("§4 restricts '## Unresolved findings' to sub-issue ids and titles only, never the finding body/file:line/quoted source", () => {
     expect(s4()).toContain(
       "names each surviving finding by its filed sub-issue id and title only — never the " +
-        "finding body, `file:line`, or a quoted source excerpt",
+        "finding body, `file:line`, a finding's `dedup_key` or any of its `file` / `line` / " +
+        "`claim_hash` fields, or a quoted source excerpt",
+    );
+    // `dedup_key` is named because PCO-376 added a SECOND carrier of the same location, in
+    // structured form. A ban enumerating only `file:line` and "the finding body" is a ban on one
+    // spelling: a serializer that drops `detail` and emits the key publishes the location anyway.
+    expect(s4()).toContain(
+      "The `dedup_key` is named here beside `file:line` because it is the same location in " +
+        "structured form: a serializer that drops `detail` and emits the key has published the " +
+        "location anyway, and a ban worded against one spelling is not a ban on the field.",
     );
   });
 
@@ -2378,8 +2387,8 @@ describe("PCO-370 R3b: §4's executable stacked-PR fence", () => {
     expect(body.replace(/\s+/g, " ")).toContain(
       "On a flagged story it is written out here with its `## Unresolved findings` section " +
         "already in it, listing each surviving finding as `<SUB-ISSUE-ID> — <sub-issue title>` " +
-        "and nothing else: never the finding body, never a `file:line`, never a quoted source " +
-        "excerpt.",
+        "and nothing else: never the finding body, never a `file:line`, never a `dedup_key` or " +
+        "any of its fields, never a quoted source excerpt.",
     );
   });
 
@@ -3270,9 +3279,13 @@ describe("PCO-367 R4: the story-lead takes a base branch, opens no PR, returns o
     const body = report();
     expect(body).not.toContain("can write them into the pull request body");
     expect(body).toContain(
-      "**`detail` is for your caller's eyes, not for verbatim republication:** it carries " +
-        "`file:line` and the specifics of a defect nobody has patched, the pull request is " +
-        "public, and it is opened before any human has reviewed the story.",
+      "**`detail` and `dedup_key` are both for your caller's eyes, not for verbatim " +
+        "republication:** `detail` carries `file:line` and the specifics of a defect nobody has " +
+        "patched, and `dedup_key` carries the same `file` and `line` in structured form, so a " +
+        "serializer that skips `detail` and emits the key has published the location anyway.",
+    );
+    expect(body).toContain(
+      "The pull request is public, and it is opened before any human has reviewed the story.",
     );
   });
 
@@ -4718,17 +4731,43 @@ function docSection(relPath: string, heading: string): string {
 // allowlist, not a scan for bad ones: the closed pins below cover what is INSIDE the rubric and
 // Output sections, and this covers the remaining move — bolting a whole new section onto the file
 // to say what those sections are no longer allowed to say.
+// PCO-374/375/376. Shared with the three describes at the bottom of this file: the two reviewer
+// docs carry these units byte-identically by design (each agent runs alone and neither reads the
+// other), so they are declared once and asserted equal in both files.
+const SPEC_SOURCE_BULLET =
+  "- **`spec_source` (required):** `cli` or `brief` — the source you actually read.";
+const REVIEWED_SHA_BULLET =
+  "- **`reviewed_sha` (required):** the full commit sha you captured before reading the diff.";
+const MALFORMED_SENTENCE =
+  "**A report that omits `spec_source`, omits `reviewed_sha`, or carries a finding without a " +
+  "`dedup_key` is malformed, and your caller must treat it as one** — not as an approval, and not " +
+  "as a review that happened.";
+
+const PROJECT_DIR_BULLET =
+  "- The project directory as `$PROJECT_DIR` — every git command you run is anchored to it with " +
+  "`git -C`, because the directory you happen to start in is not guaranteed to be the project's.";
+
+const SPEC_HEADING = "## Read the spec from Linear first (hard precondition)";
+const SHA_HEADING = "## Pin the commit you reviewed";
+const DEDUP_HEADING = "## Every finding carries a dedup key";
+
 const REVIEWER_SECTIONS: Record<string, string[]> = {
   "agents/code-reviewer.md": [
     "## Inputs you are given",
+    SPEC_HEADING,
+    SHA_HEADING,
     "## What to do",
     "## A test that cannot fail is Critical (must fix)",
+    DEDUP_HEADING,
     "## Output (return to the caller — do NOT write to Linear)",
   ],
   "agents/security-reviewer.md": [
     "## Inputs you are given",
+    SPEC_HEADING,
+    SHA_HEADING,
     "## What to do",
     "## A test that cannot fail is Critical (must fix)",
+    DEDUP_HEADING,
     "## Output (return to the caller — do NOT write to Linear)",
   ],
 };
@@ -4872,13 +4911,18 @@ describe("PCO-372: a test that cannot fail is a must-fix rubric entry in BOTH re
     "agents/code-reviewer.md": [
       OUTPUT_HEADING,
       "- **Spec compliance:** ✅ compliant | ❌ issues (with file:line)",
+      SPEC_SOURCE_BULLET,
+      REVIEWED_SHA_BULLET,
       "- **Critical (must fix):** [findings]",
       "- **Important (should fix):** [findings]",
       "- **Minor:** [findings]",
-      "For each finding: file:line, what's wrong, why it matters, how to fix. Acknowledge strengths briefly first.",
+      MALFORMED_SENTENCE,
+      "For each finding: file:line, what's wrong, why it matters, how to fix, and its `dedup_key`. Acknowledge strengths briefly first.",
     ],
     "agents/security-reviewer.md": [
       OUTPUT_HEADING,
+      SPEC_SOURCE_BULLET,
+      REVIEWED_SHA_BULLET,
       "- **Critical (must fix):** [findings]",
       "- **Important (should fix):** [findings]",
       "- **Minor / hardening:** [findings]",
@@ -4896,8 +4940,9 @@ describe("PCO-372: a test that cannot fail is a must-fix rubric entry in BOTH re
         "`firstName`, `employeeName` or `lastName` — no word boundary fires inside camelCase — and " +
         "never looked for email, phone or ssn at all. The code-reviewer caught it; this report said " +
         "nothing, and nothing was the same shape as everything being fine.",
-      "For each finding: file:line, the exposure, why it matters (attacker capability), and a " +
-        "concrete fix. If you found nothing, say so plainly — do not invent findings to look " +
+      MALFORMED_SENTENCE,
+      "For each finding: file:line, the exposure, why it matters (attacker capability), a " +
+        "concrete fix, and its `dedup_key`. If you found nothing, say so plainly — do not invent findings to look " +
         "thorough. **`checked` exists to make silence accountable, not to make silence " +
         'impossible**, and it is never a reason to manufacture a finding: an entry that says ' +
         '"checked, no exposure, here is the test I read" is a complete answer.',
@@ -5226,4 +5271,1598 @@ describe("PCO-373: an empty findings list must enumerate what was checked", () =
       expect(txt, `${why} in ${SEC}: ${shape}`).not.toMatch(shape);
     }
   });
+});
+
+// =================================================================================================
+// PCO-374 / PCO-375 / PCO-376 — the reviewer report contract.
+//
+// Pinning discipline is the one established above and unchanged: every assertion is
+// whitespace-normalized (MUST-CHECK doc-grep-assertion-must-normalize-whitespace); every phrase pin
+// is ONE contiguous string carrying its qualifiers rather than independent tokens (MUST-CHECK
+// pco352-fixpass-prose-gate-mutation-must-cover-rephrase-not-only-delete); and the load-bearing
+// assertions are CLOSED — `docUnits(...)` reduced to its logical units and compared with `toEqual`,
+// so a carve-out ADDED beside a correct sentence fails exactly as a deletion does.
+//
+// The survivor class this file has measured is not deletion and not rephrase. It is "keep the rule
+// verbatim, then excuse it": PCO-372's own gate found twenty such mutations, and one of them
+// reinstated reviewer discretion using the American spelling `judgment` where the shape list only
+// carried `judgement`. Every shape family below therefore carries both spellings of anything
+// spelled two ways, and every family has a positive control asserting it actually fires — a shape
+// that matches nothing is the inert test rubric entry 2 exists to catch.
+// =================================================================================================
+
+const REVIEWERS_374 = ["agents/code-reviewer.md", "agents/security-reviewer.md"] as const;
+
+function reviewerText(relPath: string): string {
+  return readNonEmpty(join(root, relPath)).replace(/\s+/g, " ");
+}
+
+// A shape family plus the mutation it exists to catch. `hatch` is a positive control: the family is
+// asserted to fire on it, so a family that has silently stopped matching anything fails loudly
+// instead of passing vacuously.
+type Shape = { re: RegExp; why: string; hatch: string };
+
+function assertShapesAbsent(label: string, txt: string, shapes: readonly Shape[]): void {
+  expect(shapes.length, `${label}: no shapes declared — the scan would be vacuous`).toBeGreaterThan(0);
+  for (const { re, why, hatch } of shapes) {
+    expect(re.test(hatch), `${label}: shape for '${why}' does not fire on its own control: ${re}`).toBe(true);
+    expect(txt, `${why} in ${label}: ${re}`).not.toMatch(re);
+  }
+}
+
+describe("PCO-374: the spec is read from Linear, and a brief-sourced review is degraded", () => {
+  const SPEC_UNITS: string[] = [
+    SPEC_HEADING,
+    "The dispatch brief is a summary written before the review, and a summary cannot carry what " +
+      "the spec struck. Read the story's own Linear record before you review anything, trying " +
+      "these sources **in order** and stopping at the first that returns the issue:",
+    "1. `linear issue view <id> -j --no-comments` — the CLI, and the source to prefer.",
+    "2. The dispatch brief you were handed — only when the CLI is absent, errors, or returns no " +
+      "issue.",
+    "**There is no MCP rung in this chain, and its absence is deliberate.** Your frontmatter " +
+      "grants `Read, Grep, Glob, Bash` and no MCP tool of any kind, so a `get_issue` step here " +
+      "would be a source you cannot reach and an attempt you would have to narrate without making " +
+      "— a chain that reads as three sources and degrades in one step is the silent fallback this " +
+      "section exists to stop. Your caller's Preflight is where a missing CLI is made visible " +
+      "instead.",
+    "**Report the source you actually read as `spec_source`: `cli` or `brief`.** Report what " +
+      "answered, never what you tried first — a CLI that errored, leaving you on the dispatch " +
+      "brief, is `brief`.",
+    '**`spec_source: "brief"` is a degraded review, not a normal one.** Open your report with ' +
+      "the caveat, in its first line: the Linear record was unreachable, the brief is a summary, " +
+      "and anything struck or amended after it was written could not have been seen. Your caller " +
+      "treats a degraded review as `flagged`, never `ok`.",
+    "**Scan whatever you read for AMENDED banners, superseded sections, and struck decisions, and " +
+      "surface every one you find** — quote the marker and name the decision it replaces. A " +
+      "description is amended in place, so the banner and the strike-through live in the record " +
+      "and nowhere else: neither survives into a brief written before the amendment, and a " +
+      "reviewer that never reached Linear approves the superseded design and reports it as " +
+      "compliant.",
+  ];
+
+  for (const relPath of REVIEWERS_374) {
+    // The closed pin. Everything this section is allowed to say, and nothing else — the only
+    // assertion here that can see a fourth fallback source, a reordered chain, or an appended
+    // "when Linear is slow, the brief is equivalent" sentence.
+    test(`${relPath}'s spec-read section carries exactly these units and nothing else`, () => {
+      expect(docUnits(docSection(relPath, SPEC_HEADING))).toEqual(SPEC_UNITS);
+    });
+
+    // Diagnostics for the three clauses that carry the story, each as one contiguous phrase so a
+    // demoted qualifier fails here with a name rather than as a diff against the whole section.
+    // The chain is CLI -> brief, and the MCP rung is asserted ABSENT rather than ordered. Both
+    // reviewers declare `tools: Read, Grep, Glob, Bash` and no MCP tool, so a `get_issue` rung is
+    // a source the agent cannot reach: the doc would promise three sources and degrade in one
+    // step, which is the silent fallback PCO-374 exists to stop. The frontmatter is asserted here
+    // beside the chain so re-adding the rung without granting the tool fails, and granting the
+    // tool without re-adding the rung fails too.
+    test(`${relPath} orders the fallback chain CLI, then brief — and stops at the first hit`, () => {
+      const body = docSection(relPath, SPEC_HEADING).replace(/\s+/g, " ");
+      expect(body).toContain("trying these sources **in order** and stopping at the first that returns the issue:");
+      const cli = body.indexOf("1. `linear issue view <id> -j --no-comments`");
+      const brief = body.indexOf(
+        "2. The dispatch brief you were handed — only when the CLI is absent, errors, or returns no issue.",
+      );
+      expect(cli, "the CLI step is missing").toBeGreaterThan(-1);
+      expect(brief, "the brief must come after the CLI step").toBeGreaterThan(cli);
+      expect(body, "no numbered rung beyond the two").not.toMatch(/(?:^|\s)3\.\s/);
+      expect(body).toContain("**There is no MCP rung in this chain, and its absence is deliberate.**");
+      // The reason the rung is gone, tied to the thing that makes it true.
+      const frontmatter = readNonEmpty(join(root, relPath)).match(/^---\n([\s\S]*?)\n---\n/)![1]!;
+      expect(frontmatter, `${relPath}: the frontmatter grants an MCP tool — the dropped rung was justified by its absence`)
+        .not.toMatch(/mcp__/);
+      expect(frontmatter).toContain("tools: Read, Grep, Glob, Bash");
+    });
+
+    test(`${relPath} makes brief-sourced review degraded, caveated, and never \`ok\``, () => {
+      const body = docSection(relPath, SPEC_HEADING).replace(/\s+/g, " ");
+      expect(body).toContain('**`spec_source: "brief"` is a degraded review, not a normal one.**');
+      expect(body).toContain("Your caller treats a degraded review as `flagged`, never `ok`.");
+    });
+
+    // The whole point of PCO-374: the markers a brief cannot carry. Pinned with the consequence
+    // attached — an unattributed "look for AMENDED" reads as tidiness, and the incident is what
+    // makes the reviewer actually go and look.
+    test(`${relPath} requires AMENDED / superseded / struck markers to be surfaced, with the consequence attached`, () => {
+      const body = docSection(relPath, SPEC_HEADING).replace(/\s+/g, " ");
+      expect(body).toContain(
+        "**Scan whatever you read for AMENDED banners, superseded sections, and struck decisions, " +
+          "and surface every one you find** — quote the marker and name the decision it replaces.",
+      );
+      expect(body).toContain(
+        "a reviewer that never reached Linear approves the superseded design and reports it as compliant.",
+      );
+    });
+
+    test(`${relPath} declares \`spec_source\` a required output field`, () => {
+      expect(docUnits(docSection(relPath, "## Output (return to the caller — do NOT write to Linear)")))
+        .toContain(SPEC_SOURCE_BULLET);
+    });
+  }
+
+  test("both reviewers carry a byte-identical spec-read section", () => {
+    const [a, b] = REVIEWERS_374.map((p) => docUnits(docSection(p, SPEC_HEADING)));
+    expect(a).toEqual(SPEC_UNITS);
+    expect(a).toEqual(b);
+  });
+
+  // The backstop for the regions no closed pin covers, in both reviewer docs and in both callers.
+  // Regex FAMILIES, not an enumerated list of spellings: an enumerated blacklist is evaded by the
+  // next synonym, which is the defect the inert-test rubric's entry 4 names.
+  const SPEC_HATCHES: readonly Shape[] = [
+    {
+      re: /\b(?:the\s+)?brief\b[^.]{0,90}\b(?:is|as|are)\s+(?:usually\s+|normally\s+|generally\s+)?(?:fine|ok|okay|acceptable|sufficient|enough|equivalent|authoritative)\b/i,
+      why: "the dispatch brief blessed as a substitute for the spec",
+      hatch: "In practice the brief is usually sufficient, so reading Linear is a formality.",
+    },
+    {
+      re: /\b(?:skip|skipping|bypass|forgo|forego)\b[^.]{0,60}\b(?:linear|spec)\s+(?:read|lookup|fetch|record)\b/i,
+      why: "the Linear read made skippable",
+      hatch: "You may skip the Linear read when the diff is small.",
+    },
+    {
+      re: /`?spec_source`?[^.]{0,120}\b(?:optional|encouraged|nice[- ]to[- ]have|best[- ]effort|aspirational|where\s+practical|if\s+available)\b/i,
+      why: "`spec_source` softened to optional",
+      hatch: "Report `spec_source` where practical.",
+    },
+    {
+      re: /\b(?:degraded|brief)[- ]?(?:sourced\s+)?review\b[^.]{0,90}\b(?:counts|may|can|could)\b[^.]{0,40}\b(?:approval|approved|clean\s+pass|normal\s+one|ok|fine|acceptable)\b/i,
+      why: "a degraded review re-blessed as a normal one",
+      hatch: "A degraded review still counts as a clean pass when nothing was found.",
+    },
+    {
+      re: /\b(?:amended|superseded|struck)\b[^.]{0,90}\b(?:need\s+not|no\s+need\s+to|do\s+not\s+need\s+to)\b/i,
+      why: "the amendment scan made unnecessary",
+      hatch: "AMENDED banners need not be surfaced when the decision looks unchanged.",
+    },
+  ];
+
+  for (const relPath of [...REVIEWERS_374, "agents/drawbar-story-lead.md", "commands/drawbar-work.md"]) {
+    test(`${relPath} nowhere excuses the reviewer from reading the spec`, () => {
+      assertShapesAbsent(relPath, reviewerText(relPath), SPEC_HATCHES);
+    });
+  }
+});
+
+describe("PCO-375: reviewed_sha pins the commit each review actually read", () => {
+  const SHA_UNITS: string[] = [
+    SHA_HEADING,
+    "Capture the commit at the moment you read the diff, before you write a single finding, " +
+      "anchored to the project directory you were handed:",
+    "```bash git -C \"$PROJECT_DIR\" rev-parse HEAD ```",
+    "**Report it in full as `reviewed_sha`.** The fix agent commits after your review returns, so " +
+      "every review is stale by construction, and in a stack that unreviewed delta propagates to " +
+      "every story above this one. Naming the commit turns an invisible gap into a measurable " +
+      "one; it does not earn a second review round, and you will not be given one.",
+    "**A `reviewed_sha` you did not read off the tree you reviewed is worse than none** — it " +
+      "attests to a diff nobody looked at, and the count of commits since is computed from it. An " +
+      "unanchored `git rev-parse HEAD` is that mistake in its quietest form: you are a subagent " +
+      "and your working directory is not guaranteed to be the project's, a sha read out of some " +
+      "other checkout is shape-identical to a real one, and your caller publishes it verbatim in " +
+      "a public pull-request body.",
+    "**When the diff you were handed is not committed, say so rather than pinning a commit that " +
+      "does not contain it.** A caller may dispatch you against an uncommitted working tree, " +
+      "where `HEAD` names the commit the work sits on top of and none of the work itself. Report " +
+      "that commit as `reviewed_sha` and state in your report that the tree you reviewed was " +
+      "uncommitted: the commit the diff is *against* is a true attestation, while the same sha " +
+      "offered as the tree you read is a false one.",
+  ];
+
+  for (const relPath of REVIEWERS_374) {
+    test(`${relPath}'s reviewed-sha section carries exactly these units and nothing else`, () => {
+      expect(docUnits(docSection(relPath, SHA_HEADING))).toEqual(SHA_UNITS);
+    });
+
+    // The literal invocation, on its own line in the RAW section — per MUST-CHECK
+    // prose-pins-dont-cover-the-bash-fence-they-describe, a prose mention of `git rev-parse HEAD`
+    // is satisfied by a sentence that says the caller supplies the sha instead.
+    test(`${relPath} captures the sha with a literal, PROJECT_DIR-anchored git rev-parse HEAD invocation`, () => {
+      expect(docSection(relPath, SHA_HEADING)).toMatch(/^git -C "\$PROJECT_DIR" rev-parse HEAD$/m);
+      // An unanchored invocation reads HEAD out of whatever directory the subagent starts in, and
+      // a foreign sha is shape-identical to a real one once ship §4 publishes it. Pinned as an
+      // absence too, so re-adding the bare form beside the anchored one fails.
+      expect(docSection(relPath, SHA_HEADING)).not.toMatch(/^git rev-parse HEAD$/m);
+      // The anchor is only meaningful if the value is an input the caller supplies.
+      expect(docUnits(docSection(relPath, "## Inputs you are given"))).toContain(PROJECT_DIR_BULLET);
+    });
+
+    test(`${relPath} covers the uncommitted-tree case rather than leaving it unsatisfiable`, () => {
+      const body = docSection(relPath, SHA_HEADING).replace(/\s+/g, " ");
+      expect(body).toContain(
+        "**When the diff you were handed is not committed, say so rather than pinning a commit " +
+          "that does not contain it.**",
+      );
+      expect(body).toContain(
+        "Report that commit as `reviewed_sha` and state in your report that the tree you reviewed was uncommitted",
+      );
+    });
+
+    // Locked C: the residue is made visible, not eliminated. A reviewer that reads this section as
+    // grounds for a re-review is exactly the outcome the Locked decision refuses.
+    test(`${relPath} states the staleness is by construction and earns no second review round`, () => {
+      const body = docSection(relPath, SHA_HEADING).replace(/\s+/g, " ");
+      expect(body).toContain(
+        "The fix agent commits after your review returns, so every review is stale by " +
+          "construction, and in a stack that unreviewed delta propagates to every story above this one.",
+      );
+      expect(body).toContain("it does not earn a second review round, and you will not be given one.");
+    });
+
+    test(`${relPath} declares \`reviewed_sha\` a required output field`, () => {
+      expect(docUnits(docSection(relPath, "## Output (return to the caller — do NOT write to Linear)")))
+        .toContain(REVIEWED_SHA_BULLET);
+    });
+  }
+
+  test("both reviewers carry a byte-identical reviewed-sha section", () => {
+    const [a, b] = REVIEWERS_374.map((p) => docUnits(docSection(p, SHA_HEADING)));
+    expect(a).toEqual(SHA_UNITS);
+    expect(a).toEqual(b);
+  });
+
+  const AGENT_375 = "agents/drawbar-story-lead.md";
+  const SHIP_375 = "commands/drawbar-ship.md";
+  const agent375 = () => readNonEmpty(join(root, AGENT_375)).replace(/\s+/g, " ");
+  const ship375 = () => readNonEmpty(join(root, SHIP_375)).replace(/\s+/g, " ");
+
+  test("the story-lead captures head_sha after the last commit, as a literal invocation and as a stated obligation", () => {
+    const raw = readNonEmpty(join(root, AGENT_375));
+    expect(raw).toContain('git -C "$PROJECT_DIR" rev-parse HEAD');
+    expect(agent375()).toContain(
+      "**Capture the branch head after the last commit, with `git -C \"$PROJECT_DIR\" rev-parse " +
+        "HEAD`, and report it as `head_sha`.**",
+    );
+    // The reason, pinned with the obligation: the caller can only publish the gap if it is handed
+    // both ends, which is what makes `head_sha` load-bearing rather than bookkeeping.
+    expect(agent375()).toContain(
+      "your caller publishes the divergence rather than eliminating it, and it can only do that " +
+        "if you hand it both ends.",
+    );
+  });
+
+  test("the story-lead's §7 schema carries spec_source, reviewed_sha and head_sha, per reviewer where they are per reviewer", () => {
+    const txt = agent375();
+    expect(txt).toContain(
+      '"spec_source": {"code_reviewer": "cli | brief", "security_reviewer": "cli | brief"},',
+    );
+    expect(txt).toContain(
+      '"reviewed_sha": {"code_reviewer": "<full sha>", "security_reviewer": "<full sha>"},',
+    );
+    expect(txt).toContain('"head_sha": "<the branch head you pushed>",');
+  });
+
+  // A per-reviewer attestation the lead filled in itself is a fabricated one, and it is the cheap
+  // way out of the malformed-report rule: invent the missing field rather than park the story.
+  test("the story-lead is forbidden from inferring a reviewer's spec_source or reviewed_sha", () => {
+    expect(agent375()).toContain(
+      "**`spec_source`, `reviewed_sha` and `head_sha` are reported per reviewer and are never " +
+        "inferred.** Copy each reviewer's own values through verbatim; a value you filled in for " +
+        "a reviewer that did not report one is a fabricated attestation, and it is exactly what " +
+        "the malformed-report rule refuses.",
+    );
+    // The zero-divergence case is stated, so an omitted line cannot pass for "not stale".
+    expect(agent375()).toContain(
+      "state both even when they are equal, because an omitted pair reads the same as a review " +
+        "that was never stale.",
+    );
+  });
+
+  // PCO-375's actual deliverable: the divergence is PUBLISHED, not merely recorded. Pinned as one
+  // contiguous phrase covering the trigger (every PR, not only a flagged one), the rendering, and
+  // the derivation of N from the two shas the story-lead reports.
+  test("ship §4 publishes the review-provenance line in every PR body, with N derived from reviewed_sha and head_sha", () => {
+    const txt = ship375();
+    expect(txt).toContain(
+      "**Every PR body opens with a review-provenance line, on a flagged story and a clean one " +
+        "alike**, built before `gh pr create` runs: `reviewed at <reviewed_sha> from " +
+        "<spec_source>; N commits since`, where `<reviewed_sha>` is what the reviewers read, " +
+        "`<spec_source>` is `cli` or `brief` — the source that review actually read the spec from " +
+        "— and `N` is the commit count between the sha and the story-lead's `head_sha`, all three " +
+        "taken from that report.",
+    );
+    // `spec_source` had exactly one occurrence in this whole file before: inside §2's documented
+    // return shape, consumed by nothing. drawbar-work closes that loop ("never treat that review
+    // as a clean pass"); the unattended command that opens the actual public PR did not, so a
+    // review that never read the spec — and is therefore blind to an AMENDED banner, a superseded
+    // section, a struck decision — was indistinguishable from a full one in the PR body.
+    expect(txt).toContain(
+      "**State `<spec_source>` even when it is `cli`** — a review that never reached Linear is " +
+        "blind to an AMENDED banner, a superseded section and a struck decision, and on this " +
+        "unattended path the PR body is the only place a reader can find that out; printing it " +
+        "only when it is `brief` makes its absence the signal, and an absence is what nobody " +
+        "notices at 3am.",
+    );
+    // Neither sha was shape-checked anywhere, and `N`'s derivation was named in no invocation:
+    // the agent would compose an ad-hoc `git rev-list` outside every guard §4 spends four
+    // paragraphs building, on values the story-lead is required to copy through VERBATIM from a
+    // subagent that read a branch under review. The gate killed the "leave the line off" hatch
+    // and left nothing fail-closed in its place; this is that.
+    expect(txt).toContain(
+      "**Shape-check both shas before you build that line, and park the story if either refuses.**",
+    );
+    expect(txt).toContain("Each must match `^[0-9a-f]{40}$`");
+    expect(txt).toContain('`git -C "$PROJECT_DIR" cat-file -e "<sha>^{commit}"`');
+    expect(txt).toContain('`git -C "$PROJECT_DIR" rev-list --count "<reviewed_sha>..<head_sha>"`');
+    expect(txt).toContain(
+      "A sha that is malformed, or that does not resolve here, parks the story with that as the reason",
+    );
+    expect(txt).toContain(
+      "**State `N` even when it is zero** — an omitted line reads exactly like a review that was " +
+        "never stale, which is the claim this line exists to stop anyone making.",
+    );
+    expect(txt).toContain("Where the two reviewers read different shas, name both, one line each.");
+  });
+
+  // The prose above tells the agent what to do; the heredoc is what it actually fills in. Pinning
+  // only the prose is the exact vacuous shape IMPORTANT 9 caught for `## Unresolved findings` —
+  // the rendering instruction was rewritten with the prose pin still green.
+  test("the PR-body heredoc itself carries the review-provenance line as its first line", () => {
+    const raw = readNonEmpty(join(root, SHIP_375));
+    const open = raw.indexOf("cat > \"$PR_BODY_FILE\" <<'DRAWBAR_PR_BODY_SENTINEL'\n");
+    expect(open, "the PR-body heredoc is missing").toBeGreaterThan(-1);
+    const bodyStart = open + "cat > \"$PR_BODY_FILE\" <<'DRAWBAR_PR_BODY_SENTINEL'\n".length;
+    const close = raw.indexOf("\nDRAWBAR_PR_BODY_SENTINEL", bodyStart);
+    expect(close, "the PR-body heredoc is unterminated").toBeGreaterThan(bodyStart);
+    const body = raw.slice(bodyStart, close).replace(/\s+/g, " ");
+    expect(body.length, "the PR-body heredoc is empty").toBeGreaterThan(80);
+    expect(body).toContain(
+      "Its first line is the review-provenance line `reviewed at <reviewed_sha> from " +
+        "<spec_source>; N commits since`, with both shas already shape-checked and resolved per " +
+        "the prose above.",
+    );
+    // And the finding-9 disclosure rule it sits next to is untouched by this addition.
+    expect(body).toContain("On a flagged story it is written out here with its `## Unresolved findings` section");
+  });
+
+  const SHA_HATCHES: readonly Shape[] = [
+    {
+      re: /`?reviewed_sha`?[^.]{0,120}\b(?:optional|encouraged|nice[- ]to[- ]have|best[- ]effort|aspirational|where\s+practical|if\s+available)\b/i,
+      why: "`reviewed_sha` softened to optional",
+      hatch: "Include `reviewed_sha` where practical.",
+    },
+    {
+      re: /\b(?:head_sha|reviewed_sha)\b[^.]{0,90}\b(?:may|can|could)\s+be\s+(?:inferred|assumed|reconstructed|derived\s+by\s+the\s+caller)\b/i,
+      why: "a sha the caller is allowed to invent",
+      hatch: "A missing `reviewed_sha` may be inferred from the branch head.",
+    },
+    {
+      re: /\b(?:omit|drop|skip)\b[^.]{0,80}\bprovenance\s+line\b/i,
+      why: "the published divergence made droppable",
+      hatch: "Omit the provenance line when nothing changed after the review.",
+    },
+    {
+      re: /\b(?:re-?review|second\s+review\s+round|another\s+review\s+round)\b[^.]{0,90}\b(?:when|if)\b[^.]{0,60}\b(?:diverge|stale|commits\s+since)\b/i,
+      why: "a second review round reinstated to close the divergence",
+      hatch: "Run a second review round if the shas diverge by more than one commit.",
+    },
+  ];
+
+  for (const relPath of [...REVIEWERS_374, AGENT_375, SHIP_375, "commands/drawbar-work.md"]) {
+    test(`${relPath} nowhere lets the review-staleness residue be hidden or re-reviewed away`, () => {
+      assertShapesAbsent(relPath, reviewerText(relPath), SHA_HATCHES);
+    });
+  }
+});
+
+describe("PCO-376: findings carry a dedup key, and a re-found defect is commented on, not refiled", () => {
+  const DEDUP_UNITS: string[] = [
+    DEDUP_HEADING,
+    "Two reviewers run on one diff and routinely report the same defect, and a later story " +
+      "re-reports a defect already filed from an earlier story's review. Neither is reconciled by " +
+      "hand downstream, so every finding you return — Critical, Important and Minor alike — " +
+      "carries a `dedup_key` of exactly three fields:",
+    "- `file` — the repo-relative path, spelled as the diff spells it.",
+    "- `line` — the 1-based line the finding anchors to, in the post-diff file, or `0` when it " +
+      "anchors to no line at all: a missing file, a file that should not exist, a whole-file " +
+      "structural defect, an absent section. Never invent a line to fill the field — a fabricated " +
+      "line breaks key equality for exactly the findings two reviewers are least likely to word " +
+      "alike.",
+    "- `claim_hash` — a hash of your NORMALIZED claim, never of the prose you wrote.",
+    "Normalize before you hash: lowercase the claim, strip markdown, collapse runs of whitespace, " +
+      "drop every severity word, and drop every phrase naming a story, a reviewer, a run, or a " +
+      'pull request. What is left is the defect itself — "unvalidated path segment reaches the ' +
+      'state file path" — and two reviewers who found one defect in different words must arrive ' +
+      "at the same string. Then hash that string, and nothing else:",
+    "```bash CLAIM=$(cat <<'DRAWBAR_CLAIM_SENTINEL' <the normalized claim> " +
+      "DRAWBAR_CLAIM_SENTINEL ) printf '%s' \"$CLAIM\" | shasum -a 256 | cut -c1-16 ```",
+    "**The claim is bound through that quoted heredoc and never pasted into the `printf` argument " +
+      "directly.** Your claim names a path spelled as the diff spells it, and the branch under " +
+      "review is what authored that path: inside a double-quoted argument one `\"` closes the " +
+      "string and the `$(...)` after it runs under your Bash tool, with the operator's " +
+      "environment. Inside `<<'DRAWBAR_CLAIM_SENTINEL'` nothing expands and nothing executes. " +
+      "Refuse to hash a claim carrying a line equal to that terminator, and never rewrite or " +
+      "escape the claim to make it fit — the hash is over the normalized claim, unaltered, or it " +
+      "is not reproducible.",
+    "**A `claim_hash` that changes when the sentence is rephrased is a broken key**, and a broken " +
+      "key files one defect twice. If two wordings of your own claim hash differently, you have " +
+      "not normalized down to the claim yet.",
+  ];
+
+  for (const relPath of REVIEWERS_374) {
+    test(`${relPath}'s dedup-key section carries exactly these units and nothing else`, () => {
+      expect(docUnits(docSection(relPath, DEDUP_HEADING))).toEqual(DEDUP_UNITS);
+    });
+
+    // The three fields, as a closed set. "exactly three fields" plus one bullet each: a fourth
+    // field (a severity, a reviewer name) would make two reviewers' keys differ for one defect,
+    // which is the whole failure this story exists to close.
+    test(`${relPath} defines dedup_key as exactly {file, line, claim_hash}`, () => {
+      const units = docUnits(docSection(relPath, DEDUP_HEADING));
+      expect(units.filter((u) => u.startsWith("- `"))).toEqual([
+        "- `file` — the repo-relative path, spelled as the diff spells it.",
+        "- `line` — the 1-based line the finding anchors to, in the post-diff file, or `0` when " +
+          "it anchors to no line at all: a missing file, a file that should not exist, a " +
+          "whole-file structural defect, an absent section. Never invent a line to fill the field " +
+          "— a fabricated line breaks key equality for exactly the findings two reviewers are " +
+          "least likely to word alike.",
+        "- `claim_hash` — a hash of your NORMALIZED claim, never of the prose you wrote.",
+      ]);
+      expect(units.join(" ")).toContain("carries a `dedup_key` of exactly three fields:");
+    });
+
+    // The stability property is the deliverable: a hash over prose is not a dedup key, it is a
+    // hash of one reviewer's wording. Pinned in both directions — the normalization recipe, and
+    // the statement that a rephrase-sensitive hash is broken.
+    test(`${relPath} hashes a normalized claim, not prose, and calls a rephrase-sensitive hash broken`, () => {
+      const body = docSection(relPath, DEDUP_HEADING).replace(/\s+/g, " ");
+      expect(body).toContain("`claim_hash` — a hash of your NORMALIZED claim, never of the prose you wrote.");
+      expect(body).toContain(
+        "Normalize before you hash: lowercase the claim, strip markdown, collapse runs of " +
+          "whitespace, drop every severity word, and drop every phrase naming a story, a " +
+          "reviewer, a run, or a pull request.",
+      );
+      expect(body).toContain(
+        "two reviewers who found one defect in different words must arrive at the same string.",
+      );
+      expect(body).toContain(
+        "**A `claim_hash` that changes when the sentence is rephrased is a broken key**, and a " +
+          "broken key files one defect twice.",
+      );
+    });
+
+    // A hash rule with no reproducible hash is a rule two agents implement two ways, and two
+    // hashes of one claim is the defect. Pinned on the literal invocation line in the RAW section.
+    // One reproducible invocation, AND the claim bound through a quoted heredoc rather than
+    // interpolated into the `printf` argument. The claim carries a path "spelled as the diff
+    // spells it", the branch under review authors that path, and normalization strips markdown
+    // and whitespace but no shell metacharacter — so `printf '%s' "<claim>"` is a command-
+    // substitution sink reachable from a planted filename. Pinned in both directions: the safe
+    // form must be present as a literal line, and the interpolated form must be absent.
+    test(`${relPath} gives one reproducible hash invocation, with the claim bound through a quoted heredoc`, () => {
+      const raw = docSection(relPath, DEDUP_HEADING);
+      expect(raw).toMatch(/^CLAIM=\$\(cat <<'DRAWBAR_CLAIM_SENTINEL'$/m);
+      expect(raw).toMatch(/^printf '%s' "\$CLAIM" \| shasum -a 256 \| cut -c1-16$/m);
+      expect(raw, "the claim must never be interpolated into the printf argument").not.toMatch(
+        /printf '%s' "<the normalized claim>"/,
+      );
+      const body = raw.replace(/\s+/g, " ");
+      expect(body).toContain(
+        "**The claim is bound through that quoted heredoc and never pasted into the `printf` argument directly.**",
+      );
+      expect(body).toContain(
+        "Refuse to hash a claim carrying a line equal to that terminator, and never rewrite or escape the claim to make it fit",
+      );
+    });
+  }
+
+  test("both reviewers carry a byte-identical dedup-key section", () => {
+    const [a, b] = REVIEWERS_374.map((p) => docUnits(docSection(p, DEDUP_HEADING)));
+    expect(a).toEqual(DEDUP_UNITS);
+    expect(a).toEqual(b);
+  });
+
+  // --- the two consumers -------------------------------------------------------------------
+
+  const AGENT_376 = "agents/drawbar-story-lead.md";
+  const agent376 = () => readNonEmpty(join(root, AGENT_376)).replace(/\s+/g, " ");
+
+  test("the story-lead collapses the two reviews by dedup_key and records every collapse and suppression", () => {
+    const txt = agent376();
+    // Equality is on `claim_hash` + `file`, not on the whole triple. Two reviewers who found one
+    // defect routinely anchor to different lines (the declaration and the use), so a triple-gated
+    // collapse leaves that pair uncollapsed while "never by hand" forbids correcting it — and
+    // ship §3 already matches filed sub-issues the looser way, so the triple made the two
+    // consumers of one key disagree.
+    expect(txt).toContain(
+      "**Collapse the two reviews by `dedup_key`, never by hand.** Two findings whose keys carry " +
+        "the same `claim_hash` and the same `file` are one finding: keep the higher severity, " +
+        "record both reporters, and send it into the fix pass once.",
+    );
+    expect(txt).toContain(
+      "`line` locates a finding, it does not identify one — two reviewers who found one defect " +
+        "routinely anchor to different lines, the declaration and the use, and a collapse gated " +
+        "on the whole triple would leave that pair uncollapsed with this rule forbidding you to " +
+        "correct it.",
+    );
+    expect(txt).toContain(
+      "Every collapse and every suppression goes into the report's `dedup` array — a duplicate " +
+        "you dropped without recording it is a finding your caller cannot tell from one that was " +
+        "never reported.",
+    );
+  });
+
+  test("the story-lead's §7 schema carries the dedup array and a dedup_key on every finding", () => {
+    const txt = agent376();
+    expect(txt).toContain(
+      '"dedup": [{"dedup_key": {"file": "...", "line": 0, "claim_hash": "..."}, "reported_by": ' +
+        '["code-reviewer", "security-reviewer"], "action": "collapsed | suppressed", "kept": ' +
+        '"Critical | Important | Minor"}],',
+    );
+    expect(txt).toContain(
+      '"findings": [{"severity": "Critical | Important", "detail": "file:line, what survives the ' +
+        'fix pass, why", "dedup_key": {"file": "...", "line": 0, "claim_hash": "..."}}],',
+    );
+  });
+
+  // Producer/consumer agreement in the same shape as the existing §2 return-shape test: ship's §2
+  // is what the caller reads, and a field the agent reports but the caller never documents is a
+  // field the caller will not look for.
+  test("ship §2 documents the four new report fields in the story-lead's return shape", () => {
+    const ship = readNonEmpty(join(root, "commands/drawbar-ship.md")).replace(/\s+/g, " ");
+    const m = ship.match(/It returns the JSON report in its §7: `\{([^}]*)\}`/);
+    expect(m, "ship §2 must document the story-lead's return shape").not.toBeNull();
+    const fields = m![1]!.split(",").map((f) => f.trim());
+    for (const f of ["spec_source", "reviewed_sha", "head_sha", "dedup"]) {
+      expect(fields, `ship §2 must name '${f}' in the return shape`).toContain(f);
+    }
+  });
+
+  function shipSlice(startMarker: string, endMarker: string): string {
+    assertOccursOnce(startMarker);
+    assertOccursOnce(endMarker);
+    const txt = readNonEmpty(join(root, "commands/drawbar-ship.md"));
+    const start = txt.indexOf(startMarker);
+    const end = txt.indexOf(endMarker, start);
+    expect(end, `'${endMarker}' must follow '${startMarker}'`).toBeGreaterThan(start);
+    const body = txt.slice(start, end).replace(/\s+/g, " ");
+    expect(body.length, "the slice is empty — every assertion on it would be vacuous").toBeGreaterThan(200);
+    return body;
+  }
+
+  test("ship §3 searches the parent's existing children before filing anything", () => {
+    expect(shipSlice("## 3.", "## 4.")).toContain(
+      "**Search the parent's existing children before you file anything.** `list_issues` with the " +
+        "story's parent as `parentId`, then match every `out_of_scope` and every `findings[]` " +
+        "entry against those children on `dedup_key`: a child whose body carries the same " +
+        "`claim_hash` is the same defect already filed from an earlier story's review, and so is " +
+        "a child carrying the same `file` and the same `line` under a claim that restates it.",
+    );
+  });
+
+  // The two outcomes differ in KIND, per MUST-CHECK
+  // pco352-fixpass-satisfies-the-gate-header-must-not-cover-a-repick-clause: one comments and
+  // files nothing, the other files. Each is pinned with its own outcome named in the same phrase,
+  // so neither can be folded under a shared "handle duplicates appropriately" lead-in.
+  test("ship §3 comments on a match and files nothing new, naming the story that re-found it", () => {
+    expect(shipSlice("## 3.", "## 4.")).toContain(
+      "- **On a match, `save_comment` on the existing sub-issue and file nothing new.** The " +
+        "comment names the story that re-found it, which reviewer reported it, and this story's " +
+        "branch — that naming is the point, because an uncommented match leaves the earlier " +
+        "sub-issue looking stale rather than re-confirmed. A second sub-issue for one defect " +
+        "splits the discussion across two ids and gets triaged as new work.",
+    );
+  });
+
+  test("ship §3 puts the dedup_key in the body of every sub-issue it does file, so the next run can match on it", () => {
+    expect(shipSlice("## 3.", "## 4.")).toContain(
+      "- **On no match, file it** under the rules below, and put the finding's `dedup_key` in the " +
+        "body. That key is what the next run matches against; a body without one is unmatchable " +
+        "forever after, and the search above degrades to nothing for every story that follows.",
+    );
+  });
+
+  test("ship §3 prints every match and every suppression in the run output, including the story-lead's own collapses", () => {
+    const s3 = shipSlice("## 3.", "## 4.");
+    expect(s3).toContain(
+      "**Print every match and every suppression in the run output**, one line each: the " +
+        "`dedup_key`, the sub-issue id it resolved to, and whether you commented or filed.",
+    );
+    expect(s3).toContain(
+      "The story-lead's own `dedup` array is printed here too, so a finding the two reviewers " +
+        "both raised and the story-lead collapsed into one is visible as a collapse rather than " +
+        "as a finding that went missing.",
+    );
+    expect(s3).toContain(
+      "**Nothing is dropped silently** — a suppression nobody can see is indistinguishable from a " +
+        "finding that was never reported.",
+    );
+  });
+
+  test("drawbar-work reconciles the two reviews by dedup_key rather than by hand", () => {
+    expect(readNonEmpty(join(root, "commands/drawbar-work.md")).replace(/\s+/g, " ")).toContain(
+      "by `dedup_key`, not by hand: two findings sharing one `dedup_key` are one finding, and " +
+        "every collapse you make is named in the report so a duplicate is never dropped silently.",
+    );
+  });
+
+  const DEDUP_HATCHES: readonly Shape[] = [
+    {
+      re: /`?dedup_key`?[^.]{0,120}\b(?:optional|encouraged|nice[- ]to[- ]have|best[- ]effort|aspirational|where\s+practical|if\s+available|when\s+obvious)\b/i,
+      why: "`dedup_key` softened to optional",
+      hatch: "Attach a `dedup_key` where practical.",
+    },
+    {
+      re: /\b(?:dedup|duplicate|duplicates)\b[^.]{0,90}\b(?:by\s+(?:hand|eye)|manually|at\s+the\s+orchestrator)\b/i,
+      why: "deduplication handed back to a human or the orchestrator",
+      hatch: "The caller reconciles duplicates by hand before the fix pass.",
+    },
+    {
+      re: /\b(?:duplicate|duplicates|suppression|suppressions)\b[^.]{0,40}\b(?:may|can|could)\s+be\s+(?:silently\s+)?(?:drop|dropped|discarded|suppressed|omitted)\b/i,
+      why: "a duplicate allowed to be dropped rather than recorded",
+      hatch: "Duplicates may be silently dropped from the report.",
+    },
+    {
+      re: /\b(?:need\s+not|do\s+not\s+need\s+to|no\s+need\s+to)\b[^.]{0,60}\b(?:record|report|print|surface)\b[^.]{0,40}\b(?:dedup|duplicate|duplicates|suppression|suppressions)\b/i,
+      why: "the dedup and suppression record made optional",
+      hatch: "You need not record every duplicate suppression in the run output.",
+    },
+    {
+      re: /\bfile\s+(?:it|a\s+(?:new\s+)?sub-?issue)\s+(?:again|anyway|regardless)\b/i,
+      why: "a re-found defect refiled instead of commented on",
+      hatch: "On a match, file a new sub-issue anyway so the story has its own record.",
+    },
+    {
+      re: /\bclaim_hash\b[^.]{0,90}\bhash(?:es|ing)?\s+(?:the\s+)?(?:raw\s+|full\s+)?(?:prose|sentence|finding\s+text|write-?up)\b/i,
+      why: "the claim hash taken over prose, which breaks on any rephrase",
+      hatch: "Compute `claim_hash` by hashing the finding text as written.",
+    },
+  ];
+
+  for (const relPath of [...REVIEWERS_374, AGENT_376, "commands/drawbar-ship.md", "commands/drawbar-work.md"]) {
+    test(`${relPath} nowhere lets a duplicate be reconciled by hand or dropped unrecorded`, () => {
+      assertShapesAbsent(relPath, reviewerText(relPath), DEDUP_HATCHES);
+    });
+  }
+});
+
+describe("PCO-373 close-out: a malformed reviewer report is not an approval, and a caller now enforces it", () => {
+  const AGENT = "agents/drawbar-story-lead.md";
+  const WORK = "commands/drawbar-work.md";
+  const agent = () => readNonEmpty(join(root, AGENT)).replace(/\s+/g, " ");
+  const work = () => readNonEmpty(join(root, WORK)).replace(/\s+/g, " ");
+
+  // The gap this closes: agents/security-reviewer.md has said since PCO-373 that an empty
+  // `findings` beside an absent `checked` is malformed and "your caller must treat it as one",
+  // and NO caller did. Both reviewers now say it, and both callers now discharge it. Asserted as
+  // a producer/consumer pair so deleting either side fails.
+  test("both reviewers state the malformed-report rule, in identical words", () => {
+    for (const relPath of REVIEWERS_374) {
+      expect(
+        docUnits(docSection(relPath, "## Output (return to the caller — do NOT write to Linear)")),
+        `${relPath} must carry the malformed-report sentence`,
+      ).toContain(MALFORMED_SENTENCE);
+    }
+    // Kept verbatim from PCO-373 as well — the new sentence adds fields, it does not replace the
+    // empty-findings-plus-absent-checked case that produced it.
+    expect(readNonEmpty(join(root, "agents/security-reviewer.md")).replace(/\s+/g, " ")).toContain(
+      "**An empty `findings` alongside an empty or absent `checked` is a malformed report, and " +
+        "your caller must treat it as one** — not as an approval.",
+    );
+  });
+
+  // The four malformed conditions as ONE contiguous enumeration in each caller: four independent
+  // `toContain` token checks are satisfiable by a rewrite that keeps the words and drops a
+  // conjunct, which MUST-CHECK pco352-fixpass-prose-gate-mutation-must-cover-rephrase-not-only-delete
+  // names directly.
+  // The fourth condition is SCOPED to the security-reviewer. `checked` is defined only in
+  // agents/security-reviewer.md's Output section; agents/code-reviewer.md never names it. Applied
+  // to both reviewers, the condition made a clean code review — empty `findings`, no `checked` —
+  // malformed by the letter of the rule, and §5 then parks the story with re-dispatch, self-repair
+  // and proceeding on the other reviewer all explicitly closed. That is the same unsatisfiable
+  // shape PCO-373 shipped, moved from the producer to the caller.
+  const CONDITIONS =
+    "A report is malformed when it omits `spec_source`, omits `reviewed_sha`, carries a finding " +
+    "without a `dedup_key`, or — from the security-reviewer alone, whose contract is the only one " +
+    "that defines the field — returns an empty `findings` list alongside an empty or absent `checked`.";
+
+  test("the story-lead treats a malformed report as a failed review that parks the story, and names all four conditions", () => {
+    const txt = agent();
+    expect(txt).toContain(
+      "**A malformed reviewer report is not an approval — it is a failed review, and it parks the story.**",
+    );
+    expect(txt).toContain(CONDITIONS);
+    // The reason, and the three exits it closes. Without these, "parks the story" is satisfiable
+    // by a lead that re-dispatches until it gets a well-formed empty report.
+    expect(txt).toContain(
+      "an empty finding list from a reviewer that cannot say what it read is indistinguishable " +
+        "from a reviewer that never ran, and the security-reviewer's own contract says its caller " +
+        "must treat that payload as malformed. You are that caller.",
+    );
+    expect(txt).toContain(
+      "Do not re-dispatch the reviewer, do not repair the report yourself, and do not proceed on " +
+        "the other reviewer alone: set `status: parked` with `parked_reason` naming which " +
+        "reviewer returned what, and push nothing.",
+    );
+  });
+
+  // §7's `parked` header enumerates what parks a story; a fifth cause stated only in §5 is a cause
+  // a reader of §7 does not know about. Pinned as its own sentence so the §7 enumeration and §5's
+  // rule cannot drift apart.
+  // `checked` exists in exactly one reviewer contract, so the fourth condition must name that
+  // reviewer. Asserted against the docs themselves, not against the callers' prose: an unscoped
+  // condition is only wrong BECAUSE code-reviewer.md never defines the field, and a later story
+  // that gives the code-reviewer its own `checked` should make this test fail and be revisited.
+  test("`checked` is defined by the security-reviewer alone, and both callers scope the condition to it", () => {
+    const codeOutput = docSection("agents/code-reviewer.md", "## Output (return to the caller — do NOT write to Linear)");
+    expect(codeOutput, "code-reviewer must not define `checked` — if it does, unscope the condition").not.toContain("`checked`");
+    expect(
+      docSection("agents/security-reviewer.md", "## Output (return to the caller — do NOT write to Linear)"),
+    ).toContain("**`checked` (required):**");
+    for (const [label, txt] of [["story-lead", agent()], ["drawbar-work", work()]] as const) {
+      expect(txt, `${label}: the \`checked\` condition must name the reviewer whose contract defines it`).toContain(
+        "or — from the security-reviewer alone, whose contract is the only one that defines the " +
+          "field — returns an empty `findings` list alongside an empty or absent `checked`.",
+      );
+    }
+  });
+
+  test("the story-lead's `parked` header names the malformed report as a parking cause", () => {
+    expect(agent()).toContain(
+      "**A malformed reviewer report parks it too, under the same section's rule** — a review " +
+        "that cannot account for what it read is a review that did not happen, and there is " +
+        "nothing for a fix pass to act on.",
+    );
+  });
+
+  test("the story-lead refuses `ok` for a brief-sourced review and carries the caveat into the summary", () => {
+    const txt = agent();
+    expect(txt).toContain("**A reviewer reporting `spec_source: \"brief\"` never yields `ok`.**");
+    expect(txt).toContain(
+      "it reviewed a summary written before any amendment — an AMENDED banner, a superseded " +
+        "section, a struck decision are all invisible there, and the review may have approved the " +
+        "design the amendment replaced.",
+    );
+    expect(txt).toContain(
+      "Carry that caveat into your report's `summary` and set `status: flagged` at best.",
+    );
+  });
+
+  test("the story-lead hands both reviewers the issue id so each reads the spec itself", () => {
+    expect(agent()).toContain(
+      "Give both the story's Linear issue id — each reads the spec from Linear itself, because " +
+        "the brief you wrote is a summary and a summary cannot carry what the spec struck — and " +
+        "give both `$PROJECT_DIR`, because each reads its own `reviewed_sha` off the tree with " +
+        "`git -C` and a subagent's working directory is not guaranteed to be the project's.",
+    );
+  });
+
+  test("drawbar-work treats a malformed report as a failed review, names all four conditions, and claims the caller role", () => {
+    const txt = work();
+    expect(txt).toContain("**A malformed reviewer report is not an approval — treat it as a failed review.**");
+    expect(txt).toContain(CONDITIONS);
+    expect(txt).toContain(
+      "`agents/security-reviewer.md` says that last payload is malformed and that its caller must " +
+        "treat it as one; **you are that caller**, and this is where that obligation is discharged.",
+    );
+    expect(txt).toContain(
+      "it does not count toward the two reviews this step requires: do not open a PR on the " +
+        "strength of it, and stop and tell the user which reviewer returned what.",
+    );
+  });
+
+  test("drawbar-work never treats a brief-sourced review as a clean pass", () => {
+    const txt = work();
+    expect(txt).toContain(
+      "**A reviewer reporting `spec_source: \"brief\"` reviewed a summary, not the spec.**",
+    );
+    expect(txt).toContain(
+      "Say so in your report and in the PR body; never treat that review as a clean pass.",
+    );
+  });
+
+  const MALFORMED_HATCHES: readonly Shape[] = [
+    {
+      re: /\bmalformed\b[^.]{0,120}\b(?:may|can|could|might)\s+(?:still\s+)?be\s+(?:accepted|approved|treated\s+as\s+an\s+approval|allowed|waved)\b/i,
+      why: "a malformed report allowed through as an approval",
+      hatch: "A malformed report may still be accepted when the other reviewer was thorough.",
+    },
+    {
+      // Permission-form only. Both callers state the PROHIBITION in the same words ("do not
+      // proceed on the other reviewer alone"), so a bare verb family would fire on the rule
+      // itself; the mutation worth catching is the affirmative grant.
+      re: /\b(?:you\s+may|it\s+is\s+(?:fine|ok|okay|acceptable)\s+to|feel\s+free\s+to)\s+(?:proceed|continue|carry\s+on|ship)\b[^.]{0,80}\bon\s+(?:the\s+)?(?:one|other|single|remaining)\s+review(?:er)?\b/i,
+      why: "one reviewer's report accepted as the whole review",
+      hatch: "You may proceed on the other reviewer alone if one report is unusable.",
+    },
+    {
+      re: /\b(?:fill\s+in|supply|invent|substitute|reconstruct)\b[^.]{0,80}\b(?:the\s+)?missing\s+(?:field|fields|`?spec_source`?|`?reviewed_sha`?|`?dedup_key`?)\b/i,
+      why: "the caller repairing a report by inventing the missing attestation",
+      hatch: "Fill in the missing field yourself and continue.",
+    },
+    {
+      re: /\b(?:missing|absent|omitted)\b[^.]{0,90}\b(?:is|are)\s+(?:a\s+)?(?:minor|cosmetic|formatting)\b/i,
+      why: "a missing required field graded as cosmetic",
+      hatch: "A missing `reviewed_sha` is a minor formatting problem, not a failed review.",
+    },
+    {
+      re: /\b(?:use|using|at|to|exercise|apply)\s+your\s+(?:own\s+|best\s+)?(?:judgement|judgment|discretion)\b/i,
+      why: "the malformed-report call handed back to the caller's discretion (both spellings)",
+      hatch: "Use your judgment about whether a malformed report is worth parking a story for.",
+    },
+    {
+      // Both spellings, deliberately: PCO-372's gate found a hatch that reinstated discretion via
+      // the American `judgment` where the shape list carried only `judgement`. The negative
+      // lookahead keeps the story-lead's own PROHIBITION ("…is not a judgment call you get to
+      // make") out of the family — the mutation to catch is the affirmative form.
+      re: /\bis\s+(?:a|the)\s+(?:judgement|judgment)\s+call\b/i,
+      why: "a discretion clause reinstated affirmatively, in either spelling",
+      hatch: "Whether to park on a malformed report is a judgment call.",
+    },
+  ];
+
+  for (const relPath of [...REVIEWERS_374, AGENT, WORK]) {
+    test(`${relPath} nowhere lets a malformed reviewer report count as an approval`, () => {
+      assertShapesAbsent(relPath, readNonEmpty(join(root, relPath)).replace(/\s+/g, " "), MALFORMED_HATCHES);
+    });
+  }
+});
+
+// =================================================================================================
+// PCO-374 / PCO-375 / PCO-376 fix pass — every new rule is pinned IN PLACE, and nothing outside a
+// pinned region is allowed to talk about the report contract.
+//
+// The describes above proved delete and rephrase on all of it. They did not prove the survivor
+// class this repo has actually measured: keep the rule verbatim, then excuse it. Mutation testing
+// found twenty-five alive against them, in three shapes.
+//
+// (1) A carve-out APPENDED beside the rule. The reviewer sections are closed (`docUnits(...)` +
+//     `toEqual`, which fails on an addition), but every consumer rule was pinned with a whole-file
+//     `toContain`, which a carve-out satisfies word-for-word. All of these were green:
+//       story-lead §5, after "…and push nothing.":  "In practice a report missing only one of these
+//         fields is close enough to complete: note the gap in your `summary` and grade the story on
+//         what the reviewer did return."
+//       story-lead §7, after the never-inferred rule:  "Where a reviewer reported neither, the
+//         branch head is a reasonable stand-in and you may record it as that reviewer's
+//         `reviewed_sha`."
+//       ship §3, after the search rule:  "When `list_issues` is slow or paginates, go straight to
+//         filing."
+//       ship §4, after the provenance rule:  "When the story-lead's report carries no `head_sha`,
+//         this line is left off."
+//       drawbar-work §6, inside the malformed rule:  "If the user is present and says to continue,
+//         continue."
+//
+// (2) The rule MOVED, verbatim, into a trailing `## Background` section, where it governs nothing.
+//     A whole-file `toContain` cannot tell that from the rule being in force.
+//
+// (3) A carve-out written FAR FROM the rule, in a section no pin reaches:
+//       ship `## Hard rules`:      "- A missing `reviewed_sha` or `spec_source` never blocks a run."
+//       ship `## Operator notes`:  "**`spec_source: \"brief\"` is the normal case in a sandboxed
+//         run** and needs no comment in the PR body."
+//       ship `## Parking a story`: "A malformed reviewer report is not on its own a reason to park:
+//         note it and continue."
+//       drawbar-work `## 8.`:      "Where the story-lead reported no `head_sha`, leave the
+//         review-provenance line out of the PR body."
+//       code-reviewer frontmatter: "…`spec_source` and `reviewed_sha` are reported where
+//         available."
+//
+// None of the twenty-five trips a regex shape family above, and none of them ever will: a shape
+// family is an enumerated blacklist and the next carve-out is written in the next set of words —
+// which is rubric entry 4's own defect, a blacklist standing in for an allowlist.
+//
+// The fix is the discipline this file already states for the reviewer docs, extended two ways.
+// Shapes (1) and (2) are closed by pinning the governing REGION — a whole section, or a contiguous
+// run of units inside one — with `toEqual`: a clause appended to a unit makes that unit unequal, a
+// carve-out inserted as its own paragraph breaks the run's contiguity, and a relocation removes the
+// unit from the region entirely. Shape (3) is closed by the allowlist at the bottom: every sentence
+// in these five docs that mentions the contract must live inside one of those pinned regions, and
+// the permitted set is COMPUTED from them rather than transcribed, so it cannot drift.
+// =================================================================================================
+
+// A contiguous run of logical units, asserted to appear in this order with nothing between them.
+// Pure, so the control test below can prove the adjacency check actually fires — a run assertion
+// that had silently stopped matching would be the inert test rubric entry 2 exists to catch.
+function assertRun(units: readonly string[], run: readonly string[], label: string): void {
+  expect(run.length, `${label}: a run of fewer than two units pins no adjacency at all`).toBeGreaterThan(1);
+  const at = units.indexOf(run[0]!);
+  expect(at, `${label}: this must appear VERBATIM as its own logical unit —\n${run[0]}`).toBeGreaterThan(-1);
+  expect(
+    units.slice(at, at + run.length),
+    `${label}: these units must be contiguous and in this order. A clause appended to one of them, ` +
+      `a carve-out inserted between two of them, and a rule moved out of this region all fail here.`,
+  ).toEqual([...run]);
+}
+
+function pinRun(relPath: string, heading: string, run: readonly string[]): void {
+  assertRun(docUnits(docSection(relPath, heading)), run, `${relPath} § ${heading}`);
+}
+
+// A section's PROSE — everything from its heading down to the ```bash fence it introduces. `##`
+// sections whose body is mostly an executable fence cannot be closed with `docUnits` + `toEqual`
+// without freezing 200 lines of shell that other tests already pin line by line; this closes the
+// part that is prose and stops at a boundary the doc itself declares.
+function docSectionProse(relPath: string, heading: string): string[] {
+  const lines = docSection(relPath, heading).split("\n");
+  const fence = lines.findIndex((l) => l.trim() === "```bash");
+  expect(fence, `${relPath} § ${heading} must introduce a \`\`\`bash fence for its prose to end at`).toBeGreaterThan(0);
+  const units = docUnits(lines.slice(0, fence).join("\n"));
+  expect(units.length, `${relPath} § ${heading}: the prose is empty — pinning it would be vacuous`).toBeGreaterThan(1);
+  return units;
+}
+
+// The prose between the frontmatter and the first `## ` heading. With every `##` region of a
+// reviewer doc closed and the section list an allowlist, this paragraph was one of the two places
+// left: "The report fields below are a target shape, not a gate: return what you can and let the
+// caller reconcile the rest", dropped here, left every other assertion in this file green.
+function docPreamble(relPath: string): string[] {
+  const txt = readNonEmpty(join(root, relPath));
+  const m = txt.match(/^---\n[\s\S]*?\n---\n([\s\S]*?)(?=\n## )/);
+  expect(m, `${relPath} must have a preamble between its frontmatter and its first section`).not.toBeNull();
+  const units = docUnits(m![1]!);
+  expect(units.length, `${relPath}: the preamble is empty — pinning it would be vacuous`).toBeGreaterThan(0);
+  return units;
+}
+
+const SL_374 = "agents/drawbar-story-lead.md";
+const SH_374 = "commands/drawbar-ship.md";
+const WK_374 = "commands/drawbar-work.md";
+
+const SL5 = "## 5. Review, and exactly one fix pass";
+const SL6 = "## 6. Commit and push";
+const SL7 = "## 7. Report — your entire final message";
+const SH3 = "## 3. File out-of-scope findings as sub-issues";
+const SH4 = "## 4. Open the stacked PR";
+const WK6 = "## 6. Review and fix loop";
+
+// §4 runs from prose into a 200-line bash fence that other tests already pin, so it is closed down
+// to the fence and no further: `docSectionProse` cuts at the opening ```bash line. Pinning only the
+// provenance paragraph and its neighbour was not enough — mutation testing put "When the
+// story-lead's report is incomplete, open the pull request without that opening line." at the far
+// end of §4's prose, which names no field of the contract, so neither the run nor the token scan
+// below could see it. Closing the whole prose region is what catches a carve-out that refers to the
+// rule without naming it.
+const SH4_PROSE: readonly string[] = [
+    "## 4. Open the stacked PR",
+    "**This step is the only thing in the whole run that opens a pull request.** The " +
+      "story-lead's own §6 pushes its branch and stops there — it opens none. Were both to open " +
+      "one, they would submit the identical head+base pair on the run's first story, GitHub " +
+      "would refuse the second with a 422, and the run would park on story 1 every night.",
+    "This step resolves the base by delegating to `stack.ts` — never re-derived in bash — and " +
+      "opens the PR with an explicit `--base <base>` flag; `--base` is never omitted (Locked " +
+      "A): the default would silently fall back to the repo's default branch, producing a PR " +
+      "whose diff carries every earlier story's work too — green, plausible, and " +
+      "near-impossible to spot in the morning.",
+    "`FLAGGED` comes from the story-lead's §7 report `status` field, on the `ok | flagged` " +
+      "contract: `flagged` becomes the JSON boolean `true`, `ok` becomes `false` — a `parked` " +
+      "story never reaches this step at all, because §2 routes it straight to *Parking a " +
+      "story*. On a **flagged** story, the PR body carries an `## Unresolved findings` section, " +
+      "built before `gh pr create` runs, never appended after. That section names each " +
+      "surviving finding by its filed sub-issue id and title only — never the finding body, " +
+      "`file:line`, a finding's `dedup_key` or any of its `file` / `line` / `claim_hash` " +
+      "fields, or a quoted source excerpt; the full write-up already lives in the sub-issue §3 " +
+      "filed for it, and republishing it in a public PR body announces an unpatched detail to " +
+      "every repo watcher before the operator's morning review. The `dedup_key` is named here " +
+      "beside `file:line` because it is the same location in structured form: a serializer that " +
+      "drops `detail` and emits the key has published the location anyway, and a ban worded " +
+      "against one spelling is not a ban on the field.",
+    "**Every PR body opens with a review-provenance line, on a flagged story and a clean one " +
+      "alike**, built before `gh pr create` runs: `reviewed at <reviewed_sha> from " +
+      "<spec_source>; N commits since`, where `<reviewed_sha>` is what the reviewers read, " +
+      "`<spec_source>` is `cli` or `brief` — the source that review actually read the spec from " +
+      "— and `N` is the commit count between the sha and the story-lead's `head_sha`, all three " +
+      "taken from that report. The fix pass commits after the reviewers read the diff, so every " +
+      "review is stale by construction and `N` is normally non-zero; stating it is the whole " +
+      "point, and no second review round closes it. **State `N` even when it is zero** — an " +
+      "omitted line reads exactly like a review that was never stale, which is the claim this " +
+      "line exists to stop anyone making. **State `<spec_source>` even when it is `cli`** — a " +
+      "review that never reached Linear is blind to an AMENDED banner, a superseded section and " +
+      "a struck decision, and on this unattended path the PR body is the only place a reader " +
+      "can find that out; printing it only when it is `brief` makes its absence the signal, and " +
+      "an absence is what nobody notices at 3am.",
+    "**Shape-check both shas before you build that line, and park the story if either " +
+      "refuses.** `reviewed_sha` and `head_sha` reach you as free text from a subagent that " +
+      "read a branch under review, and the story-lead's contract copies them through verbatim — " +
+      "nothing between there and here has looked at them. Each must match `^[0-9a-f]{40}$`, and " +
+      "each must resolve in the repository this PR opens against: `git -C \"$PROJECT_DIR\" " +
+      "cat-file -e \"<sha>^{commit}\"`. `N` is then `git -C \"$PROJECT_DIR\" rev-list --count " +
+      "\"<reviewed_sha>..<head_sha>\"`, anchored the same way and never derived from whatever " +
+      "branch happens to be checked out. A sha that is malformed, or that does not resolve " +
+      "here, parks the story with that as the reason — it attests to a tree this repository " +
+      "does not have, and a foreign 40-hex sha is shape-identical to a real one once it is in " +
+      "the PR body. Where the two reviewers read different shas, name both, one line each.",
+    "**Nothing carries over into the fence below.** No shell state survives across two Bash " +
+      "tool calls, so every value it consumes is re-derived inside it from one source of truth " +
+      "— a fresh `ship-config.ts validate`, behind the same two `$CONFIG` guards Preflight " +
+      "runs, because `$CONFIG` is re-resolved from `$PWD` and a branch under review can plant " +
+      "one. An ambient exported `REPO` would otherwise win and aim every `gh` call at an " +
+      "unvalidated repository, and an empty `$BASE` yields `--base \"\"`, which is Locked A's " +
+      "exact failure mode.",
+    "**Every value you substitute goes into a quoted heredoc, never into an assignment.** The " +
+      "branch name, the PR title and the PR body all originate in text produced from the " +
+      "repository under review, and you paste them in literally — so a single `\"` would close a " +
+      "double-quoted assignment and the `$(...)` after it would run. Inside `<<'SENTINEL'` " +
+      "nothing expands and nothing executes; the fence reads the values back out with `jq -r` " +
+      "and `cat`.",
+    "**Before you substitute anything, check every value for a line equal to the terminator " +
+      "you are pasting it under, and halt the run if you find one** — park the story with that " +
+      "as the reason, and never rewrite, escape, or truncate the value to make it fit. A quoted " +
+      "heredoc protects the value's `\"`, `$` and backticks, but it still ends at the first line " +
+      "equal to its terminator, and these terminators are fixed literals published in this " +
+      "repository: a report line reading exactly `DRAWBAR_PR_BODY_SENTINEL` closes the body " +
+      "heredoc early and every line after it is parsed as shell — arbitrary command execution " +
+      "under the operator's authenticated `gh`, with the written file left looking entirely " +
+      "correct. A check inside the fence cannot save you here: by the time any line of it runs, " +
+      "the injected commands have already run.",
+    "**No value that came out of the repository under review is ever pasted into a JSON " +
+      "document.** The branch name gets its own heredoc file and is read back with `cat`, " +
+      "because a `\"` in a value pasted between two `\"` inside the inputs document does not " +
+      "produce invalid JSON that `jq -e .` would refuse — it appends keys, and `jq` resolves " +
+      "duplicate keys last-wins, so it silently overrides any key declared above it (`arg` " +
+      "names the state file, `story` picks the base). Both shape gates then pass, because they " +
+      "see only the laundered values. A key whitelist is not a defence: the injected document " +
+      "has exactly the same key set.",
+];
+
+// drawbar-work §6 is closed whole. A run over the three new rules plus their successor left the
+// tail of the section open, and "When only one reviewer returns a usable report, treat it as the
+// whole review." dropped in after the last pinned unit was green against everything else here.
+const WK6_FULL: readonly string[] = [
+    "## 6. Review and fix loop",
+    "Dispatch **two reviewers in parallel** on the story's diff, in a single message:",
+    "- `code-reviewer` — spec compliance, code quality, and tests (pass it the acceptance " +
+      "criteria).",
+    "- `security-reviewer` — security only: committed secrets/credentials, authz/tenant " +
+      "isolation, injection, data exposure (pass it the `.drawbar/memory` path so it can recall " +
+      "`MUST-CHECK security` constraints).",
+    "Pass both the project directory as `$PROJECT_DIR`: each pins the commit it read with " +
+      "`git -C \"$PROJECT_DIR\" rev-parse HEAD`, and a subagent's working directory is not " +
+      "guaranteed to be the project's. Tell both that the diff they are reading is " +
+      "**uncommitted** — step 4 told the implementer not to commit and step 8 is where the " +
+      "first commit happens — so the sha they capture names the commit this work sits on top of " +
+      "and none of the work itself, which is exactly what their own contract says to report and " +
+      "to say plainly.",
+    "They are independent on purpose: a single reviewer juggling spec + quality + tests " +
+      "under-weights security, which is how a committed credential slips through. Merge both " +
+      "reviews — by `dedup_key`, not by hand: two findings sharing one `dedup_key` are one " +
+      "finding, and every collapse you make is named in the report so a duplicate is never " +
+      "dropped silently.",
+    "**A malformed reviewer report is not an approval — treat it as a failed review.** A " +
+      "report is malformed when it omits `spec_source`, omits `reviewed_sha`, carries a finding " +
+      "without a `dedup_key`, or — from the security-reviewer alone, whose contract is the only " +
+      "one that defines the field — returns an empty `findings` list alongside an empty or " +
+      "absent `checked`. `agents/security-reviewer.md` says that last payload is malformed and " +
+      "that its caller must treat it as one; **you are that caller**, and this is where that " +
+      "obligation is discharged. An empty finding list from a reviewer that cannot say what it " +
+      "read is indistinguishable from a reviewer that never ran, so it does not count toward " +
+      "the two reviews this step requires: do not open a PR on the strength of it, and stop and " +
+      "tell the user which reviewer returned what.",
+    "**A reviewer reporting `spec_source: \"brief\"` reviewed a summary, not the spec.** It " +
+      "could not reach Linear, so an AMENDED banner, a superseded section, or a struck decision " +
+      "in the story's description was invisible to it and the design it approved may already " +
+      "have been replaced. Say so in your report and in the PR body; never treat that review as " +
+      "a clean pass.",
+    "**Fixes are implementation — delegate the substantive ones.** For findings that need a " +
+      "test or non-trivial logic, re-dispatch `story-implementer` **in fix mode**: hand it the " +
+      "findings and tell it this is a fix pass (address them, add a regression test red→green " +
+      "for any real bug/security finding, report just that — not the full story matrix). Then " +
+      "**re-run the step 5 verification gate** on its fixes and re-review.",
+    "**A fix pass carries Critical and Important findings only.** Minors do not go in. Batch " +
+      "them into a single cleanup pass at the end, or drop them — say which. This is the single " +
+      "biggest lever on how long a story takes: a brief carrying twenty-odd items is not a fix " +
+      "pass, it is a second story, and it will be implemented like one.",
+    "**Keep the brief proportional.** State the findings, the reproduction, and the expected " +
+      "fix. Then state the constraint explicitly: *only* these findings, no refactors, no " +
+      "relocating shared helpers, no new abstractions, nothing opportunistic — " +
+      "`story-implementer`'s fix mode says the same thing, and the two need to agree. Code " +
+      "added during a fix pass is the least-reviewed code in the change; it lands after the " +
+      "reviewers have read the diff. On this project, scope-expanding fix passes have " +
+      "introduced Criticals worse than the ones they closed.",
+    "**Verification between rounds is scoped, not a full re-derivation.** Re-running " +
+      "everything the implementer already ran is near-zero yield. What actually catches " +
+      "problems:",
+    "- **Reproduce each Critical yourself** — before the fix (confirm the finding is real) " +
+      "and after (confirm it is closed). Reviewers are wrong often enough that this is not " +
+      "optional.",
+    "- **Mutation-test the changed guards** — neuter each one and confirm a specific test " +
+      "fails. This is the highest-value check available to you: it catches guards that are " +
+      "dead, vacuous, or passing for the wrong reason, including in your own fixes.",
+    "- **One full suite run**, and confirm the diff matches the report.",
+    "**Cap the loop, and escalate with a cost estimate.** If a second review round finds new " +
+      "Criticals — especially ones introduced by the previous fix pass — stop and go to the " +
+      "user before starting a third. Report what has been found, what it has cost so far, and " +
+      "the options: keep iterating, ship with the finding documented, or have you apply the fix " +
+      "directly. A loop that keeps finding real Criticals is not evidence the loop is working; " +
+      "it is usually evidence the story was too big or the briefs are too broad, and that is " +
+      "the user's call to make, not yours.",
+    "Small, obvious one-line corrections you may apply directly rather than round-tripping an " +
+      "agent — that latitude is for trivia only (a rename, a typo, a missing null-check with no " +
+      "behavior to test), not for anything a reviewer would want to see a test for. (Keep this " +
+      "loop — it catches real issues before the PR.)",
+];
+
+// Contract-bearing units that a pinned SECTION or RUN does not contain, but that another assertion
+// in this file pins by exact string: ship §2's documented return shape (PCO-376's producer/consumer
+// test), the PR-body heredoc (PCO-375's heredoc test), and one pre-existing bash comment that
+// happens to use the word "malformed" about `resolved_config`, which has nothing to do with this
+// contract.
+const SHIP_PINNED_ELSEWHERE: readonly string[] = [
+  "# somehow arrives as the STRING \"null\" (a malformed `resolved_config`) must not silently",
+  // Preflight's `linear` warning. It names `spec_source` on purpose: without it, "every story is
+  // flagged because this machine has no CLI" and "every story is flagged because every story has
+  // caveats" print the same unattended run output. Pinned by its own test below as well.
+  "# same run output, and the first is a machine problem nobody will look for. command -v linear " +
+    ">/dev/null 2>&1 || echo \"WARNING: no \\`linear\\` CLI — every review will report spec_source: " +
+    "\\\"brief\\\" and no story can come back clean\"",
+  "It returns the JSON report in its §7: `{status, branch, base, spec_source, reviewed_sha, " +
+    "head_sha, findings, dedup, mutation_pairs, out_of_scope, lessons, summary}`. It carries no " +
+    "`pr` — it opens none; §4 below is what opens the PR and learns its number. **Do not ask it " +
+    "for the diff.** If you find yourself wanting one, the split is not working.",
+  "cat > \"$PR_BODY_FILE\" <<'DRAWBAR_PR_BODY_SENTINEL' <the PR body, verbatim — nothing here " +
+    "expands. Its first line is the review-provenance line `reviewed at <reviewed_sha> from " +
+    "<spec_source>; N commits since`, with both shas already shape-checked and resolved per the " +
+    "prose above. On a flagged story it is written out here with its `## Unresolved findings` " +
+    "section already in it, listing each surviving finding as `<SUB-ISSUE-ID> — <sub-issue " +
+    "title>` and nothing else: never the finding body, never a `file:line`, never a `dedup_key` " +
+    "or any of its fields, never a quoted source excerpt.> DRAWBAR_PR_BODY_SENTINEL",
+];
+
+const WORK_PINNED_ELSEWHERE: readonly string[] = [
+  "```bash command -v drawbar-kb >/dev/null 2>&1 || { echo \"drawbar-kb not found — run " +
+    "/drawbar-setup\"; exit 1; } [ -d \"$PWD/.drawbar/memory\" ] || { echo \"no .drawbar/memory — " +
+    "run /drawbar-setup\"; exit 1; } command -v linear >/dev/null 2>&1 || echo \"WARNING: no " +
+    "\\`linear\\` CLI — every review will report spec_source: \\\"brief\\\" and no story can come " +
+    "back clean\" ```",
+];
+
+// Anything naming a field of the report contract, the two words it turns on, or the report itself
+// ("one reviewer", "the other reviewer", "a reviewer's report", "a reviewer returned"). Not a
+// blacklist of forbidden phrasings — a detector for "this sentence is ABOUT the contract", which
+// then has to be inside a region pinned closed. The last three alternatives were added because
+// "One usable reviewer report is enough to open the PR.", dropped into drawbar-work's close-out
+// step, names no field of the contract and was green; they cost nothing, matching no unit of any
+// of these five docs that a pinned region does not already contain.
+const CONTRACT_TOKEN =
+  /spec_source|reviewed_sha|head_sha|dedup_key|claim_hash|\bdedup\b|\bmalformed\b|review-provenance|provenance line|\breviewers?['\u2019]?s?\s+(?:report|reports|returns?)\b|\b(?:one|either|the\s+other|a\s+single|the\s+remaining)\s+reviewer\b|\breviewer\s+(?:returns?|returned|reported)\b/i;
+
+function strayContractUnits(all: readonly string[], allowed: ReadonlySet<string>): string[] {
+  return all.filter((u) => CONTRACT_TOKEN.test(u) && !allowed.has(u));
+}
+
+type PinnedRegions = {
+  sections: readonly string[];
+  runs: readonly (readonly string[])[];
+  elsewhere: readonly string[];
+  preamble: boolean;
+};
+
+const PINNED_REGIONS: Record<string, PinnedRegions> = {
+  // Both reviewer docs are closed section by section, and the section list itself is an allowlist,
+  // so every `##` region is covered. That leaves the preamble (pinned below) and the frontmatter
+  // (pinned by nothing — and a `description:` reading "`spec_source` and `reviewed_sha` are
+  // reported where available" is a live mutation this catches).
+  "agents/code-reviewer.md": {
+    sections: REVIEWER_SECTIONS["agents/code-reviewer.md"]!,
+    runs: [],
+    elsewhere: [],
+    preamble: true,
+  },
+  "agents/security-reviewer.md": {
+    sections: REVIEWER_SECTIONS["agents/security-reviewer.md"]!,
+    runs: [],
+    elsewhere: [],
+    preamble: true,
+  },
+  [SL_374]: { sections: [SL5, SL6, SL7], runs: [], elsewhere: [], preamble: false },
+  [SH_374]: { sections: [SH3], runs: [SH4_PROSE], elsewhere: SHIP_PINNED_ELSEWHERE, preamble: false },
+  // drawbar-work's Preflight fence carries the same `linear` warning, and `docUnits` folds the
+  // whole fence into one unit — so the fence is the region, pinned here as one exact string and
+  // asserted by its own test below.
+  [WK_374]: { sections: [WK6], runs: [], elsewhere: WORK_PINNED_ELSEWHERE, preamble: false },
+};
+
+describe("PCO-374/375/376 fix pass: the new rules are closed in place, and nothing outside speaks for them", () => {
+  test("assertRun's adjacency check fires on append, on insertion, and on relocation", () => {
+    const RUN = ["A is the rule.", "B is the next unit."];
+    expect(() => assertRun(["A is the rule.", "B is the next unit.", "C."], RUN, "control")).not.toThrow();
+    // a carve-out appended to the rule's own paragraph — the unit is no longer equal
+    expect(() =>
+      assertRun(["A is the rule. Use your judgment though.", "B is the next unit."], RUN, "control"),
+    ).toThrow();
+    // a carve-out as its own paragraph — the run is no longer contiguous
+    expect(() =>
+      assertRun(
+        ["A is the rule.", "When the CLI is unavailable this is optional.", "B is the next unit."],
+        RUN,
+        "control",
+      ),
+    ).toThrow();
+    // the rule relocated out of the region — its unit is gone from here
+    expect(() => assertRun(["B is the next unit.", "C."], RUN, "control")).toThrow();
+    // a one-unit run pins no adjacency and is refused rather than passing vacuously
+    expect(() => assertRun(["A is the rule."], ["A is the rule."], "control")).toThrow();
+  });
+
+  test("story-lead §5 carries exactly these units and nothing else", () => {
+    expect(docUnits(docSection(SL_374, SL5))).toEqual([
+      "## 5. Review, and exactly one fix pass",
+      "Dispatch **`code-reviewer`** and **`security-reviewer`** in parallel, in one message. " +
+        "Give the code reviewer the acceptance criteria; give the security reviewer `$KB`. Give " +
+        "both the story's Linear issue id — each reads the spec from Linear itself, because the " +
+        "brief you wrote is a summary and a summary cannot carry what the spec struck — and give " +
+        "both `$PROJECT_DIR`, because each reads its own `reviewed_sha` off the tree with `git " +
+        "-C` and a subagent's working directory is not guaranteed to be the project's.",
+      "**A malformed reviewer report is not an approval — it is a failed review, and it parks " +
+        "the story.** A report is malformed when it omits `spec_source`, omits `reviewed_sha`, " +
+        "carries a finding without a `dedup_key`, or — from the security-reviewer alone, whose " +
+        "contract is the only one that defines the field — returns an empty `findings` list " +
+        "alongside an empty or absent `checked`. Each of those leaves the review unable to " +
+        "account for what it did, so there is nothing to grade: an empty finding list from a " +
+        "reviewer that cannot say what it read is indistinguishable from a reviewer that never " +
+        "ran, and the security-reviewer's own contract says its caller must treat that payload as " +
+        "malformed. You are that caller. Do not re-dispatch the reviewer, do not repair the " +
+        "report yourself, and do not proceed on the other reviewer alone: set `status: parked` " +
+        "with `parked_reason` naming which reviewer returned what, and push nothing.",
+      "**A reviewer reporting `spec_source: \"brief\"` never yields `ok`.** It could not reach " +
+        "the story's Linear record, so it reviewed a summary written before any amendment — an " +
+        "AMENDED banner, a superseded section, a struck decision are all invisible there, and the " +
+        "review may have approved the design the amendment replaced. Carry that caveat into your " +
+        "report's `summary` and set `status: flagged` at best.",
+      "**Collapse the two reviews by `dedup_key`, never by hand.** Two findings whose keys " +
+        "carry the same `claim_hash` and the same `file` are one finding: keep the higher " +
+        "severity, record both reporters, and send it into the fix pass once. `line` locates a " +
+        "finding, it does not identify one — two reviewers who found one defect routinely anchor " +
+        "to different lines, the declaration and the use, and a collapse gated on the whole " +
+        "triple would leave that pair uncollapsed with this rule forbidding you to correct it. " +
+        "That is the same match your caller makes against the sub-issues already filed. Every " +
+        "collapse and every suppression goes into the report's `dedup` array — a duplicate you " +
+        "dropped without recording it is a finding your caller cannot tell from one that was " +
+        "never reported.",
+      "Fixes are implementation: re-dispatch `story-implementer` in fix mode with the merged " +
+        "findings, require a red→green regression test for any real bug or security finding, then " +
+        "re-run §3 and §4 on the fixes. Trivial one-liners (a rename, a typo) you may apply " +
+        "directly.",
+      "**Exactly one fix pass runs, and it carries Critical and Important findings only.** " +
+        "Minors are batched into a single follow-up note or dropped outright, and either way " +
+        "every Minor is named in your report's `summary` — a Minor that is silently dropped is a " +
+        "finding nobody ever sees again.",
+      "**A second fix pass is prohibited.** Findings that survive the first one do not earn " +
+        "another attempt: they travel in the report's `findings` array, where your caller picks " +
+        "them up — a surviving Important sets `status: flagged`, a surviving Critical sets " +
+        "`status: parked`. Re-dispatching the reviewers for a second round is not a judgment call " +
+        "you get to make.",
+      "**A surviving Critical parks the story — it is never `flagged`.** An Important that " +
+        "outlives the one fix pass is a note on an open pull request; a Critical is an unpatched " +
+        "defect on a branch every later story would stack on. Bounding the fix pass replaced a " +
+        "rule that used to hold a Critical back outright, and the replacement has to refuse " +
+        "rather than wave it through. Do not push, and leave your caller no pull request to open: " +
+        "set `status: parked` with `parked_reason` naming the surviving Critical, and carry the " +
+        "finding in `findings`.",
+      "**Findings that are real but outside this story's scope are not yours to fix or to widen " +
+        "the pull request for.** Collect them for `out_of_scope` in your report — file:line, what " +
+        "is wrong, why it is out of scope, and the evidence. Your caller files them in Linear.",
+
+    ]);
+  });
+
+  test("story-lead §6 carries exactly these units and nothing else", () => {
+    expect(docUnits(docSection(SL_374, SL6))).toEqual([
+      "## 6. Commit and push",
+      "```bash git -C \"$PROJECT_DIR\" add -A git -C \"$PROJECT_DIR\" commit -m \"<type>: <summary> " +
+        "(<STORY>)\" # hooks run — never --no-verify git -C \"$PROJECT_DIR\" push -u origin " +
+        "\"$BRANCH\" ```",
+      "**Capture the branch head after the last commit, with `git -C \"$PROJECT_DIR\" rev-parse " +
+        "HEAD`, and report it as `head_sha`.** It sits beside the reviewers' `reviewed_sha` in your " +
+        "report. The fix pass commits after the reviewers read the diff, so the two differ by " +
+        "construction and no second review closes the gap; your caller publishes the divergence " +
+        "rather than eliminating it, and it can only do that if you hand it both ends.",
+      "**You open no pull request — pushing the branch is where your work ends.** Your caller's §4 " +
+        "opens the stacked pull request against the base *it* resolves, and it is the only step that " +
+        "may. Were you to open one too, both steps would submit the identical head+base pair on the " +
+        "run's first story, GitHub would refuse the second with a 422, and the run would park on " +
+        "story 1 every night.",
+    ]);
+  });
+
+  test("story-lead §7 carries exactly these units and nothing else", () => {
+    expect(docUnits(docSection(SL_374, SL7))).toEqual([
+      "## 7. Report — your entire final message",
+      "```json { \"story\": \"<TEAM>-####\", \"status\": \"ok | flagged | parked\", \"branch\": " +
+        "\"<user>/<team>-####-slug\", \"base\": \"<the $BASE_BRANCH you cut from>\", \"parked_reason\": " +
+        "null, \"spec_source\": {\"code_reviewer\": \"cli | brief\", \"security_reviewer\": \"cli | " +
+        "brief\"}, \"reviewed_sha\": {\"code_reviewer\": \"<full sha>\", \"security_reviewer\": \"<full " +
+        "sha>\"}, \"head_sha\": \"<the branch head you pushed>\", \"findings\": [{\"severity\": \"Critical " +
+        "| Important\", \"detail\": \"file:line, what survives the fix pass, why\", \"dedup_key\": " +
+        "{\"file\": \"...\", \"line\": 0, \"claim_hash\": \"...\"}}], \"dedup\": [{\"dedup_key\": {\"file\": " +
+        "\"...\", \"line\": 0, \"claim_hash\": \"...\"}, \"reported_by\": [\"code-reviewer\", " +
+        "\"security-reviewer\"], \"action\": \"collapsed | suppressed\", \"kept\": \"Critical | Important " +
+        "| Minor\"}], \"mutation_pairs\": [{\"mutation\": \"...\", \"failing_test\": \"...\"}], " +
+        "\"out_of_scope\": [{\"title\": \"...\", \"detail\": \"file:line, what is wrong, why out of " +
+        "scope\"}], \"lessons\": [{\"key\": \"kebab-key\", \"type\": \"learned\", \"content\": \"...\", \"tags\": " +
+        "[\"...\"]}], \"summary\": \"two or three sentences\" } ```",
+      "**`spec_source`, `reviewed_sha` and `head_sha` are reported per reviewer and are never " +
+        "inferred.** Copy each reviewer's own values through verbatim; a value you filled in for " +
+        "a reviewer that did not report one is a fabricated attestation, and it is exactly what " +
+        "the malformed-report rule refuses. `head_sha` is the branch head you pushed, and " +
+        "`reviewed_sha` is what each reviewer read — state both even when they are equal, because " +
+        "an omitted pair reads the same as a review that was never stale.",
+      "The three statuses differ in kind, not in degree, and each gets its own header below. " +
+        "Never collapse them into one shared \"satisfied if any of the following\" list: `ok` and " +
+        "`flagged` in particular have different downstream outcomes, so a reader who is handed " +
+        "them as one bulleted set has been told the wrong thing.",
+      "**`ok` — the fix pass closed everything, and nothing survives.** No Critical or " +
+        "Important finding remains; `findings` is `[]`. The branch is pushed and your caller " +
+        "opens the pull request.",
+      "**`flagged` — Important findings survived the one fix pass.** The branch is still pushed " +
+        "and your caller still opens the pull request; the surviving findings travel in " +
+        "`findings` so your caller can decide how to surface them. **`detail` and `dedup_key` are " +
+        "both for your caller's eyes, not for verbatim republication:** `detail` carries " +
+        "`file:line` and the specifics of a defect nobody has patched, and `dedup_key` carries " +
+        "the same `file` and `line` in structured form, so a serializer that skips `detail` and " +
+        "emits the key has published the location anyway. The pull request is public, and it is " +
+        "opened before any human has reviewed the story. How much of that is safe to publish is " +
+        "your caller's call, not something you authorize here. This is not a failure to complete " +
+        "the story.",
+      "**`parked` — the story could not be completed at all.** The verify gate (§3) or the " +
+        "mutation gate (§4) could not be satisfied, or a Critical finding survived the one fix " +
+        "pass (§5). There is no branch to stack the next story on; set `parked_reason` and say " +
+        "which gate refused. **A malformed reviewer report parks it too, under the same section's " +
+        "rule** — a review that cannot account for what it read is a review that did not happen, " +
+        "and there is nothing for a fix pass to act on.",
+      "No diffs, no test logs, no review bodies — your caller must not need them. `lessons` are " +
+        "written to the KB by your caller; `status: parked` means there is nothing to stack on, " +
+        "and say why.",
+
+    ]);
+  });
+
+  test("ship §3 carries exactly these units and nothing else", () => {
+    expect(docUnits(docSection(SH_374, SH3))).toEqual([
+      "## 3. File out-of-scope findings as sub-issues",
+      "**Search the parent's existing children before you file anything.** `list_issues` with the " +
+        "story's parent as `parentId`, then match every `out_of_scope` and every `findings[]` entry " +
+        "against those children on `dedup_key`: a child whose body carries the same `claim_hash` is " +
+        "the same defect already filed from an earlier story's review, and so is a child carrying the " +
+        "same `file` and the same `line` under a claim that restates it. A defect re-found by a later " +
+        "story is not new work — one story re-found a defect an earlier story had already filed, and " +
+        "it was filed a second time.",
+      "- **On a match, `save_comment` on the existing sub-issue and file nothing new.** The comment " +
+        "names the story that re-found it, which reviewer reported it, and this story's branch — that " +
+        "naming is the point, because an uncommented match leaves the earlier sub-issue looking stale " +
+        "rather than re-confirmed. A second sub-issue for one defect splits the discussion across two " +
+        "ids and gets triaged as new work.",
+      "- **On no match, file it** under the rules below, and put the finding's `dedup_key` in the " +
+        "body. That key is what the next run matches against; a body without one is unmatchable " +
+        "forever after, and the search above degrades to nothing for every story that follows.",
+      "**Print every match and every suppression in the run output**, one line each: the " +
+        "`dedup_key`, the sub-issue id it resolved to, and whether you commented or filed. The " +
+        "story-lead's own `dedup` array is printed here too, so a finding the two reviewers both " +
+        "raised and the story-lead collapsed into one is visible as a collapse rather than as a " +
+        "finding that went missing. **Nothing is dropped silently** — a suppression nobody can see is " +
+        "indistinguishable from a finding that was never reported.",
+      "**Mandatory, not discretionary.** For each entry in `out_of_scope`, `save_issue` a new " +
+        "sub-issue under the same parent: title naming the bug not the symptom; description with " +
+        "file:line, what is wrong, why it is out of scope here, and the PR that surfaced it; status " +
+        "`Unplanned`; label `found-in-review`. Never file it `Todo` — `Unplanned → Todo` is the human " +
+        "triage gate, and this command has no authority to walk a finding through it unattended.",
+      "**File one sub-issue for every surviving `findings[]` entry too**, under the same rules — " +
+        "status `Unplanned`, label `found-in-review`, a `## Dependencies` section — and record its id " +
+        "alongside the `out_of_scope` ones. `findings[]` carries the Critical and Important findings " +
+        "that outlived the story-lead's one fix pass, unfixed **security** findings included, and " +
+        "§4's `## Unresolved findings` section is allowed to name a finding by sub-issue id and title " +
+        "only: with no sub-issue filed here there is no id for §4 to render, so a flagged story's " +
+        "surviving findings would be unpublishable and would die with the session exactly as an " +
+        "unfiled `out_of_scope` entry does. Put the finding's `detail` in the sub-issue body — a " +
+        "Linear issue is not world-readable the way the pull request is, which is the whole reason " +
+        "the split exists.",
+      "**The title of every sub-issue filed here carries no `file:line`, no path, and no quoted " +
+        "source** — those go in the body only, and this rule outranks any wording that reads as " +
+        "encouraging them, because §4 publishes the title verbatim in a public PR body while " +
+        "forbidding exactly those three things there. A title like \"path traversal in " +
+        "`scripts/lib/stack.ts:165`\" satisfies \"name the bug not the symptom\" and still announces " +
+        "an unpatched detail to every repo watcher; name the bug and its component instead.",
+      "**Give every filed sub-issue a `## Dependencies` section**, stating `none — filed from " +
+        "review of <PR>` when it has none. Step 0 halts on a snapshot member that carries no such " +
+        "section, and a finding filed here becomes exactly that member once a human triages it " +
+        "`Unplanned → Todo`. Omitting the section here is a halt on some later night, in a different " +
+        "command, with nothing pointing back to this step.",
+      "Not added to the snapshot — they wait for the next run.",
+      "> The reviewer agents explicitly \"return categorized findings; do not write to Linear,\" " +
+        "and > the story-lead has no Linear tools. If you skip this, the finding dies with the " +
+        "session.",
+    ]);
+  });
+
+  test("ship §4's prose carries exactly these units and nothing else, down to the fence", () => {
+    expect(docSectionProse(SH_374, SH4)).toEqual(SH4_PROSE);
+  });
+
+  test("drawbar-work §6 carries exactly these units and nothing else", () => {
+    expect(docUnits(docSection(WK_374, WK6))).toEqual(WK6_FULL);
+  });
+
+  // --- the reviewer docs' two remaining open regions -------------------------------------------
+
+  test("code-reviewer's preamble carries exactly this and nothing else", () => {
+    expect(docPreamble("agents/code-reviewer.md")).toEqual([
+      "You are a senior code reviewer gating one story's implementation. This is task-scoped: " +
+        "verify the diff matches the story (nothing more, nothing less) and is well-built.",
+    ]);
+  });
+
+  test("security-reviewer's preamble carries exactly this and nothing else", () => {
+    expect(docPreamble("agents/security-reviewer.md")).toEqual([
+      "You are an adversarial application-security reviewer gating one story's diff. Security is " +
+        "your **only** mandate — do not comment on spec compliance, style, or general test structure; " +
+        "another reviewer owns those. The one exception is a test that is the only thing standing " +
+        "behind a security property: when that test cannot fail, the property is unverified, and that " +
+        "is yours to raise. Your single job is to find the security problem the general reviewer will " +
+        "miss because its attention is split.",
+    ]);
+  });
+
+  // Both `Inputs` sections now name the Linear issue id as an input. A fourth bullet reading "when
+  // no issue id is supplied, the brief you were handed is the spec" reinstates the exact fallback
+  // PCO-374 forbids, one section away from where the ordering is pinned.
+  test("code-reviewer's Inputs section carries exactly these units and nothing else", () => {
+    expect(docUnits(docSection("agents/code-reviewer.md", "## Inputs you are given"))).toEqual([
+      "## Inputs you are given",
+      "- The story's Linear issue id — the spec is read from Linear, not from this brief.",
+      "- The story's description (What / Decisions / Testing / Validation / Files), as the brief " +
+        "carries it.",
+      "- The diff under review (a base..head range or a diff file).",
+      PROJECT_DIR_BULLET,
+    ]);
+  });
+
+  test("security-reviewer's Inputs section carries exactly these units and nothing else", () => {
+    expect(docUnits(docSection("agents/security-reviewer.md", "## Inputs you are given"))).toEqual([
+      "## Inputs you are given",
+      "- The story's Linear issue id — the spec is read from Linear, not from this brief.",
+      "- The diff under review (a base..head range or a diff file).",
+      "- The project's `.drawbar/memory` path.",
+      PROJECT_DIR_BULLET,
+    ]);
+  });
+
+  test("code-reviewer's What-to-do section carries exactly these units and nothing else", () => {
+    expect(docUnits(docSection("agents/code-reviewer.md", "## What to do"))).toEqual([
+      "## What to do",
+      "1. **Spec compliance** — Compare the diff to the story:",
+      "- Missing: acceptance criteria or required behavior not implemented.",
+      "- Extra: scope creep / unrequested features.",
+      "- Misunderstood: the right feature built wrong. Honor every Locked decision; flag any " +
+        "violation.",
+      "2. **Code quality** — separation of concerns, error handling (no swallowed errors), edge " +
+        "cases, DRY without premature abstraction.",
+      "3. **Tests** — Do new tests verify real behavior (not mocks)? Are the story's edge cases " +
+        "covered? Is the test output clean? A test that asserts nothing is a finding, and a test that " +
+        "cannot fail is a Critical one — apply the rubric below.",
+      "Inspect code outside the diff only to evaluate a concrete, named risk. Do not crawl the " +
+        "codebase. Read-only — do not modify anything.",
+    ]);
+  });
+
+  test("security-reviewer's What-to-do section carries exactly these units and nothing else", () => {
+    expect(docUnits(docSection("agents/security-reviewer.md", "## What to do"))).toEqual([
+      "## What to do",
+      "1. Query the knowledge base for security constraints relevant to this diff: `drawbar-kb " +
+        "recall \"MUST-CHECK security <area>\" --dir \"<path>\" --json` Every `MUST-CHECK:` security " +
+        "entry that applies is a hard requirement — flag any violation as Critical.",
+      "2. Review the diff across these lenses. Default to skepticism: if an exposure is plausible, " +
+        "raise it.",
+      "- **Secrets & credentials** — API keys, tokens, passwords, connection strings, private keys, " +
+        "or any high-entropy literal committed to source or config. **This is the most common miss — " +
+        "check every added string and every new/changed config, `.env`, fixture, and test file.** A " +
+        "credential in a test or example is still a leaked credential.",
+      "- **AuthN / AuthZ** — missing or weakened authentication, broken access control, privilege " +
+        "escalation, and **tenant isolation** (one tenant able to read or write another's data).",
+      "- **Injection & untrusted input** — SQL/NoSQL, command, path traversal, SSRF, " +
+        "deserialization, and XSS. Trace where request/user data flows into a sink without validation " +
+        "or parameterization.",
+      "- **Data exposure** — secrets or PII written to logs, returned in API responses or error " +
+        "messages, or left in debug/verbose paths; overly broad query results; CORS or endpoint left " +
+        "open.",
+      "- **Crypto & insecure defaults** — weak/absent hashing for secrets, disabled TLS " +
+        "verification, predictable randomness for security-sensitive values, permissive defaults.",
+      "3. Inspect code outside the diff only to confirm a concrete, named risk (e.g. is this input " +
+        "actually reachable from a request?). Do not crawl the codebase. Read-only — do not modify " +
+        "anything.",
+    ]);
+  });
+
+  // --- the allowlist: nothing outside a pinned region speaks for the contract -------------------
+
+  test("the contract scan catches a carve-out written outside every pinned region", () => {
+    const allowed = new Set(["The rule, stated in full, naming `reviewed_sha`."]);
+    expect(
+      strayContractUnits(["The rule, stated in full, naming `reviewed_sha`.", "Unrelated prose."], allowed),
+    ).toEqual([]);
+    expect(
+      strayContractUnits(
+        [
+          "The rule, stated in full, naming `reviewed_sha`.",
+          "- A missing `reviewed_sha` or `spec_source` never blocks a run.",
+        ],
+        allowed,
+      ),
+    ).toEqual(["- A missing `reviewed_sha` or `spec_source` never blocks a run."]);
+    // Every token in the family is load-bearing — a family that had stopped matching one of the
+    // field names would let carve-outs about that field through in silence.
+    for (const probe of [
+      "reports `spec_source`",
+      "reports `reviewed_sha`",
+      "reports `head_sha`",
+      "carries a `dedup_key`",
+      "computes a `claim_hash`",
+      "the `dedup` array",
+      "a malformed report",
+      "the review-provenance line",
+      "leave the provenance line out",
+      "One usable reviewer report is enough",
+      "when only one reviewer returns a usable report",
+      "proceed on the other reviewer alone",
+      "a reviewer returned nothing",
+    ]) {
+      expect(CONTRACT_TOKEN.test(probe), `the contract token family must match: ${probe}`).toBe(true);
+    }
+  });
+
+  // `linear issue view` is the only preferred spec source, and before this the word `linear`
+  // appeared nowhere else in the plugin — no Preflight guard, no setup step, no dependency
+  // declaration. With no CLI, every review reports `spec_source: "brief"` and the story-lead makes
+  // `ok` unreachable: every story is flagged forever, with nothing distinguishing "this story has
+  // real caveats" from "this machine has no CLI". A WARNING and not an exit, so the degradation
+  // stays honest AND visible.
+  for (const [relPath, why] of [
+    ["commands/drawbar-ship.md", "the unattended command that opens the public PR"],
+    ["commands/drawbar-work.md", "the attended command"],
+  ] as const) {
+    test(`${relPath}'s Preflight warns — and does not exit — when the \`linear\` CLI is missing`, () => {
+      const raw = readNonEmpty(join(root, relPath));
+      const line = raw.split("\n").find((l) => l.includes("command -v linear"));
+      expect(line, `${relPath} (${why}) must guard the \`linear\` CLI in Preflight`).toBeDefined();
+      expect(line!.trim()).toBe(
+        'command -v linear >/dev/null 2>&1 || echo "WARNING: no \\`linear\\` CLI — every review ' +
+          'will report spec_source: \\"brief\\" and no story can come back clean"',
+      );
+      // A halt here would refuse to run at all on an install without the CLI, which is worse than
+      // a degraded-but-honest review; the exit-guard spelling used by the other Preflight lines is
+      // asserted absent from this one.
+      expect(line!, "the linear guard must be a warning, never a halt").not.toContain("exit 1");
+    });
+  }
+
+  for (const [relPath, regions] of Object.entries(PINNED_REGIONS)) {
+    test(`${relPath}: every sentence about the report contract lives inside a pinned region`, () => {
+      const allowed = new Set<string>([
+        ...regions.sections.flatMap((h) => docUnits(docSection(relPath, h))),
+        ...regions.runs.flatMap((r) => [...r]),
+        ...regions.elsewhere,
+        ...(regions.preamble ? docPreamble(relPath) : []),
+      ]);
+      expect(allowed.size, `${relPath}: no pinned region resolved — the scan below would be vacuous`).toBeGreaterThan(3);
+      const all = docUnits(readNonEmpty(join(root, relPath)));
+      const bearing = all.filter((u) => CONTRACT_TOKEN.test(u));
+      expect(
+        bearing.length,
+        `${relPath}: nothing in this doc mentions the report contract — this scan is vacuous`,
+      ).toBeGreaterThan(2);
+      expect(
+        strayContractUnits(all, allowed),
+        `${relPath}: these mention the report contract from OUTSIDE every region this file pins ` +
+          `closed. A carve-out written here excuses the rule without touching a word of it, which is ` +
+          `the survivor class this scan exists to close — put the sentence in the governing section, ` +
+          `or pin the region it lives in.`,
+      ).toEqual([]);
+    });
+  }
 });
