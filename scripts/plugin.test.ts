@@ -1,10 +1,10 @@
 import { test, expect, describe } from "bun:test";
-import { readFileSync, mkdtempSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
+import { readFileSync, mkdtempSync, writeFileSync, existsSync, mkdirSync, symlinkSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { parseShipConfig, validateShipConfig, type Runner } from "./lib/ship-config";
-import { REQUIRED_KEYS } from "./lib/run-state";
+import { parseShipConfig, validateShipConfig, isValidRefName, type Runner } from "./lib/ship-config";
+import { REQUIRED_KEYS, parseRunState } from "./lib/run-state";
 
 const root = join(import.meta.dir, "..");
 
@@ -317,10 +317,16 @@ describe("config-driven preflight guard fails closed (PCO-348)", () => {
   // Fix pass 2, Important 8: the tracked-config security guard. Bounded by its own MUST-CHECK
   // comment start and the closing `exit 1; }` of its refusal, mirroring extractConfigFileGuard
   // above — extracted for real from the shipped doc, never hand-reimplemented.
+  // Starts at the `readlink -f` resolution, not at the `git -C` line: resolving every symlinked
+  // component is PART of this guard, not a neighbour of it. A committed directory symlink
+  // otherwise defeats the refusal outright — `git -C` chdirs through the link, the absolute
+  // pathspec matches nothing in the index, `--error-unmatch` exits 1, and the guard reads "not
+  // tracked" for a config the branch under review committed. Extracting from `git -C` alone left
+  // that bypass untested (and the standalone runs below would not exercise the resolution at all).
   function extractTrackedConfigGuard(): string {
     const block = preflightBlock();
-    const guardStart = block.indexOf("git -C \"$(dirname \"$CONFIG\")\" ls-files --error-unmatch");
-    expect(guardStart, "tracked-config guard not found in Preflight").toBeGreaterThan(-1);
+    const guardStart = block.indexOf('CONFIG_REAL=$(readlink -f "$CONFIG")');
+    expect(guardStart, "tracked-config guard's path resolution not found in Preflight").toBeGreaterThan(-1);
     // Ends at `|| true` (not merely `exit 1; }`) — that trailing clause is what keeps the
     // guard's OWN exit status 0 on the untracked/pass path when it is run standalone (in the
     // real fence, later commands overwrite $? regardless, same as the documented `[ "$seen" =
@@ -404,6 +410,26 @@ describe("config-driven preflight guard fails closed (PCO-348)", () => {
     Bun.spawnSync(["git", "commit", "-q", "-m", "add config"], { cwd: dir });
     const { code, output } = await runScript(`CONFIG='${cfgPath}'\n` + extractTrackedConfigGuard(), {});
     expect(code).not.toBe(0);
+    expect(output).toContain("tracked by git");
+  });
+
+  // MUST-CHECK config-file-must-not-be-tracked-by-git, the bypass half: a COMMITTED DIRECTORY
+  // SYMLINK. The branch under review adds `real/ship.config.json` plus `.drawbar -> real`, so the
+  // config IS committed, but `git -C "$(dirname …)"` chdirs through the link and the absolute
+  // pathspec matches nothing in the index — `--error-unmatch` exits 1 and the `&& { … } || true`
+  // shape reads "not tracked". The planted config's `projectDir` then reaches `--project-dir` and
+  // `git -C`, and its `envDir` reaches `git -C … pull --rebase` (a fetch: the `core.sshCommand`
+  // execution sink of MUST-CHECK path-from-mutable-state-into-git-C-is-code-execution).
+  test("refuses (for real) when the config is committed behind a directory symlink", async () => {
+    const dir = initRealGitRepo();
+    mkdirSync(join(dir, "real"), { recursive: true });
+    writeFileSync(join(dir, "real/ship.config.json"), '{"projectDir":"/attacker"}');
+    symlinkSync("real", join(dir, ".drawbar"));
+    Bun.spawnSync(["git", "add", "-A"], { cwd: dir });
+    Bun.spawnSync(["git", "commit", "-q", "-m", "plant config behind a symlink"], { cwd: dir });
+    const cfgPath = join(dir, ".drawbar/ship.config.json");
+    const { code, output } = await runScript(`CONFIG='${cfgPath}'\n` + extractTrackedConfigGuard(), {});
+    expect(code, `the planted config was accepted: ${output}`).not.toBe(0);
     expect(output).toContain("tracked by git");
   });
 
@@ -499,7 +525,10 @@ describe("config-driven preflight guard fails closed (PCO-348)", () => {
     // shape, so a future re-introduction of parent-walking `dirname` usage still fails this.
     const dirnameOccurrences = (block.match(/dirname/g) ?? []).length;
     expect(dirnameOccurrences, "unexpected number of `dirname` occurrences in Preflight").toBe(1);
-    expect(block).toContain('dirname "$CONFIG"'); // the ONE legitimate reference
+    // A single-level dirname of the SYMLINK-RESOLVED config path (`readlink -f "$CONFIG"`), which
+    // is what makes the tracked-config guard below ask git about the real path instead of chdiring
+    // through a planted directory symlink. Still not a walk-up-to-find-the-repo probe.
+    expect(block).toContain('dirname "$CONFIG_REAL"'); // the ONE legitimate reference
     expect(block).not.toMatch(/\[\s*-d\s+"?\$(PWD|ENV_DIR)\/\.drawbar\/memory"?\s*\]/);
     expect(block).toContain('KB="$ENV_DIR/.drawbar/memory"'); // the ONE legitimate reference
   });
@@ -1476,20 +1505,31 @@ describe("PCO-365 R2 IMPORTANT 5: 'Never stack' is gone from the runbook's Hard 
 // stack.ts, never re-deriving either in bash); §5 becomes "post the summary comment, leave
 // In Progress" with no status transition of any kind.
 //
-// The executable fence that would resolve the base, assert chain integrity, and call `gh pr
-// create` is deliberately NOT specified in §4 — see MUST-CHECK
-// prose-cannot-hold-an-evidence-protocol-split-the-story and PCO-370 (sequenced with R4 /
-// PCO-367). Nothing below pins fenced bash content; every assertion here is a prose pin, plus
-// one absence check proving no fence has crept back in.
+// PCO-370 (R3b) landed §4's executable fence, so three tests that lived here were RETIRED with
+// their written reasons — each existed only to hold the gap open, and each is now false:
+//
+//   - "documents the story-lead's own PR creation as a transitional duplicate removed by R4
+//     (PCO-367)" — R4 landed (04b3077). The story-lead opens no PR at all, so there is no
+//     duplicate to document and no future removal to promise.
+//   - "states the executable fence is deliberately not specified, deferred to PCO-370
+//     alongside R4, and forbids hand-writing a substitute" — the fence IS specified now, and
+//     both blockers that paragraph named ("the story-lead currently cuts every branch from
+//     `main`", "the story-lead still opens its own PR") no longer exist.
+//   - "§4 contains no bash fence at all" — the absence check whose whole purpose was to keep a
+//     substitute from creeping in before PCO-370. Its inverse (exactly ONE fence, whose every
+//     load-bearing line is pinned) lives in the PCO-370 describe below.
+//
+// Everything still pinned here is PROSE. The fence's own pins are in the PCO-370 describe, on
+// literal invocation lines extracted from the raw fence, per MUST-CHECK
+// prose-pins-dont-cover-the-bash-fence-they-describe.
 //
 // Every pin below is on a CONTIGUOUS, whitespace-normalized phrase (never independent
 // tokens) per MUST-CHECK pco352-fixpass-prose-gate-mutation-must-cover-rephrase-not-only-delete:
 // a phrase demoted to a parenthetical aside, or a qualifier weakened, must fail the same test
 // a deletion does.
 describe("PCO-366 R3: ship §4/§5 — open the stacked PR, leave In Progress, pin the prose", () => {
-  // Raw slice (whitespace intact) — the no-bash-fence absence check below needs the literal
-  // ``` markers, which whitespace normalization would otherwise leave undisturbed anyway, but
-  // keeping this raw keeps the intent explicit.
+  // Raw slice (whitespace intact). Every pin in THIS describe normalizes on top of it; the
+  // raw form is what the PCO-370 describe below needs for its literal-invocation-line pins.
   function rawSlice(startMarker: string, endMarker: string): string {
     assertOccursOnce(startMarker);
     assertOccursOnce(endMarker);
@@ -1511,9 +1551,6 @@ describe("PCO-366 R3: ship §4/§5 — open the stacked PR, leave In Progress, p
   function s4(): string {
     return normalizedSlice("## 4.", "## 5.");
   }
-  function s4Raw(): string {
-    return rawSlice("## 4.", "## 5.");
-  }
   function s5(): string {
     return normalizedSlice("## 5.", "## 6.");
   }
@@ -1525,16 +1562,24 @@ describe("PCO-366 R3: ship §4/§5 — open the stacked PR, leave In Progress, p
     );
   });
 
-  test("§4 documents the story-lead's own PR creation as a transitional duplicate removed by R4 (PCO-367)", () => {
+  // Replaces the retired "transitional duplicate" pin (see the describe comment above): R4
+  // landed, so the claim §4 must now carry is that it is the SOLE opener, with the 422 that
+  // makes a second opener unshippable. One contiguous phrase — rewording "only thing in the
+  // whole run" to a softer "generally" must fail this exactly as a deletion does.
+  test("§4 claims sole ownership of PR creation and names the 422 collision that forbids a second opener", () => {
     expect(s4()).toContain(
-      "That call is a **transitional duplicate**: this step opens the PR that actually " +
-        "anchors the stack, and the story-lead's own PR creation is **removed entirely once " +
-        "R4 (PCO-367) lands**",
+      "**This step is the only thing in the whole run that opens a pull request.** The " +
+        "story-lead's own §6 pushes its branch and stops there — it opens none. Were both to " +
+        "open one, they would submit the identical head+base pair on the run's first story, " +
+        "GitHub would refuse the second with a 422",
     );
   });
 
-  test("§4 states the flagged field is consumed against the ok | flagged contract R4 (PCO-367) lands", () => {
-    expect(s4()).toContain("written against the `ok | flagged` contract R4 (PCO-367) lands");
+  test("§4 states the flagged field is consumed against the ok | flagged contract, as a JSON boolean", () => {
+    expect(s4()).toContain(
+      "`FLAGGED` comes from the story-lead's §7 report `status` field, on the `ok | flagged` " +
+        "contract: `flagged` becomes the JSON boolean `true`, `ok` becomes `false`",
+    );
   });
 
   test("§4's flagged-PR-body pin: an Unresolved findings section, built before gh pr create runs, never appended after", () => {
@@ -1548,9 +1593,14 @@ describe("PCO-366 R3: ship §4/§5 — open the stacked PR, leave In Progress, p
   // the full write-up. Republishing file:line / the finding body / a quoted source excerpt in
   // a PUBLIC PR body announces an unpatched detail to every repo watcher before the operator's
   // morning review, so §4 restricts the section to sub-issue ids and titles only.
+  //
+  // PCO-370 (R3b), finding 13: widened from "each out-of-scope finding" to "each surviving
+  // finding". §3 now files a sub-issue for every surviving `findings[]` entry too, which is
+  // what makes an id available to render — without that, this rule was unsatisfiable for the
+  // very entries a `flagged` story is flagged FOR.
   test("§4 restricts '## Unresolved findings' to sub-issue ids and titles only, never the finding body/file:line/quoted source", () => {
     expect(s4()).toContain(
-      "names each out-of-scope finding by its filed sub-issue id and title only — never the " +
+      "names each surviving finding by its filed sub-issue id and title only — never the " +
         "finding body, `file:line`, or a quoted source excerpt",
     );
   });
@@ -1558,11 +1608,16 @@ describe("PCO-366 R3: ship §4/§5 — open the stacked PR, leave In Progress, p
   // MUST-CHECK pco352-fixpass-satisfies-the-gate-header-must-not-cover-a-repick-clause: the
   // "no PR opened" and "PR opened" outcomes differ in KIND, not degree — never one shared
   // "satisfied if any of the following" header.
-  test("§4's two outcomes are marked as differing in kind, not filed under one shared header", () => {
+  test("§4's outcomes are marked as differing in kind, not filed under one shared header", () => {
     expect(s4()).toContain(
-      "These two outcomes differ in kind, not merely in degree — the header below names " +
+      "These three outcomes differ in kind, not merely in degree — the header below names " +
         "which one you're in; never file this under one shared \"satisfied if any of the " +
         "following\" list.",
+    );
+    // Each outcome owns one output prefix, so an operator (or an unattended agent) reading a
+    // refusal line can tell which outcome it is in without inferring it.
+    expect(s4()).toContain(
+      "`NO_PR:` is Outcome A, `PR_UNRECORDED:` is Outcome C, `PR_OPENED:` is Outcome B.",
     );
   });
 
@@ -1584,28 +1639,30 @@ describe("PCO-366 R3: ship §4/§5 — open the stacked PR, leave In Progress, p
     expect(s4()).toContain(
       "**Outcome B — the PR opened.** Record `{story, branch, pr, base, flagged}` in the run " +
         "state's `stack` array — `pr` as a JSON number (a positive integer, never the string " +
-        "form) and `flagged` as a JSON boolean — then continue to §5.",
+        "form) and `flagged` as a JSON boolean — which is what the fence's `jq --argjson` " +
+        "builds and what its closing `assert-chain` re-read proves round-trips, then continue " +
+        "to §5.",
     );
   });
 
-  // MUST-CHECK prose-cannot-hold-an-evidence-protocol-split-the-story: the deferred fence's
-  // absence must be a WRITTEN reason, not silence, so a future reader does not hand-write a
-  // substitute. Deleting the block, or keeping a block that no longer names PCO-370 or the
-  // do-not-hand-write instruction, must fail this — it is one contiguous phrase, not
-  // independent tokens.
-  test("§4 states the executable fence is deliberately not specified, deferred to PCO-370 alongside R4, and forbids hand-writing a substitute", () => {
+  // PCO-370 fix pass, finding "no operator instruction for `the PR is open but recording it
+  // failed`": six refusals sat AFTER `gh pr create` succeeded, four of them saying only
+  // "refusing." and one prefixed `NO_PR:` while its own text said a PR stays open. Outcome A
+  // defines NO_PR as a refusal at one of the three required checks, so an unattended agent at
+  // 3am had no rule for this state at all: the story is parked with the wrong reason, the PR is
+  // orphaned, and a retry hits the 422 §4's opening paragraph warns about. Pinned as one
+  // contiguous phrase so softening it fails exactly as deleting it does.
+  test("§4's Outcome C covers 'the PR opened but the run state does not record it', and forbids a retry", () => {
     expect(s4()).toContain(
-      "**Deliberately not specified here: the executable fence.** This section's stacked-PR-" +
-        "opening logic — resolving the base, asserting chain integrity, and calling `gh pr " +
-        "create` — is deferred to **PCO-370** and must land together with **R4 (PCO-367)**; " +
-        "nobody should hand-write a substitute here in the meantime.",
+      "**Outcome C — the PR opened but the run state does not record it (halt).** Every " +
+        "refusal after `gh pr create` returns — an unreadable or non-integer PR number, a " +
+        "`FLAGGED` that is not a JSON literal, an entry that cannot be built, appended, or " +
+        "written, or a round-trip that fails — is prefixed `PR_UNRECORDED:` and leaves a real " +
+        "pull request open with nothing in the `stack` array pointing at it. It is not Outcome " +
+        "A: no `NO_PR:` line is printed, because a PR exists. Go to *Parking a story*, and make " +
+        "`parked_reason` say that the PR is open and unrecorded, with its URL. **Never re-run " +
+        "this step for that story**",
     );
-  });
-
-  // Mutation-proof against a trivial fence creeping back in while PCO-370 is still open —
-  // re-adding even a one-line ```bash``` fence must fail this.
-  test("§4 contains no bash fence at all — the executable PR-opening logic is deferred to PCO-370", () => {
-    expect(s4Raw()).not.toMatch(/```/);
   });
 
   test("§5 pins 'Leave the story In Progress. No status transition of any kind' as one contiguous phrase", () => {
@@ -1627,6 +1684,1129 @@ describe("PCO-366 R3: ship §4/§5 — open the stacked PR, leave In Progress, p
       "what shipped, the PR link, the stack position (this story's place in the run's " +
         "stack, e.g. \"position 3 of the run, based on `<BASE>`\"), the sub-issues filed in " +
         "§3, and the story-lead's `mutation_pairs`.",
+    );
+  });
+});
+
+// PCO-370 (R3b): §4's EXECUTABLE stacked-PR fence. R3 (PCO-366) landed §4's narrative and
+// deliberately left the fence out; this describe pins the fence, and with it the fourteen
+// review findings that landed alongside it.
+//
+// Discipline, per MUST-CHECK prose-pins-dont-cover-the-bash-fence-they-describe (as amended):
+// every constraint naming a CLI flag or a specific derivation is pinned on the LITERAL
+// INVOCATION LINE, extracted from the RAW (non-whitespace-normalized) fence — never on the
+// prose beside it, and never as two independent `toContain` tokens that a reworded comment
+// alone would satisfy. That vacuous shape is exactly what let a reviewer swap
+// `RESOLVED=$(... ship-config.ts validate ...)` for `RESOLVED=$(jq -c ".resolved_config"
+// "$STATE")` with the whole suite green. Where a guard can be executed, it is: extracted from
+// the shipped doc by its own marker comments and run for real (MUST-CHECK
+// verification-harness-must-replicate-full-fixture), never reimplemented here.
+describe("PCO-370 R3b: §4's executable stacked-PR fence", () => {
+  const SHIP = "commands/drawbar-ship.md";
+  const AGENT = "agents/drawbar-story-lead.md";
+
+  function shipDoc(): string {
+    return readNonEmpty(join(root, SHIP));
+  }
+
+  // MUST-CHECK doc-fence-slice-marker-must-not-appear-in-comments: assert each slice marker
+  // occurs EXACTLY once before slicing on it — `assertOccursOnce` is the module-level helper.
+  function rawSection(startMarker: string, endMarker: string): string {
+    assertOccursOnce(startMarker);
+    assertOccursOnce(endMarker);
+    const txt = shipDoc();
+    const start = txt.indexOf(startMarker);
+    const end = txt.indexOf(endMarker, start);
+    expect(end, `'${endMarker}' not found after '${startMarker}'`).toBeGreaterThan(start);
+    return txt.slice(start, end);
+  }
+
+  // MUST-CHECK doc-grep-assertion-must-normalize-whitespace — for PROSE only.
+  function section(startMarker: string, endMarker: string): string {
+    return rawSection(startMarker, endMarker).replace(/\s+/g, " ");
+  }
+
+  // The ONE bash fence in §4, raw. Every pin below keys off this.
+  function fence(): string {
+    const fences = [...rawSection("## 4.", "## 5.").matchAll(/```bash\n([\s\S]*?)```/g)].map((m) => m[1]!);
+    expect(fences.length, "§4 must carry exactly one bash fence").toBe(1);
+    expect(fences[0]!.length, "§4's fence is suspiciously short — did it get gutted?").toBeGreaterThan(2000);
+    return fences[0]!;
+  }
+
+  // The fence with COMMENT lines removed. Every "must NOT contain" assertion runs against
+  // this: §4's comments legitimately name the forbidden constructs in order to forbid them
+  // (`never `jq '.resolved_config' "$STATE"``), so an absence check over the raw text would be
+  // satisfiable only by deleting the explanation — the opposite of the intent.
+  function code(): string {
+    return fence()
+      .split("\n")
+      .filter((l) => !/^\s*#/.test(l))
+      .join("\n");
+  }
+
+  // Preflight's own fence — the source of truth §4's re-derived guards are compared AGAINST,
+  // so the two can never drift into "similar but not the same". Mirrors the extraction the
+  // PCO-348 describe above performs, anchored on the Preflight heading so §4's fence can never
+  // be picked up by accident.
+  function preflightFence(): string {
+    const txt = shipDoc();
+    const sectionStart = txt.indexOf("## Preflight (halt on any failure)");
+    expect(sectionStart, "Preflight heading not found").toBeGreaterThan(-1);
+    const fenceStart = txt.indexOf("```bash", sectionStart);
+    const fenceEnd = txt.indexOf("```", fenceStart + 7);
+    expect(fenceEnd).toBeGreaterThan(fenceStart);
+    return txt.slice(fenceStart + 7, fenceEnd);
+  }
+
+  // Exactly one line starting with `prefix`, returned verbatim. "Exactly one" is load-bearing:
+  // a SECOND assignment of the same variable further down silently overwrites the pinned one,
+  // and a `toContain` on the first would never notice.
+  function oneLine(block: string, prefix: string, label: string): string {
+    const hits = block.split("\n").filter((l) => l.startsWith(prefix));
+    expect(
+      hits.length,
+      `${label}: expected exactly one line starting with ${JSON.stringify(prefix)}, found ${hits.length}`,
+    ).toBe(1);
+    return hits[0]!;
+  }
+
+  // A marker-bounded guard block, extracted from the shipped doc so it can be RUN. The marker
+  // comments in §4 are an intentional test seam, the same one Preflight's
+  // `# --- derive from the resolved config` markers are.
+  function markedBlock(startMarker: string, endMarker: string): string {
+    const f = fence();
+    for (const m of [startMarker, endMarker]) {
+      const n = f.split(m).length - 1;
+      expect(n, `'${m}' must occur exactly once in §4's fence, found ${n}`).toBe(1);
+    }
+    const start = f.indexOf(startMarker);
+    const end = f.indexOf(endMarker, start);
+    expect(end, `'${endMarker}' not found after '${startMarker}' in §4's fence`).toBeGreaterThan(start);
+    return f.slice(start, end);
+  }
+
+  // The CONTENT of one quoted heredoc in §4's fence — i.e. the instruction the agent actually
+  // fills in. This text is not a comment, so `code()` keeps it, but nothing pinned it: the
+  // `## Unresolved findings` rendering rule could be rewritten to emit `file:line` and the whole
+  // suite stayed green, because the only pin on that rule lived in §4's PROSE (MUST-CHECK
+  // prose-pins-dont-cover-the-bash-fence-they-describe, applied to a heredoc rather than a
+  // command line).
+  function heredocBody(sentinel: string): string {
+    const f = fence();
+    const opener = `<<'${sentinel}'\n`;
+    const open = f.indexOf(opener);
+    expect(open, `heredoc ${sentinel} is not opened in quoted form`).toBeGreaterThan(-1);
+    const start = open + opener.length;
+    const end = f.indexOf(`\n${sentinel}\n`, start);
+    expect(end, `heredoc ${sentinel} is never terminated`).toBeGreaterThan(start);
+    const body = f.slice(start, end);
+    expect(body.length, `heredoc ${sentinel} is suspiciously empty`).toBeGreaterThan(30);
+    return body;
+  }
+
+  async function runScript(script: string, env: Record<string, string> = {}): Promise<{ exitCode: number; output: string }> {
+    const proc = Bun.spawn(["bash", "-c", script], {
+      env: { PATH: process.env.PATH ?? "", ...env },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const out = await new Response(proc.stdout).text();
+    const err = await new Response(proc.stderr).text();
+    return { exitCode: await proc.exited, output: out + err };
+  }
+
+  // Carries an arbitrary literal into a bash variable without this test file itself becoming
+  // the injection vector: a QUOTED heredoc, exactly the mechanism §4's fence uses.
+  function assignLiteral(name: string, value: string): string {
+    return `${name}=$(cat <<'TEST_LITERAL_SENTINEL'\n${value}\nTEST_LITERAL_SENTINEL\n)`;
+  }
+
+  test("§4 carries exactly one bash fence, and it is substantial", () => {
+    expect(fence().length).toBeGreaterThan(2000);
+  });
+
+  // --- CRITICAL 1: the trust root is a FRESH ship-config.ts validate ------------------------
+  //
+  // The R3 pin asserted only that the fence CONTAINED the tokens `ship-config.ts` and
+  // `validate` as two independent substrings — satisfiable by a comment. Pinned on the literal
+  // invocation line instead, and cross-derived from Preflight's own line so the two cannot
+  // drift into two different "fresh validates".
+  test("CRITICAL 1: $RESOLVED comes from one literal ship-config.ts validate invocation, byte-identical to Preflight's", () => {
+    const line = oneLine(fence(), "RESOLVED=", "§4's RESOLVED assignment");
+    expect(line).toBe(
+      'RESOLVED=$(echo "$LINEAR_FACTS_JSON" | bun run "${CLAUDE_PLUGIN_ROOT}/scripts/lib/ship-config.ts" validate --config "$CONFIG") \\',
+    );
+    // Cross-derived: Preflight's line is the canonical one; §4's must be the same call, not a
+    // lookalike. Mutating either side alone fails this.
+    expect(line).toBe(oneLine(preflightFence(), "RESOLVED=", "Preflight's RESOLVED assignment"));
+  });
+
+  // The NEGATIVE half of Critical 1, and the exact mutation MUST-CHECK
+  // r3-must-not-source-project-dir-from-pasted-run-state exists to close: sourcing $RESOLVED
+  // (and therefore --project-dir) from the agent-writable run-state file makes stack.ts's
+  // equality guard a tautology about the attacker's own directory.
+  test("CRITICAL 1: $RESOLVED is never sourced from the run-state file, and --project-dir comes from it", () => {
+    const c = code();
+    const line = oneLine(fence(), "RESOLVED=", "§4's RESOLVED assignment");
+    expect(line).not.toContain("$STATE");
+    expect(line).not.toContain("runs/");
+    expect(line).not.toContain("resolved_config");
+    // Nothing in the executable body reads `resolved_config` at all — that key exists only in
+    // the state file, and every legitimate mention of it in §4 is a comment.
+    expect(c).not.toContain("resolved_config");
+    // PROJECT_DIR is derived from $RESOLVED, and it is what every assert-chain call is anchored
+    // on. Both invocations, pinned as literal lines.
+    expect(c).toContain(`PROJECT_DIR=$(echo "$RESOLVED" | jq -r '.projectDir // empty')`);
+    const chainCalls = c.split("\n").filter((l) => l.includes("stack.ts\" assert-chain"));
+    expect(chainCalls.length, "§4 must call assert-chain exactly twice (before, and to round-trip after)").toBe(2);
+    for (const call of chainCalls) {
+      expect(call).toContain(`--project-dir "$PROJECT_DIR"`);
+      expect(call).not.toContain("jq");
+    }
+  });
+
+  // --- CRITICAL 4: $CONFIG is re-resolved from $PWD, so Preflight's guards run again ---------
+  //
+  // Byte-identical to Preflight's, derived from Preflight rather than hand-copied here, so
+  // "the same guard" is a fact the test establishes instead of a claim a comment makes.
+  test("CRITICAL 4: §4 re-runs BOTH of Preflight's $CONFIG guards verbatim", () => {
+    const f = fence();
+    const pf = preflightFence();
+    expect(oneLine(f, 'CONFIG="${DRAWBAR_SHIP_CONFIG', "§4's CONFIG resolution")).toBe(
+      oneLine(pf, 'CONFIG="${DRAWBAR_SHIP_CONFIG', "Preflight's CONFIG resolution"),
+    );
+    expect(oneLine(f, '[ -f "$CONFIG" ]', "§4's config-file-existence guard")).toBe(
+      oneLine(pf, '[ -f "$CONFIG" ]', "Preflight's config-file-existence guard"),
+    );
+    // The symlink resolution the tracked-config guard asks git about is part of the guard: a
+    // committed directory symlink otherwise makes `--error-unmatch` exit 1 for a config that IS
+    // committed, and the refusal never fires. Pinned as a literal line on BOTH sides, so §4's copy
+    // cannot keep the `git -C` line while quietly dropping the resolution it depends on.
+    expect(oneLine(f, "CONFIG_REAL=", "§4's config path resolution")).toBe(
+      oneLine(pf, "CONFIG_REAL=", "Preflight's config path resolution"),
+    );
+    expect(oneLine(f, "CONFIG_REAL=", "§4's config path resolution")).toBe(
+      `CONFIG_REAL=$(readlink -f "$CONFIG") || { echo "FATAL: cannot resolve $CONFIG to a real path — refusing."; exit 1; }`,
+    );
+    // …and it runs BEFORE the guard that consumes it.
+    expect(f.indexOf("CONFIG_REAL=")).toBeLessThan(f.indexOf("ls-files --error-unmatch"));
+    // The tracked-config refusal spans three lines (continuation, refusal, `|| true`).
+    const trackedPrefix = 'git -C "$(dirname "$CONFIG_REAL")" ls-files --error-unmatch';
+    function trackedGuard(block: string, label: string): string {
+      const lines = block.split("\n");
+      const start = lines.findIndex((l) => l.startsWith(trackedPrefix));
+      expect(start, `${label}: tracked-config guard not found`).toBeGreaterThan(-1);
+      const end = lines.findIndex((l, i) => i >= start && l.trim() === "|| true");
+      expect(end, `${label}: tracked-config guard's '|| true' not found`).toBeGreaterThan(start);
+      return lines.slice(start, end + 1).join("\n");
+    }
+    expect(trackedGuard(f, "§4")).toBe(trackedGuard(pf, "Preflight"));
+    // And the guards run BEFORE the validate whose --config they protect.
+    expect(f.indexOf(trackedPrefix)).toBeLessThan(f.indexOf("RESOLVED="));
+  });
+
+  // --- CRITICAL 3 / IMPORTANT 6: nothing carries across a Bash tool call --------------------
+  //
+  // MUST-CHECK cross-fence-shell-state-must-be-rederived-for-every-consumed-var and
+  // cross-invocation-guard-applies-per-variable-not-per-fence. A generic detector, not a
+  // hand-listed set: every uppercase variable the fence CONSUMES must have been ASSIGNED
+  // earlier in the same fence, or be one of the three ambient values the runbook deliberately
+  // inherits. This is what closes IMPORTANT 6 ($LINEAR_FACTS_JSON consumed, never bound) for
+  // good rather than for one variable.
+  const AMBIENT_ALLOWLIST = new Set([
+    "CLAUDE_PLUGIN_ROOT", // guarded by the `:?` line at the top of the fence
+    "DRAWBAR_SHIP_CONFIG", // the operator's own env override, consumed via `:-` with a default
+    "PWD", // shell builtin
+    "LC_ALL", // assigned inside the ref-name gate's subshell, never read
+  ]);
+
+  function unboundVariables(script: string): string[] {
+    const bound = new Set<string>(AMBIENT_ALLOWLIST);
+    const unbound: string[] = [];
+    for (const line of script.split("\n")) {
+      const assignments = [...line.matchAll(/\b([A-Z][A-Z0-9_]*)=/g)].map((m) => ({ name: m[1]!, at: m.index! }));
+      for (const ref of line.matchAll(/\$\{?([A-Z][A-Z0-9_]*)/g)) {
+        const name = ref[1]!;
+        if (bound.has(name)) continue;
+        if (assignments.some((a) => a.name === name && a.at < ref.index!)) continue;
+        unbound.push(name);
+      }
+      for (const a of assignments) bound.add(a.name);
+    }
+    return [...new Set(unbound)];
+  }
+
+  test("the unbound-variable detector actually detects (positive control)", () => {
+    expect(unboundVariables('echo "$LINEAR_FACTS_JSON"')).toEqual(["LINEAR_FACTS_JSON"]);
+    expect(unboundVariables('X=1\necho "$X"')).toEqual([]);
+    expect(unboundVariables('Y=$(f); echo "$Y"')).toEqual([]);
+    expect(unboundVariables('echo "$Y"; Y=1')).toEqual(["Y"]);
+    expect(unboundVariables(': "${CLAUDE_PLUGIN_ROOT:?x}"')).toEqual([]);
+    expect(unboundVariables('echo "${REPO}"')).toEqual(["REPO"]);
+  });
+
+  test("CRITICAL 3 / IMPORTANT 6: every variable §4's fence consumes is bound earlier in the same fence", () => {
+    expect(unboundVariables(code())).toEqual([]);
+  });
+
+  // Every literal-invocation pin below is extracted with `oneLine`, which anchors on
+  // `startsWith` — so an INDENTED re-assignment inside a block
+  // (`if [ -z "$BASE" ]; then BASE=$(git rev-parse …); fi`) silently overwrites the pinned value
+  // while every one of those pins still passes. Asserted here once, generically, for the whole
+  // derived set: exactly one assignment each, at any indentation.
+  test("CRITICAL 1/3 + Locked A: every value §4's fence derives is assigned exactly once, at any indentation", () => {
+    const c = code();
+    const DERIVED = [
+      "ARG", "STORY", "BRANCH", "FLAGGED", "LINEAR_FACTS_JSON",
+      "IN_DIR", "INPUTS", "BRANCH_FILE", "PR_TITLE_FILE", "PR_BODY_FILE",
+      "CONFIG", "CONFIG_REAL", "RESOLVED", "ENV_DIR", "PROJECT_DIR", "REPO", "STATE",
+      "CHAIN_JSON", "CHAIN_OK", "CHAIN_REASON",
+      "BASE_JSON", "BASE", "BASE_REASON",
+      "PR_URL", "PR", "ENTRY", "NEXT_STATE",
+      "VERIFY_JSON", "VERIFY_OK", "VERIFY_REASON",
+    ];
+    for (const name of DERIVED) {
+      const hits = [...c.matchAll(new RegExp(`(?:^|[\\s;{(])${name}=`, "gm"))];
+      expect(hits.length, `${name} must be assigned exactly once in §4's fence, found ${hits.length}`).toBe(1);
+    }
+  });
+
+  test("CRITICAL 3: the not-empty / not-\"null\" assert loop covers the WHOLE derived set, per variable", () => {
+    const derive = markedBlock("# --- derive from the resolved config (§4)", "# --- end derive from the resolved config (§4)");
+    const derived = [...derive.matchAll(/^([A-Z][A-Z0-9_]*)=\$\(echo "\$RESOLVED" \| jq -r '\.[A-Za-z]+ \/\/ empty'\)$/gm)].map(
+      (m) => m[1]!,
+    );
+    expect(derived.length, "no `jq -r` derivations from $RESOLVED found").toBeGreaterThan(2);
+    const loop = derive.match(/^for v in ([A-Z0-9_ ]+); do$/m);
+    expect(loop, "the derive block's assert loop is missing").not.toBeNull();
+    expect([...loop![1]!.trim().split(/\s+/)].sort()).toEqual([...derived].sort());
+    expect(derive).toContain(
+      '[ -n "$val" ] && [ "$val" != "null" ] || { echo "FATAL: $v is empty or null after validation — refusing."; exit 1; }',
+    );
+  });
+
+  test("CRITICAL 3: the derive block really refuses an empty projectDir (extracted from the doc, run for real)", async () => {
+    const derive = markedBlock("# --- derive from the resolved config (§4)", "# --- end derive from the resolved config (§4)");
+    const { exitCode, output } = await runScript(
+      `RESOLVED='{"envDir":"/tmp/e","projectDir":"","repo":"acme/widgets"}'\n` + derive,
+    );
+    expect(exitCode).not.toBe(0);
+    expect(output).toContain("PROJECT_DIR is empty or null");
+  });
+
+  test("CRITICAL 3: the derive block really refuses a repo that arrives as the literal string null", async () => {
+    const derive = markedBlock("# --- derive from the resolved config (§4)", "# --- end derive from the resolved config (§4)");
+    const { exitCode, output } = await runScript(
+      `RESOLVED='{"envDir":"/tmp/e","projectDir":"/tmp/p","repo":null}'\n` + derive,
+    );
+    expect(exitCode).not.toBe(0);
+    expect(output).toContain("REPO is empty or null");
+  });
+
+  test("CRITICAL 3: the inputs assert loop covers every value read out of the inputs heredoc", () => {
+    const c = code();
+    const read = [...c.matchAll(/^([A-Z][A-Z0-9_]*)=\$\(jq -[rc] .*"\$INPUTS"\)$/gm)].map((m) => m[1]!);
+    expect(read.length, "no values read out of the inputs heredoc").toBeGreaterThan(3);
+    const loop = c.match(/^for v in ([A-Z0-9_ ]+); do$/m);
+    expect(loop, "the inputs assert loop is missing").not.toBeNull();
+    expect([...loop![1]!.trim().split(/\s+/)].sort()).toEqual([...read].sort());
+  });
+
+  // Per-CONJUNCT, not merely per-variable. The derive loop's body was pinned as a literal while
+  // the inputs loop's was not, so dropping `&& [ "$val" != "null" ]` from the inputs loop alone
+  // survived: a value arriving as the STRING "null" then satisfies the surviving `-n` check and
+  // flows on into `--head` / the stack entry. Both loop bodies are pinned here, generically, so
+  // a third loop cannot be added without one.
+  test('CRITICAL 3: BOTH assert loops keep the not-empty AND not-"null" conjuncts, and refuse by exiting', () => {
+    const bodies = [...code().matchAll(/^for v in [A-Z0-9_ ]+; do\n  val="\$\{!v\}"\n  ([^\n]*)$/gm)].map((m) => m[1]!);
+    expect(bodies.length, "expected exactly two `for v in …; do` assert loops in §4's fence").toBe(2);
+    for (const body of bodies) {
+      expect(body, `an assert loop body is not the two-conjunct fail-closed form: ${body}`).toMatch(
+        /^\[ -n "\$val" \] && \[ "\$val" != "null" \] \|\| \{ echo "FATAL: [^"]*"; exit 1; \}$/,
+      );
+    }
+  });
+
+  // The two inputs that are TYPE-checked at the source rather than merely asserted non-empty,
+  // each pinned as its literal read line. `flagged` reaches `jq --argjson` (where the string
+  // "true" would produce a string in the stack entry) and `teams` reaches `ship-config.ts
+  // validate`'s `isLinearFacts` contract on stdin. Only `FLAGGED`'s check was pinned before, so
+  // relaxing `teams` to a bare `{teams:.teams}` — or widening the accepted type — survived.
+  test("CRITICAL 3 / IMPORTANT 6: `flagged` and `teams` are TYPE-checked where they are read", () => {
+    const c = code();
+    expect(c).toContain(
+      `FLAGGED=$(jq -r 'if (.flagged|type)=="boolean" then (.flagged|tostring) else empty end' "$INPUTS")`,
+    );
+    expect(c).toContain(
+      `LINEAR_FACTS_JSON=$(jq -c 'if (.teams|type)=="array" then {teams:.teams} else empty end' "$INPUTS")`,
+    );
+    // …and the heredoc that supplies them says so, so the agent filling it in cannot satisfy the
+    // placeholder with a quoted string and be refused only at runtime.
+    expect(heredocBody("DRAWBAR_INPUTS_SENTINEL")).toContain(
+      '"flagged": <the report `status`: flagged -> true, ok -> false; a JSON boolean, never a string>',
+    );
+  });
+
+  // The inputs heredoc is parsed by `jq` before ANY value is read out of it, so a heredoc the
+  // agent filled in wrongly halts at one guard instead of yielding five empty reads. Deleting
+  // this line, or downgrading its refusal to a warning, both survived before this pin.
+  test("CRITICAL 3: the inputs heredoc is proved to be valid JSON before any value is read out of it", () => {
+    const c = code();
+    const line = oneLine(c, "jq -e . ", "§4's inputs-JSON validity gate");
+    expect(line).toBe(
+      `jq -e . "$INPUTS" >/dev/null 2>&1 || { echo "FATAL: the inputs heredoc is not valid JSON — refusing."; exit 1; }`,
+    );
+    expect(c.indexOf(line), "the validity gate must precede the first read out of $INPUTS").toBeLessThan(
+      c.indexOf(`ARG=$(jq -r '.arg // empty' "$INPUTS")`),
+    );
+  });
+
+  // --- CRITICAL 2: report text never reaches a command line ---------------------------------
+  test("CRITICAL 2: gh pr create is one literal invocation with --repo/--base/--head and --body-file", () => {
+    const line = oneLine(fence(), "PR_URL=", "§4's gh pr create invocation");
+    expect(line).toBe(
+      'PR_URL=$(gh pr create --repo "$REPO" --base "$BASE" --head "$BRANCH" --title "$(cat "$PR_TITLE_FILE")" --body-file "$PR_BODY_FILE") \\',
+    );
+    const c = code();
+    // `--body` (the inline form) must not exist anywhere: it is the one flag that would take
+    // report text as an argv element.
+    expect(c).not.toMatch(/--body(?!-file)\b/);
+    // …and no title/body/branch text is ever interpolated from a variable into the argv.
+    expect(c).not.toMatch(/--title "\$[A-Z]/);
+  });
+
+  test("CRITICAL 2: every agent-substituted value arrives through a QUOTED heredoc with a unique sentinel", () => {
+    const c = code();
+    const sentinels = [
+      "DRAWBAR_INPUTS_SENTINEL",
+      "DRAWBAR_BRANCH_SENTINEL",
+      "DRAWBAR_PR_TITLE_SENTINEL",
+      "DRAWBAR_PR_BODY_SENTINEL",
+    ];
+    expect(new Set(sentinels).size, "sentinels must be distinct").toBe(sentinels.length);
+    for (const s of sentinels) {
+      // Quoted form only — `<<SENTINEL` and `<<"SENTINEL"` both EXPAND, which is the whole bug.
+      expect(c, `${s} must be opened as a quoted heredoc`).toContain(`<<'${s}'`);
+      expect(c).not.toContain(`<<${s}`);
+      expect(c).not.toContain(`<<"${s}"`);
+      // Exactly two occurrences: the opener and the terminator. A third means the sentinel is
+      // no longer unique to its own block.
+      expect(c.split(s).length - 1, `${s} must occur exactly twice (open + terminate)`).toBe(2);
+    }
+    expect(c).toMatch(/^cat > "\$INPUTS" <<'DRAWBAR_INPUTS_SENTINEL'$/m);
+    expect(c).toMatch(/^cat > "\$BRANCH_FILE" <<'DRAWBAR_BRANCH_SENTINEL'$/m);
+    expect(c).toMatch(/^cat > "\$PR_TITLE_FILE" <<'DRAWBAR_PR_TITLE_SENTINEL'$/m);
+    expect(c).toMatch(/^cat > "\$PR_BODY_FILE" <<'DRAWBAR_PR_BODY_SENTINEL'$/m);
+    // Every one of those files lives under the `mktemp -d` directory, pinned as its own literal
+    // line: a fixed, world-guessable path lets a local user pre-plant a symlink at it, and each
+    // `cat >` redirect FOLLOWS symlinks — truncating an arbitrary file the operator can write, and
+    // substituting the very body the fence then hands to `gh --body-file`. Only the `||` guard's
+    // shape was pinned before, so swapping `mktemp -d` for `/tmp/<fixed>` survived.
+    expect(oneLine(c, "IN_DIR=", "§4's temp-dir creation")).toBe(
+      'IN_DIR=$(mktemp -d) || { echo "FATAL: mktemp -d failed — refusing."; exit 1; }',
+    );
+    for (const [name, leaf] of [
+      ["INPUTS", "inputs.json"],
+      ["BRANCH_FILE", "branch"],
+      ["PR_TITLE_FILE", "title"],
+      ["PR_BODY_FILE", "body"],
+    ] as [string, string][]) {
+      expect(oneLine(c, `${name}=`, `§4's ${name} path`)).toBe(`${name}="\${IN_DIR}/${leaf}"`);
+    }
+    // Nothing is assigned by interpolating a placeholder: no `<...>` on the right of an `=`.
+    for (const line of c.split("\n")) {
+      expect(line, `placeholder interpolated into an assignment: ${line}`).not.toMatch(/^[A-Z][A-Z0-9_]*=["']?</);
+    }
+  });
+
+  // CRITICAL: a quoted heredoc stops at the first line EQUAL TO ITS TERMINATOR, and the three
+  // terminators are fixed literals published in this public repository. A report line reading
+  // exactly `DRAWBAR_PR_BODY_SENTINEL` therefore closes the heredoc and everything after it is
+  // parsed as shell — arbitrary command execution in an unattended session holding an
+  // authenticated `gh`, with the written file left looking correct. §4's safety argument used to
+  // be stated unconditionally ("inside a QUOTED heredoc nothing expands and no command runs"),
+  // and nothing anywhere required the substituted value to be free of the terminator. A check
+  // inside the fence is not a fix: by the time it runs, the injected commands have already run —
+  // so the requirement is a HALT the agent performs before substituting, pinned here as one
+  // contiguous phrase, and the fence's own comment must not restate the claim unconditionally.
+  test("CRITICAL 2: §4 halts on a substituted value that contains a line equal to a heredoc terminator", () => {
+    const flat = section("## 4.", "## 5.");
+    expect(flat).toContain(
+      "**Before you substitute anything, check every value for a line equal to the terminator " +
+        "you are pasting it under, and halt the run if you find one** — park the story with that " +
+        "as the reason, and never rewrite, escape, or truncate the value to make it fit.",
+    );
+    expect(flat).toContain(
+      "A quoted heredoc protects the value's `\"`, `$` and backticks, but it still ends at the " +
+        "first line equal to its terminator, and these terminators are fixed literals published " +
+        "in this repository",
+    );
+    expect(flat).toContain(
+      "A check inside the fence cannot save you here: by the time any line of it runs, the " +
+        "injected commands have already run.",
+    );
+    // The fence's own comment carries the same qualification, so the executable block cannot be
+    // read as promising unconditional safety on its own.
+    expect(fence().replace(/\s+/g, " ")).toContain(
+      "The one thing a quoted heredoc does # NOT protect against is a substituted line equal " +
+        "to the terminator itself — that closes the # heredoc and the rest is parsed as shell, so " +
+        "the halt instruction above this fence is part of # the guarantee, not an aside, and no " +
+        "check placed here could replace it.",
+    );
+  });
+
+  // CRITICAL: JSON KEY injection. `branch` used to be pasted between two `"` inside the
+  // hand-assembled inputs document. A `"` in it does not produce invalid JSON that `jq -e .`
+  // refuses — it APPENDS keys, and jq resolves duplicate keys last-wins, so any key declared
+  // above it (`arg`, which names the state file; `story`, which picks the base) is silently
+  // overridden while both shape gates still pass, because they see only the laundered values.
+  // A key whitelist is no defence: the injected document has exactly the same key set. So the
+  // untrusted value never enters a JSON document at all.
+  test("CRITICAL 2: the branch name never enters the inputs JSON document — it has its own heredoc file", () => {
+    const c = code();
+    const inputs = heredocBody("DRAWBAR_INPUTS_SENTINEL");
+    expect(inputs, "`branch` is a key in the hand-assembled JSON document again").not.toContain("branch");
+    expect(c).not.toContain(`jq -r '.branch`);
+    expect(oneLine(c, "BRANCH=", "§4's BRANCH read")).toBe('BRANCH=$(cat "$BRANCH_FILE")');
+    // Every value still inside the document is one the repository under review cannot author, and
+    // the comment above the heredoc says so — pinned as one contiguous phrase.
+    expect(fence().replace(/\s+/g, " ")).toContain(
+      "# `branch` is NOT a key in this document: it derives from the repository under review, " +
+        "and a `\"` # in a value pasted between two `\"` here appends keys rather than breaking " +
+        "the parse — jq takes # the LAST of a duplicate key, so an injected `\"arg\"`/`\"story\"` " +
+        "silently wins and aims $STATE, # assert-chain and resolve-base at a different run. Only " +
+        "values the repository under review # cannot author live in here.",
+    );
+  });
+
+  // Executed, against the doc's OWN read lines: a hostile branch value cannot reach `arg` or
+  // `story` any more. The test writes the two files exactly as the agent's heredocs do (a quoted
+  // heredoc, so this test file is not itself the injection vector) and then runs the shipped
+  // read block verbatim.
+  test("CRITICAL 2: a branch value carrying JSON syntax cannot override arg or story (run for real)", async () => {
+    const read = markedBlock("# --- read the substituted inputs", "# --- end read the substituted inputs");
+    const hostile = 'feature/x", "story": "PCO-111", "arg": "PCO-111';
+    const dir = mkdtempSync(join(tmpdir(), "drawbar-inputs-"));
+    const script = [
+      `INPUTS='${join(dir, "inputs.json")}'`,
+      `BRANCH_FILE='${join(dir, "branch")}'`,
+      `cat > "$INPUTS" <<'TEST_INPUTS_SENTINEL'`,
+      `{ "arg": "PCO-363", "story": "PCO-363", "teams": [{"key":"PCO"}], "flagged": false }`,
+      `TEST_INPUTS_SENTINEL`,
+      `cat > "$BRANCH_FILE" <<'TEST_BRANCH_SENTINEL'`,
+      hostile,
+      `TEST_BRANCH_SENTINEL`,
+      read,
+      `printf 'ARG=%s\\nSTORY=%s\\nBRANCH=%s\\n' "$ARG" "$STORY" "$BRANCH"`,
+    ].join("\n");
+    const { exitCode, output } = await runScript(script);
+    expect(exitCode, `the shipped read block failed: ${output}`).toBe(0);
+    expect(output).toContain("ARG=PCO-363\n");
+    expect(output).toContain("STORY=PCO-363\n");
+    expect(output).toContain(`BRANCH=${hostile}\n`);
+    // …and that same value is then refused outright by the ref-name gate, so it never reaches
+    // `--head` or the stack entry either.
+    const gate = markedBlock("# --- branch ref-name shape gate", "# --- end branch ref-name shape gate");
+    const gated = await runScript(assignLiteral("BRANCH", hostile) + "\n" + gate);
+    expect(gated.exitCode, "the hostile branch value passed the ref-name gate").not.toBe(0);
+  });
+
+  test("CRITICAL 2: $BRANCH is ref-name shape-gated before it reaches --head or the stack entry", () => {
+    const f = fence();
+    const c = code();
+    expect(c).toContain(
+      `( LC_ALL=C; [[ "$BRANCH" =~ ^[A-Za-z0-9][/A-Za-z0-9._-]*$ ]] ) || { echo "FATAL: BRANCH is not a valid git ref name — refusing."; exit 1; }`,
+    );
+    expect(c).toContain(
+      `case "$BRANCH" in *..*|*"@{"*|*.lock) echo "FATAL: BRANCH is not a valid git ref name — refusing."; exit 1;; esac`,
+    );
+    const gateEnd = f.indexOf("# --- end branch ref-name shape gate");
+    expect(gateEnd).toBeGreaterThan(-1);
+    expect(f.indexOf("gh pr create"), "the ref-name gate must precede gh pr create").toBeGreaterThan(gateEnd);
+    expect(f.indexOf("--arg branch"), "the ref-name gate must precede the stack entry").toBeGreaterThan(gateEnd);
+  });
+
+  // Differential, executed: the shipped bash gate and ship-config.ts's `isValidRefName` must
+  // agree on every case. A gate that merely "looks similar" to REF_NAME_SHAPE is what lets a
+  // branch through that `isValidStackEntry` will then reject, bricking the state file after
+  // the PR is already open.
+  test("CRITICAL 2: the shipped $BRANCH gate agrees with ship-config.ts's isValidRefName, case by case", async () => {
+    const gate = markedBlock("# --- branch ref-name shape gate", "# --- end branch ref-name shape gate");
+    const CASES = [
+      "mike/pco-370-fence",
+      "a",
+      "a_b",
+      "HEAD",
+      "feature.x-1",
+      "refs/heads/x",
+      "-lead",
+      "--head",
+      "a..b",
+      "x.lock",
+      "a@{0}",
+      "",
+      "a b",
+      'a" $(id) "b',
+      "a;id",
+      "a$b",
+      "a`id`b",
+      "café",
+      "a\nb",
+    ];
+    let accepted = 0;
+    for (const value of CASES) {
+      const { exitCode } = await runScript(assignLiteral("BRANCH", value) + "\n" + gate);
+      const bashAccepts = exitCode === 0;
+      expect(bashAccepts, `bash gate vs isValidRefName disagree on ${JSON.stringify(value)}`).toBe(isValidRefName(value));
+      if (bashAccepts) accepted++;
+    }
+    // Not vacuous in either direction: some cases pass, some fail.
+    expect(accepted, "every case was refused — the harness is not exercising the accept path").toBeGreaterThan(3);
+    expect(accepted).toBeLessThan(CASES.length);
+  });
+
+  // MUST-CHECK endpoint-injection-not-just-command-injection: `$ARG` is interpolated into the
+  // state-file PATH (`$ENV_DIR/.drawbar/runs/$ARG.json`), so it is gated to a single safe path
+  // segment before `$STATE` is built from it. Deleting this gate — and, separately, dropping the
+  // `*/*` or the `*..*` branch from it — all survived until this pin.
+  test("CRITICAL 2: $ARG is path-segment gated before it is interpolated into the state-file path", () => {
+    const c = code();
+    expect(oneLine(c, 'case "$ARG" in', "§4's ARG path-segment gate")).toBe(
+      `case "$ARG" in ''|*/*|*'\\'*|*..*) echo "FATAL: ARG is not a safe path segment — refusing."; exit 1;; esac`,
+    );
+    const f = fence();
+    expect(
+      f.indexOf('STATE="$ENV_DIR'),
+      "the ARG gate must precede the state-file path it protects",
+    ).toBeGreaterThan(f.indexOf('case "$ARG" in'));
+  });
+
+  // Differential, executed, against run-state.ts's own `arg` validation (reached through the
+  // exported `parseRunState`, never a hand-copied predicate): a gate that admits a traversal
+  // segment writes the run state to a path `parseRunState` then refuses to read back.
+  // Whitespace/control-character cases are deliberately absent — `isNonEmptyTrimmed` refuses
+  // those upstream of the path-segment shape, and this bash gate does not re-implement that half.
+  test("CRITICAL 2: the shipped $ARG gate agrees with parseRunState's arg validation, case by case", async () => {
+    const gate = oneLine(code(), 'case "$ARG" in', "§4's ARG path-segment gate");
+    const CASES = ["PCO-370", "a", "PCO-363.1", "-x", "", "a/b", "../x", "x/..", "a..b", "..", "a\\b"];
+    let accepted = 0;
+    for (const value of CASES) {
+      const { exitCode } = await runScript(assignLiteral("ARG", value) + "\n" + gate);
+      const bashAccepts = exitCode === 0;
+      const parsed = parseRunState(JSON.stringify({ ...FIXTURE_RUN_STATE, arg: value }));
+      expect(bashAccepts, `ARG gate vs parseRunState disagree on ${JSON.stringify(value)}`).toBe(parsed.ok);
+      if (bashAccepts) accepted++;
+    }
+    // Not vacuous in either direction.
+    expect(accepted, "every case was refused — the harness is not exercising the accept path").toBeGreaterThan(2);
+    expect(accepted).toBeLessThan(CASES.length);
+  });
+
+  // --- Locked A: `resolve-base` is the ONLY producer of $BASE --------------------------------
+  //
+  // §4's PROSE says the base is "never re-derived in bash", and `gh pr create`'s literal line
+  // pins `--base "$BASE"` — but nothing pinned where `$BASE` itself comes from. Re-deriving it
+  // from `git symbolic-ref origin/HEAD`, from `git rev-parse --abbrev-ref HEAD`, or from the
+  // agent-writable state file all left the suite green while `--base` stayed present: Locked A's
+  // exact failure mode (a PR whose diff carries every earlier story's work) with the flag intact.
+  test("Locked A: $BASE comes only from resolve-base's verdict, never re-derived in bash or read from the state", () => {
+    const c = code();
+    expect(oneLine(c, "BASE_JSON=", "§4's resolve-base invocation")).toBe(
+      'BASE_JSON=$(bun run "${CLAUDE_PLUGIN_ROOT}/scripts/lib/stack.ts" resolve-base --state "$STATE" --story "$STORY")',
+    );
+    const line = oneLine(c, "BASE=", "§4's BASE derivation");
+    expect(line).toBe(
+      `BASE=$(printf '%s' "\${BASE_JSON:-null}" | jq -r 'if (type=="object" and .ok==true) then .base else empty end' 2>/dev/null)`,
+    );
+    // The verdict is only read on `ok == true`: `.base // empty` alone would accept the `.base`
+    // of a REFUSAL payload, which is how a resolve-base failure becomes a silent wrong base.
+    expect(line).toContain('.ok==true');
+    // Nothing else may produce it.
+    expect(line).not.toMatch(/\bgit\b/);
+    expect(line).not.toContain("$STATE");
+    expect(line).not.toContain("BASE_BRANCH");
+    // …and the refusal is fail-closed on both empty and the literal string "null".
+    expect(c).toContain(
+      `[ -n "$BASE" ] && [ "$BASE" != "null" ] || { BASE_REASON=$(printf '%s' "\${BASE_JSON:-null}" | jq -r '.reason // "unreadable-verdict"' 2>/dev/null); echo "NO_PR: resolve-base refused ($BASE_REASON) — park the story; paraphrase, never paste, the detail on stderr."; exit 1; }`,
+    );
+    // `resolve-base` runs BEFORE the PR is opened, and `$BASE` reaches nothing but `--base`.
+    const f = fence();
+    expect(f.indexOf("gh pr create")).toBeGreaterThan(f.indexOf("resolve-base"));
+  });
+
+  // --- IMPORTANT 9: the PR body's own rendering instruction ----------------------------------
+  //
+  // §4's prose restricting `## Unresolved findings` to sub-issue id + title was pinned; the
+  // heredoc that actually TELLS the agent what to write was not. Rewriting it to render
+  // `file:line` and the finding body left the suite green — the finding-9 disclosure with the
+  // prose pin still passing.
+  test("IMPORTANT 9: the PR-body heredoc itself restricts '## Unresolved findings' to sub-issue id + title", () => {
+    const body = heredocBody("DRAWBAR_PR_BODY_SENTINEL");
+    expect(body.replace(/\s+/g, " ")).toContain(
+      "On a flagged story it is written out here with its `## Unresolved findings` section " +
+        "already in it, listing each surviving finding as `<SUB-ISSUE-ID> — <sub-issue title>` " +
+        "and nothing else: never the finding body, never a `file:line`, never a quoted source " +
+        "excerpt.",
+    );
+  });
+
+  // --- IMPORTANT 7: the PR number is a validated positive integer ---------------------------
+  test("IMPORTANT 7: the PR number comes from `gh pr view --json number`, digits-gated, never basename", () => {
+    const c = code();
+    // Every refusal here is AFTER `gh pr create` returned, so each one says the PR is open and
+    // names Outcome C — `FATAL: … refusing.` said nothing about the pull request it left behind.
+    expect(oneLine(c, "PR=$(", "§4's PR number derivation")).toBe(
+      `PR=$(gh pr view "$PR_URL" --repo "$REPO" --json number -q .number) || { echo "PR_UNRECORDED: gh pr create left no readable PR number — the PR is open; park the story with that reason (Outcome C) and repair the run state by hand."; exit 1; }`,
+    );
+    expect(c).toContain(
+      `case "$PR" in ''|*[!0-9]*) echo "PR_UNRECORDED: PR number is not digits-only — the PR is open; park the story with that reason (Outcome C) and repair the run state by hand."; exit 1;; esac`,
+    );
+    expect(c).toContain(
+      `[ "$PR" -gt 0 ] || { echo "PR_UNRECORDED: PR number is not a positive integer — the PR is open; park the story with that reason (Outcome C) and repair the run state by hand."; exit 1; }`,
+    );
+    expect(c).not.toContain("basename");
+  });
+
+  test("IMPORTANT 7: the shipped PR-number gate refuses everything that is not a positive integer (run for real)", async () => {
+    // The `gh pr view` line is dropped and $PR supplied directly — the two GUARD lines are what
+    // is under test, extracted from the doc rather than restated here.
+    const guard = markedBlock("# --- pr number shape gate", "# --- end pr number shape gate")
+      .split("\n")
+      .filter((l) => !l.startsWith("PR=$("))
+      .join("\n");
+    expect(guard).toContain("digits-only");
+    for (const [value, ok] of [
+      ["42", true],
+      ["1", true],
+      ["0", false],
+      ["-1", false],
+      ["", false],
+      ["1.5", false],
+      ["12a", false],
+      ["4 2", false],
+      ["$(id)", false],
+    ] as [string, boolean][]) {
+      const { exitCode } = await runScript(assignLiteral("PR", value) + "\n" + guard);
+      expect(exitCode === 0, `PR gate verdict wrong for ${JSON.stringify(value)}`).toBe(ok);
+    }
+  });
+
+  // --- CRITICAL 5: the stack entry round-trips through parseRunState ------------------------
+  test("CRITICAL 5: the stack entry is built with --argjson for `pr` and `flagged`, never --arg", () => {
+    const line = oneLine(code(), "ENTRY=$(jq -nc", "§4's stack-entry construction");
+    expect(line).toContain('--argjson pr "$PR"');
+    expect(line).toContain('--argjson flagged "$FLAGGED"');
+    expect(line).not.toMatch(/--arg pr\b/);
+    expect(line).not.toMatch(/--arg flagged\b/);
+    expect(line).toContain("{story:$story,branch:$branch,pr:$pr,base:$base,flagged:$flagged}");
+    // `flagged` is type-checked where it is READ, too — a string "true" never gets that far.
+    expect(code()).toContain(
+      `FLAGGED=$(jq -r 'if (.flagged|type)=="boolean" then (.flagged|tostring) else empty end' "$INPUTS")`,
+    );
+    // …and re-gated to the two JSON literals immediately before `--argjson` consumes it. Deleting
+    // this gate, or widening it to a catch-all `*)`, survived until this pin: `--argjson flagged`
+    // with anything else either aborts `jq` mid-run or lands a non-boolean in the state file.
+    const c = code();
+    expect(c).toContain(
+      `case "$FLAGGED" in true|false) ;; *) echo "PR_UNRECORDED: FLAGGED must be the JSON literal true or false — the PR is open; park the story with that reason (Outcome C) and repair the run state by hand."; exit 1;; esac`,
+    );
+    expect(c.indexOf('case "$FLAGGED" in'), "the FLAGGED literal gate must precede the stack entry").toBeLessThan(
+      c.indexOf("ENTRY=$(jq -nc"),
+    );
+    // …and the APPEND line one line later, which was entirely unpinned: `--argjson entry` ->
+    // `--arg entry` puts a JSON *string* into `stack` (permanently unreadable by `parseRunState`,
+    // with the PR already open), and `.stack += [$entry]` -> `.stack = [$entry]` silently drops
+    // every earlier story from the chain. Both survived a pin that covered only the `ENTRY=` line.
+    expect(oneLine(c, "NEXT_STATE=", "§4's run-state append")).toBe(
+      `NEXT_STATE=$(jq -c --argjson entry "$ENTRY" '.stack += [$entry]' "$STATE") || { echo "PR_UNRECORDED: could not append the stack entry to the run state — the PR is open; park the story with that reason (Outcome C) and repair the run state by hand."; exit 1; }`,
+    );
+    expect(oneLine(c, "printf '%s\\n' \"$NEXT_STATE\"", "§4's run-state write")).toBe(
+      `printf '%s\\n' "$NEXT_STATE" > "$STATE.tmp" && mv "$STATE.tmp" "$STATE" || { echo "PR_UNRECORDED: could not write the run state — the PR is open; park the story with that reason (Outcome C) and repair the run state by hand."; exit 1; }`,
+    );
+  });
+
+  // Executed: the shipped stack-entry block really refuses a `FLAGGED` that is not a JSON
+  // literal, rather than building an entry `isValidStackEntry` rejects on the next read.
+  test("CRITICAL 5: the shipped stack-entry block refuses a non-literal FLAGGED (run for real)", async () => {
+    const block = markedBlock("# --- stack entry", "# --- end stack entry");
+    for (const [value, ok] of [
+      ["true", true],
+      ["false", true],
+      ["yes", false],
+      ["True", false],
+      ["", false],
+      ["1", false],
+      ['"true"', false],
+    ] as [string, boolean][]) {
+      const script = [
+        assignLiteral("STORY", "PCO-370"),
+        assignLiteral("BRANCH", "mike/pco-370-fence"),
+        assignLiteral("BASE", "main"),
+        assignLiteral("PR", "4242"),
+        assignLiteral("FLAGGED", value),
+        block,
+      ].join("\n");
+      const { exitCode } = await runScript(script);
+      expect(exitCode === 0, `FLAGGED gate verdict wrong for ${JSON.stringify(value)}`).toBe(ok);
+    }
+  });
+
+  // A `ResolvedConfig`-shaped payload and the pinned run-state schema, the minimum
+  // `parseRunState` accepts — so the ONLY thing under test below is the entry the shipped
+  // fence builds.
+  const FIXTURE_RESOLVED_CONFIG = {
+    envDir: "/tmp/env-repo",
+    projectDir: "/tmp/project-repo",
+    repo: "acme/widgets",
+    team: "PCO",
+    baseBranch: "main",
+    requiredChecks: ["build"],
+    observed: { projectDirRemote: "acme/widgets", envDirRemote: "acme/knowledge", defaultBranch: "main" },
+  };
+  const FIXTURE_RUN_STATE = {
+    arg: "PCO-363",
+    invoked_as: "parent" as const,
+    started_at: "2026-07-29T00:00:00.000Z",
+    order_rationale: "fixture",
+    snapshot: ["PCO-370"],
+    stories_done: [],
+    in_flight: null,
+    stack: [] as unknown[],
+    subissues_filed: [],
+    resolved_config: FIXTURE_RESOLVED_CONFIG,
+  };
+
+  async function buildEntry(mutate: (block: string) => string = (b) => b): Promise<unknown> {
+    const block = mutate(markedBlock("# --- stack entry", "# --- end stack entry"));
+    const script = [
+      assignLiteral("STORY", "PCO-370"),
+      assignLiteral("BRANCH", "mike/pco-370-fence"),
+      assignLiteral("BASE", "main"),
+      assignLiteral("PR", "4242"),
+      assignLiteral("FLAGGED", "true"),
+      block,
+      `printf '%s' "$ENTRY"`,
+    ].join("\n");
+    const { exitCode, output } = await runScript(script);
+    expect(exitCode, `stack-entry block failed: ${output}`).toBe(0);
+    return JSON.parse(output);
+  }
+
+  test("CRITICAL 5: the entry the shipped fence builds round-trips through parseRunState", async () => {
+    const entry = (await buildEntry()) as Record<string, unknown>;
+    expect(typeof entry.pr, "pr must be a JSON number").toBe("number");
+    expect(typeof entry.flagged, "flagged must be a JSON boolean").toBe("boolean");
+    const parsed = parseRunState(JSON.stringify({ ...FIXTURE_RUN_STATE, stack: [entry] }));
+    expect(parsed.ok, parsed.ok ? "" : `parseRunState refused: ${parsed.reason} (${parsed.detail})`).toBe(true);
+  });
+
+  // Executed, end to end over the shipped APPEND: build the entry with the doc's own block, then
+  // append it to a real state file with the doc's own `NEXT_STATE=` / write lines, and read the
+  // result back through `parseRunState`. This is the step the reviewer's e2e run left as
+  // `[{…}, "{\"story\":…}"]` — permanently unreadable by its own tooling, with an orphan PR open —
+  // because only the `ENTRY=` line was pinned. It also proves `+=` keeps the earlier story.
+  test("CRITICAL 5: the shipped append writes a state parseRunState reads back, earlier stack entries intact", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "drawbar-append-"));
+    const statePath = join(dir, "PCO-363.json");
+    const earlier = { story: "PCO-369", branch: "mike/pco-369", pr: 41, base: "main", flagged: false };
+    writeFileSync(statePath, JSON.stringify({ ...FIXTURE_RUN_STATE, stack: [earlier] }));
+    const script = [
+      assignLiteral("STORY", "PCO-370"),
+      assignLiteral("BRANCH", "mike/pco-370-fence"),
+      assignLiteral("BASE", "mike/pco-369"),
+      assignLiteral("PR", "4242"),
+      assignLiteral("FLAGGED", "true"),
+      `STATE='${statePath}'`,
+      markedBlock("# --- stack entry", "# --- end stack entry"),
+      oneLine(code(), "NEXT_STATE=", "§4's run-state append"),
+      oneLine(code(), "printf '%s\\n' \"$NEXT_STATE\"", "§4's run-state write"),
+    ].join("\n");
+    const { exitCode, output } = await runScript(script);
+    expect(exitCode, `the shipped append failed: ${output}`).toBe(0);
+    const parsed = parseRunState(readFileSync(statePath, "utf8"));
+    expect(parsed.ok, parsed.ok ? "" : `parseRunState refused the appended state: ${parsed.reason}`).toBe(true);
+    if (!parsed.ok) return;
+    expect(parsed.state.stack).toEqual([earlier, { story: "PCO-370", branch: "mike/pco-370-fence", pr: 4242, base: "mike/pco-369", flagged: true }]);
+  });
+
+  // The control that makes the test above mean something: `--arg entry` (a JSON string in the
+  // `stack` array) and `.stack = [$entry]` (every earlier story dropped) are exactly what the
+  // append must never do — run for real against the same fixture.
+  test("CRITICAL 5 control: --arg entry / .stack = [] on the append produce a state parseRunState rejects or a lost chain", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "drawbar-append-ctl-"));
+    const earlier = { story: "PCO-369", branch: "mike/pco-369", pr: 41, base: "main", flagged: false };
+    async function runAppend(mutate: (l: string) => string): Promise<string> {
+      const statePath = join(dir, `${Math.random().toString(36).slice(2)}.json`);
+      writeFileSync(statePath, JSON.stringify({ ...FIXTURE_RUN_STATE, stack: [earlier] }));
+      const script = [
+        assignLiteral("STORY", "PCO-370"),
+        assignLiteral("BRANCH", "mike/pco-370-fence"),
+        assignLiteral("BASE", "mike/pco-369"),
+        assignLiteral("PR", "4242"),
+        assignLiteral("FLAGGED", "true"),
+        `STATE='${statePath}'`,
+        markedBlock("# --- stack entry", "# --- end stack entry"),
+        mutate(oneLine(code(), "NEXT_STATE=", "§4's run-state append")),
+        oneLine(code(), "printf '%s\\n' \"$NEXT_STATE\"", "§4's run-state write"),
+      ].join("\n");
+      const { exitCode, output } = await runScript(script);
+      expect(exitCode, `the mutated append failed to run: ${output}`).toBe(0);
+      return readFileSync(statePath, "utf8");
+    }
+    const asString = parseRunState(await runAppend((l) => l.replace("--argjson entry", "--arg entry")));
+    expect(asString.ok).toBe(false);
+    if (!asString.ok) expect(asString.reason).toBe("invalid_stack_entry");
+    const clobbered = parseRunState(await runAppend((l) => l.replace(".stack += [$entry]", ".stack = [$entry]")));
+    expect(clobbered.ok).toBe(true);
+    if (clobbered.ok) expect(clobbered.state.stack.length, "the earlier story survived a `.stack =` overwrite").toBe(1);
+  });
+
+  // The control that makes the round-trip test above mean something: the natural bash transcription
+  // (`--arg`, producing strings) is exactly what `parseRunState` rejects — with EMPTY stdout
+  // from stack.ts, so the operator would see only a bare `refused ()`.
+  test("CRITICAL 5 control: swapping --argjson for --arg produces a state parseRunState rejects", async () => {
+    const entry = (await buildEntry((b) => b.replace(/--argjson pr /, "--arg pr ").replace(/--argjson flagged /, "--arg flagged "))) as Record<
+      string,
+      unknown
+    >;
+    expect(typeof entry.pr).toBe("string");
+    const parsed = parseRunState(JSON.stringify({ ...FIXTURE_RUN_STATE, stack: [entry] }));
+    expect(parsed.ok).toBe(false);
+    if (parsed.ok) return;
+    expect(parsed.reason).toBe("invalid_stack_entry");
+  });
+
+  test("CRITICAL 5: the fence re-reads the state through assert-chain AFTER writing it", () => {
+    const c = code();
+    const writeAt = c.indexOf("NEXT_STATE=");
+    expect(writeAt, "the state write is missing").toBeGreaterThan(-1);
+    const lastChain = c.lastIndexOf('stack.ts" assert-chain');
+    expect(lastChain, "no assert-chain call after the write — nothing proves the entry round-trips").toBeGreaterThan(writeAt);
+    expect(c).toMatch(
+      /^VERIFY_OK=\$\(printf '%s' "\$\{VERIFY_JSON:-null\}" \| jq -r 'if \(type=="object" and \.ok==true\) then "true" else "false" end' 2>\/dev\/null\)$/m,
+    );
+  });
+
+  // --- IMPORTANT 8: refusal text is paraphrased, never pasted -------------------------------
+  test("IMPORTANT 8: no echo in the fence interpolates a verdict JSON, and `.detail` is never read", () => {
+    const c = code();
+    const echoes = [...c.matchAll(/echo "[^"]*"/g)].map((m) => m[0]);
+    expect(echoes.length, "no echoes found — the extraction is broken").toBeGreaterThan(8);
+    // The three VERDICT JSONs are what carry `.detail`, and none of them may reach an echo.
+    // Named individually rather than matched as `/_JSON/`: `$LINEAR_FACTS_JSON` is legitimately
+    // echoed, because `ship-config.ts validate` reads the Linear facts on STDIN, so a blanket
+    // `_JSON` refusal would either fail on that line or have to be softened until it stopped
+    // covering the verdicts — which are the whole point of finding 8.
+    for (const verdict of ["CHAIN_JSON", "BASE_JSON", "VERIFY_JSON"]) {
+      for (const e of echoes) {
+        expect(e, `an echo carries the raw ${verdict} verdict: ${e}`).not.toContain(verdict);
+      }
+    }
+    // The one permitted `_JSON` echo is the validator's stdin, and it must STAY a pipe: if it
+    // ever becomes operator-facing output the trailing `|` disappears, and that is the mutation
+    // this assertion exists to catch.
+    const jsonEchoes = echoes.filter((e) => /_JSON/.test(e));
+    expect(jsonEchoes, "exactly one echo may carry a JSON payload — the validator's stdin").toEqual([
+      'echo "$LINEAR_FACTS_JSON"',
+    ]);
+    expect(c).toContain('echo "$LINEAR_FACTS_JSON" | bun run');
+    // The `echo "…"` extraction above is necessary but NOT sufficient: it misses `printf 'x %s'
+    // "$CHAIN_JSON"` entirely, and its `[^"]*` stops at the first inner quote, so
+    // `echo "refused ($(printf '%s' "$CHAIN_JSON"))"` slips through as a truncated match. Both
+    // mutations survived. So the containment is asserted on the VARIABLE instead of on the output
+    // command: every textual reference to a verdict JSON, anywhere in the executable body, must
+    // be either its own `X_JSON=$(bun run … stack.ts …)` assignment or a
+    // `printf '%s' "${X_JSON:-null}" | jq -r '…' 2>/dev/null` read. Nothing else — no output
+    // command, present or future — can reach one.
+    // The two filters — and ONLY these two — a verdict JSON may be read with. A wildcard
+    // `jq -r '…'` in this position let `jq -r '.'` through, which renders the WHOLE verdict object
+    // (`.detail`, absolute paths, the real repo slug) into the operator-visible `NO_PR:` echo
+    // while `not.toContain(".detail")` never fires, because `.detail` is not named.
+    const ALLOWED_FILTERS = [
+      `.reason // "unreadable-verdict"`,
+      `if (type=="object" and .ok==true) then "true" else "false" end`,
+      `if (type=="object" and .ok==true) then .base else empty end`,
+    ];
+    for (const verdict of ["CHAIN_JSON", "BASE_JSON", "VERIFY_JSON"]) {
+      const filters = ALLOWED_FILTERS.map((f) => f.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|");
+      const allowedRead = new RegExp(`printf '%s' "\\$\\{${verdict}:-null\\}" \\| jq -r '(?:${filters})' 2>/dev/null`, "g");
+      let sites = 0;
+      for (const rawLine of c.split("\n")) {
+        if (!rawLine.includes(verdict)) continue;
+        sites++;
+        const residue = rawLine
+          .replace(new RegExp(`^${verdict}=\\$\\(bun run "\\$\\{CLAUDE_PLUGIN_ROOT\\}/scripts/lib/stack\\.ts" `), "")
+          .replace(allowedRead, "");
+        expect(
+          residue,
+          `${verdict} reaches something other than its stack.ts assignment or a '%s'|jq read: ${rawLine}`,
+        ).not.toContain(verdict);
+      }
+      // Not vacuous: the assignment plus at least the verdict-check and the refusal read.
+      expect(sites, `no references to ${verdict} found — the scan is broken`).toBeGreaterThan(2);
+    }
+    // `.detail` carries absolute paths and the real repo slug; nothing in §4 reads it at all.
+    expect(c).not.toContain(".detail");
+    // Every verdict refusal derives `.reason`, and only `.reason`.
+    const reasons = [...c.matchAll(/([A-Z][A-Z0-9_]*_REASON)=\$\(printf '%s' "\$\{[A-Z_]+_JSON:-null\}" \| jq -r '\.reason \/\/ "unreadable-verdict"' 2>\/dev\/null\)/g)];
+    expect(reasons.length, "expected one `.reason`-only derivation per verdict-bearing refusal").toBe(3);
+    // …and each refusal site maps to exactly one documented outcome, by count. `NO_PR:` is
+    // Outcome A, whose definition is "a refusal at any of the three required checks", so there are
+    // exactly THREE of them — assert-chain, resolve-base, `gh pr create`. Every refusal AFTER the
+    // PR exists is Outcome C, prefixed `PR_UNRECORDED:` and stating that the PR is open; `> 3`
+    // tolerated five NO_PR sites against three documented checks, two of them for a state in which
+    // a pull request is already open.
+    const noPr = [...c.matchAll(/echo "NO_PR: [^"]*"/g)].map((m) => m[0]);
+    expect(noPr.length, "NO_PR: must mark exactly the three required checks of Outcome A").toBe(3);
+    for (const site of noPr) {
+      expect(site, `a NO_PR: site claims a PR is open — that is Outcome C: ${site}`).not.toContain("PR is open");
+    }
+    const unrecorded = [...c.matchAll(/echo "PR_UNRECORDED: [^"]*"/g)].map((m) => m[0]);
+    expect(unrecorded.length, "every post-create refusal must be an Outcome C site").toBe(8);
+    for (const site of unrecorded) {
+      expect(site, `an Outcome C site does not say the PR is open: ${site}`).toContain(
+        "— the PR is open; park the story with that reason (Outcome C) and repair the run state by hand.",
+      );
+    }
+    // Ordering is what makes the split meaningful. The boundary is the first line that can only
+    // run once `gh pr create` RETURNED successfully — the PR-number read — not the create call
+    // itself, whose own `|| { … }` refusal is the third of Outcome A's checks.
+    const create = c.indexOf("gh pr create");
+    const postCreate = c.indexOf('PR=$(gh pr view');
+    expect(create).toBeGreaterThan(-1);
+    expect(postCreate).toBeGreaterThan(create);
+    for (const site of noPr) {
+      expect(c.indexOf(site), `a NO_PR: site sits after the PR exists: ${site}`).toBeLessThan(postCreate);
+    }
+    for (const site of unrecorded) {
+      expect(c.indexOf(site), `a PR_UNRECORDED: site sits before gh pr create: ${site}`).toBeGreaterThan(create);
+    }
+    // No refusal after the PR exists may fall back to the bare `FATAL: … refusing.` form, which
+    // says nothing about the pull request it leaves behind.
+    for (const line of c.slice(postCreate).split("\n")) {
+      expect(line, `a post-create refusal says only "refusing": ${line}`).not.toMatch(/echo "FATAL:/);
+    }
+  });
+
+  // --- Bash discipline ----------------------------------------------------------------------
+  test("guards are `positive || { … exit 1; }`, with the ONE verbatim-from-Preflight exception", () => {
+    // The tracked-config refusal is `negative && { … } || true` in Preflight and is copied
+    // BYTE-IDENTICALLY (asserted above) — rewording it would defeat the point of reusing it.
+    // Everything else in the fence must use the positive form.
+    const lines = fence().split("\n");
+    const start = lines.findIndex((l) => l.startsWith('git -C "$(dirname "$CONFIG_REAL")" ls-files --error-unmatch'));
+    expect(start).toBeGreaterThan(-1);
+    const end = lines.findIndex((l, i) => i >= start && l.trim() === "|| true");
+    // Comment lines are dropped before the check: bash discipline governs CODE, and the prose
+    // beside this very guard quotes the `&& { … } || true` shape it is explaining. Matching the
+    // explanation instead of the code is MUST-CHECK
+    // doc-fence-slice-marker-must-not-appear-in-comments in its other direction.
+    const rest = [...lines.slice(0, start), ...lines.slice(end + 1)]
+      .filter((l) => !l.trimStart().startsWith("#"))
+      .join("\n");
+    expect(rest).not.toMatch(/&&\s*\{/);
+    // …and the exception really was sliced out, rather than the slice silently covering the
+    // whole fence because a marker moved. Asserted on the SIZE of the removal, not only on what
+    // survives it: the guard is exactly three lines (continuation, refusal, `|| true`), so a
+    // marker that moved and swallowed the rest of the fence fails here rather than quietly
+    // shrinking the text the `&&` check runs over.
+    expect(end - start, "the sliced-out exception is not the three-line tracked-config guard").toBe(2);
+    expect(rest.length, "the slice removed too much — nothing left to check").toBeGreaterThan(2000);
+    expect(rest).toContain("|| { echo");
+    // EVERY `||` is a refusal that EXITS. `|| { echo` as a substring is satisfied by one
+    // conforming guard anywhere in the fence, so downgrading a specific guard to
+    // `|| echo "WARN…"` survived it — and a warning that does not exit lets the fence continue
+    // with the very value the guard exists to reject (an unvalidated $BRANCH straight into
+    // `--head`, or an unmade $IN_DIR into four `cat >` redirects).
+    const refusals = [...lines.slice(0, start), ...lines.slice(end + 1)].filter(
+      (l) => !l.trimStart().startsWith("#") && l.includes("||"),
+    );
+    expect(refusals.length, "no `||` guards found — the extraction is broken").toBeGreaterThan(10);
+    for (const line of refusals) {
+      expect(line.slice(line.indexOf("||")), `a '||' guard that does not refuse-and-exit: ${line}`).toMatch(
+        /^\|\|\s*\{.*exit 1;\s*\}$/,
+      );
+    }
+    // No `mapfile`/`readarray`, and no `set -e`-style implicit reliance.
+    expect(fence()).not.toMatch(/\b(mapfile|readarray)\b/);
+  });
+
+  // --- Findings 10 / 11 / 12: nothing stale is left pointing at a world that no longer exists
+  test("findings 10-12: every retired R3 claim is gone from the runbook", () => {
+    const txt = shipDoc();
+    for (const stale of [
+      "transitional duplicate",
+      "removed entirely once R4",
+      "Deliberately not specified here",
+      "deferred to **PCO-370**",
+      "ready_to_merge",
+      "the story-lead currently cuts every branch from",
+      "the story-lead still opens its own PR",
+      "story-lead's §8",
+      "Same guard drawbar-story-lead",
+    ]) {
+      expect(txt.replace(/\s+/g, " "), `stale claim still present: ${stale}`).not.toContain(stale);
+    }
+  });
+
+  test("finding 11: every story-lead section cross-reference in the runbook resolves to a real heading in the agent", () => {
+    const ship = shipDoc().replace(/\s+/g, " ");
+    const agent = readNonEmpty(join(root, AGENT));
+    const refs = [...ship.matchAll(/story-lead(?:'s)?[^.\n]{0,30}?§\*{0,2}(\d+)/g)].map((m) => m[1]!);
+    expect(refs.length, "no story-lead section cross-references matched — the pattern is broken").toBeGreaterThan(1);
+    for (const n of new Set(refs)) {
+      expect(agent, `the runbook cites the story-lead's §${n}, which has no '## ${n}.' heading`).toContain(`## ${n}.`);
+    }
+    // The specific one finding 11 names: the report is §7 after R4, and it is what FLAGGED reads.
+    expect(ship).toContain("`FLAGGED` comes from the story-lead's §7 report `status` field");
+  });
+
+  test("finding 12: Preflight's CLAUDE_PLUGIN_ROOT comment points at sections that really carry the guard", () => {
+    const marker = ': "${CLAUDE_PLUGIN_ROOT:?CLAUDE_PLUGIN_ROOT must be set}"';
+    const pf = preflightFence();
+    const commentStart = pf.indexOf("# MUST-CHECK repo-anchor-guard-is-what-gates-an-unfixed-vulnerability: fail closed");
+    expect(commentStart, "the CLAUDE_PLUGIN_ROOT guard comment not found").toBeGreaterThan(-1);
+    const comment = pf.slice(commentStart, pf.indexOf(marker, commentStart));
+    // The cross-reference it used to carry would be FALSE: the agent names CLAUDE_PLUGIN_ROOT
+    // nowhere at all, so there is no "same guard" over there to point at.
+    expect(readNonEmpty(join(root, AGENT))).not.toContain("CLAUDE_PLUGIN_ROOT");
+    expect(comment).not.toMatch(/story-lead §\d/);
+    // What it points at instead — §4 and §6 of THIS file — must actually carry the same line.
+    expect(comment).toContain("§4 and §6");
+    expect(fence()).toContain(marker);
+    expect(rawSection("## 6.", "## 7.")).toContain(marker);
+  });
+
+  // --- Finding 13: §3 files a sub-issue for every surviving findings[] entry ------------------
+  test("finding 13: §3 files one sub-issue per surviving findings[] entry, which is what gives §4 an id to render", () => {
+    const s3 = section("## 3.", "## 4.");
+    expect(s3).toContain(
+      "**File one sub-issue for every surviving `findings[]` entry too**, under the same rules " +
+        "— status `Unplanned`, label `found-in-review`, a `## Dependencies` section — and " +
+        "record its id alongside the `out_of_scope` ones.",
+    );
+    expect(s3).toContain(
+      "with no sub-issue filed here there is no id for §4 to render, so a flagged story's " +
+        "surviving findings would be unpublishable and would die with the session exactly as " +
+        "an unfiled `out_of_scope` entry does.",
+    );
+  });
+
+  // Finding 13's other half: §3 now files sub-issues for unfixed SECURITY findings, and §4
+  // publishes `<SUB-ISSUE-ID> — <sub-issue title>` verbatim in a public PR body while forbidding
+  // `file:line` there. §3's only title rule was "name the bug not the symptom", so a fully
+  // §3-compliant title like "path traversal in scripts/lib/stack.ts:165" landed verbatim on a
+  // public PR — finding 9's disclosure reopened one indirection up, and newly reachable because
+  // before this diff only `out_of_scope` findings were named in that section. Constrained where
+  // the title is CREATED, and pinned as one contiguous phrase so a softening rephrase fails
+  // exactly as a deletion does.
+  test("finding 13: §3 forbids file:line/paths/quoted source in a sub-issue TITLE, because §4 publishes it", () => {
+    expect(section("## 3.", "## 4.")).toContain(
+      "**The title of every sub-issue filed here carries no `file:line`, no path, and no quoted " +
+        "source** — those go in the body only, and this rule outranks any wording that reads as " +
+        "encouraging them, because §4 publishes the title verbatim in a public PR body while " +
+        "forbidding exactly those three things there.",
     );
   });
 });

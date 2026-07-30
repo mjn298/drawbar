@@ -38,8 +38,10 @@ command -v drawbar-kb >/dev/null || { echo "no drawbar-kb — run /drawbar-setup
 command -v gh        >/dev/null && gh auth status >/dev/null 2>&1 || { echo "gh not authed"; exit 1; }
 
 # MUST-CHECK repo-anchor-guard-is-what-gates-an-unfixed-vulnerability: fail closed if the
-# plugin root isn't set — nothing below can find ship-config.ts without it. Same guard
-# drawbar-story-lead §7 uses.
+# plugin root isn't set — nothing below can find ship-config.ts without it. Every later fence
+# in THIS file (§4 and §6) re-declares this same guard, because no shell state survives across
+# two Bash tool calls. The story-lead runs no such guard — it is handed absolute paths and
+# invokes no plugin script — so do not cross-reference it here.
 : "${CLAUDE_PLUGIN_ROOT:?CLAUDE_PLUGIN_ROOT must be set}"
 
 # Locked 17: CONFIG comes from config, resolved EXPLICITLY. No walking up to a parent
@@ -64,7 +66,13 @@ CONFIG="${DRAWBAR_SHIP_CONFIG:-$PWD/.drawbar/ship.config.json}"
 # config is NEVER tracked by git. Fails closed on a genuine tracked hit; a `git` failure
 # (e.g. $CONFIG's directory isn't a repo at all) is not itself the vulnerability this guards
 # against, so it does not need special-casing here.
-git -C "$(dirname "$CONFIG")" ls-files --error-unmatch "$CONFIG" >/dev/null 2>&1 \
+# A committed DIRECTORY SYMLINK would otherwise defeat this refusal outright: `git -C` chdirs
+# THROUGH the symlink, git's cwd becomes the link target, and the absolute pathspec then matches
+# nothing in the index (which knows the real path), so `--error-unmatch` exits 1 and the guard
+# reads "not tracked" for a config the branch under review has committed. Resolve every
+# symlinked component first and ask git about the real path.
+CONFIG_REAL=$(readlink -f "$CONFIG") || { echo "FATAL: cannot resolve $CONFIG to a real path — refusing."; exit 1; }
+git -C "$(dirname "$CONFIG_REAL")" ls-files --error-unmatch "$CONFIG_REAL" >/dev/null 2>&1 \
   && { echo "FATAL: $CONFIG is tracked by git — a committed ship config is never trusted. Untrack it (git rm --cached) and keep it out of version control."; exit 1; } \
   || true
 
@@ -315,6 +323,23 @@ file:line, what is wrong, why it is out of scope here, and the PR that surfaced 
 `Unplanned`; label `found-in-review`. Never file it `Todo` — `Unplanned → Todo` is the human
 triage gate, and this command has no authority to walk a finding through it unattended.
 
+**File one sub-issue for every surviving `findings[]` entry too**, under the same rules —
+status `Unplanned`, label `found-in-review`, a `## Dependencies` section — and record its id
+alongside the `out_of_scope` ones. `findings[]` carries the Critical and Important findings
+that outlived the story-lead's one fix pass, unfixed **security** findings included, and §4's
+`## Unresolved findings` section is allowed to name a finding by sub-issue id and title only:
+with no sub-issue filed here there is no id for §4 to render, so a flagged story's surviving
+findings would be unpublishable and would die with the session exactly as an unfiled
+`out_of_scope` entry does. Put the finding's `detail` in the sub-issue body — a Linear issue
+is not world-readable the way the pull request is, which is the whole reason the split exists.
+
+**The title of every sub-issue filed here carries no `file:line`, no path, and no quoted
+source** — those go in the body only, and this rule outranks any wording that reads as
+encouraging them, because §4 publishes the title verbatim in a public PR body while forbidding
+exactly those three things there. A title like "path traversal in `scripts/lib/stack.ts:165`"
+satisfies "name the bug not the symptom" and still announces an unpatched detail to every repo
+watcher; name the bug and its component instead.
+
 **Give every filed sub-issue a `## Dependencies` section**, stating `none — filed from review
 of <PR>` when it has none. Step 0 halts on a snapshot member that carries no such section, and
 a finding filed here becomes exactly that member once a human triages it `Unplanned → Todo`.
@@ -328,10 +353,10 @@ Not added to the snapshot — they wait for the next run.
 
 ## 4. Open the stacked PR
 
-The story-lead's own §6 already runs `gh pr create` against `$BASE_BRANCH` — the configured
-base, correct only for the first story of a run. That call is a **transitional duplicate**:
-this step opens the PR that actually anchors the stack, and the story-lead's own PR creation
-is **removed entirely once R4 (PCO-367) lands**, closing this overlap for good.
+**This step is the only thing in the whole run that opens a pull request.** The story-lead's
+own §6 pushes its branch and stops there — it opens none. Were both to open one, they would
+submit the identical head+base pair on the run's first story, GitHub would refuse the second
+with a 422, and the run would park on story 1 every night.
 
 This step resolves the base by delegating to `stack.ts` — never re-derived in bash — and
 opens the PR with an explicit `--base <base>` flag; `--base` is never omitted (Locked A): the
@@ -339,26 +364,221 @@ default would silently fall back to the repo's default branch, producing a PR wh
 carries every earlier story's work too — green, plausible, and near-impossible to spot in
 the morning.
 
-**Deliberately not specified here: the executable fence.** This section's stacked-PR-opening
-logic — resolving the base, asserting chain integrity, and calling `gh pr create` — is
-deferred to **PCO-370** and must land together with **R4 (PCO-367)**; nobody should hand-write
-a substitute here in the meantime. Two reasons block it today: the story-lead currently cuts
-every branch from `main`, so a recorded chain would refuse `branch_moved` from the third story
-onward; and the story-lead still opens its own PR, so a second `gh pr create` here would
-collide with it for story 1.
-
-`FLAGGED` comes from the story-lead's §8 report `status` field — written against the `ok |
-flagged` contract R4 (PCO-367) lands (today's story-lead still reports `ready_to_merge |
-parked`; this step is already written against the contract its successor is landing). On a
+`FLAGGED` comes from the story-lead's §7 report `status` field, on the `ok | flagged`
+contract: `flagged` becomes the JSON boolean `true`, `ok` becomes `false` — a `parked` story
+never reaches this step at all, because §2 routes it straight to *Parking a story*. On a
 **flagged** story, the PR body carries an `## Unresolved findings` section, built before
-`gh pr create` runs, never appended after. That section names each out-of-scope finding by
+`gh pr create` runs, never appended after. That section names each surviving finding by
 its filed sub-issue id and title only — never the finding body, `file:line`, or a quoted
 source excerpt; the full write-up already lives in the sub-issue §3 filed for it, and
 republishing it in a public PR body announces an unpatched detail to every repo watcher
 before the operator's morning review.
 
-**These two outcomes differ in kind, not merely in degree — the header below names which one
-you're in; never file this under one shared "satisfied if any of the following" list.**
+**Nothing carries over into the fence below.** No shell state survives across two Bash tool
+calls, so every value it consumes is re-derived inside it from one source of truth — a fresh
+`ship-config.ts validate`, behind the same two `$CONFIG` guards Preflight runs, because
+`$CONFIG` is re-resolved from `$PWD` and a branch under review can plant one. An ambient
+exported `REPO` would otherwise win and aim every `gh` call at an unvalidated repository, and
+an empty `$BASE` yields `--base ""`, which is Locked A's exact failure mode.
+
+**Every value you substitute goes into a quoted heredoc, never into an assignment.** The
+branch name, the PR title and the PR body all originate in text produced from the repository
+under review, and you paste them in literally — so a single `"` would close a double-quoted
+assignment and the `$(...)` after it would run. Inside `<<'SENTINEL'` nothing expands and
+nothing executes; the fence reads the values back out with `jq -r` and `cat`.
+
+**Before you substitute anything, check every value for a line equal to the terminator you
+are pasting it under, and halt the run if you find one** — park the story with that as the
+reason, and never rewrite, escape, or truncate the value to make it fit. A quoted heredoc
+protects the value's `"`, `$` and backticks, but it still ends at the first line equal to its
+terminator, and these terminators are fixed literals published in this repository: a report
+line reading exactly `DRAWBAR_PR_BODY_SENTINEL` closes the body heredoc early and every line
+after it is parsed as shell — arbitrary command execution under the operator's authenticated
+`gh`, with the written file left looking entirely correct. A check inside the fence cannot
+save you here: by the time any line of it runs, the injected commands have already run.
+
+**No value that came out of the repository under review is ever pasted into a JSON document.**
+The branch name gets its own heredoc file and is read back with `cat`, because a `"` in a value
+pasted between two `"` inside the inputs document does not produce invalid JSON that `jq -e .`
+would refuse — it appends keys, and `jq` resolves duplicate keys last-wins, so it silently
+overrides any key declared above it (`arg` names the state file, `story` picks the base). Both
+shape gates then pass, because they see only the laundered values. A key whitelist is not a
+defence: the injected document has exactly the same key set.
+
+```bash
+: "${CLAUDE_PLUGIN_ROOT:?CLAUDE_PLUGIN_ROOT must be set}"
+
+# EVERY agent-substituted value enters through the four QUOTED heredocs below and nowhere
+# else — this is the explicit-assignment convention §6 uses for $LESSONS_JSON, hardened.
+# Substituted into an ordinary double-quoted assignment, one `"` in report text closes the
+# string and `$(...)`/backticks then execute; even single quotes only move the problem to `'`.
+# The branch name, the title and the body all derive from the repository under review, so
+# nothing here is assigned by interpolation at all: inside a QUOTED heredoc (`<<'SENTINEL'`)
+# nothing expands and no command runs, and the values are read back out with `jq -r` / `cat`,
+# never eval'd. A value consumed but never bound would merely halt the run every night; a
+# value bound by interpolation is arbitrary code execution. The one thing a quoted heredoc does
+# NOT protect against is a substituted line equal to the terminator itself — that closes the
+# heredoc and the rest is parsed as shell, so the halt instruction above this fence is part of
+# the guarantee, not an aside, and no check placed here could replace it.
+# `mktemp -d` and not a fixed path: the four `cat >` redirects below follow symlinks, so a
+# guessable directory lets a local user pre-plant one and have this fence truncate an arbitrary
+# file — and substitute the body it then hands to `gh --body-file`.
+IN_DIR=$(mktemp -d) || { echo "FATAL: mktemp -d failed — refusing."; exit 1; }
+INPUTS="${IN_DIR}/inputs.json"
+BRANCH_FILE="${IN_DIR}/branch"
+PR_TITLE_FILE="${IN_DIR}/title"
+PR_BODY_FILE="${IN_DIR}/body"
+
+# `branch` is NOT a key in this document: it derives from the repository under review, and a `"`
+# in a value pasted between two `"` here appends keys rather than breaking the parse — jq takes
+# the LAST of a duplicate key, so an injected `"arg"`/`"story"` silently wins and aims $STATE,
+# assert-chain and resolve-base at a different run. Only values the repository under review
+# cannot author live in here.
+cat > "$INPUTS" <<'DRAWBAR_INPUTS_SENTINEL'
+{
+  "arg":     "<the id THIS RUN was invoked with — it names the state file>",
+  "story":   "<TEAM>-####",
+  "teams":   <the list_teams result for this session, as a JSON array>,
+  "flagged": <the report `status`: flagged -> true, ok -> false; a JSON boolean, never a string>
+}
+DRAWBAR_INPUTS_SENTINEL
+
+cat > "$BRANCH_FILE" <<'DRAWBAR_BRANCH_SENTINEL'
+<the story-lead report's `branch` field, verbatim, one line — nothing here expands>
+DRAWBAR_BRANCH_SENTINEL
+
+cat > "$PR_TITLE_FILE" <<'DRAWBAR_PR_TITLE_SENTINEL'
+<the PR title, one line, verbatim — nothing here expands>
+DRAWBAR_PR_TITLE_SENTINEL
+
+cat > "$PR_BODY_FILE" <<'DRAWBAR_PR_BODY_SENTINEL'
+<the PR body, verbatim — nothing here expands. On a flagged story it is written out here with
+its `## Unresolved findings` section already in it, listing each surviving finding as
+`<SUB-ISSUE-ID> — <sub-issue title>` and nothing else: never the finding body, never a
+`file:line`, never a quoted source excerpt.>
+DRAWBAR_PR_BODY_SENTINEL
+
+# --- read the substituted inputs ------------------------------------------------------------
+jq -e . "$INPUTS" >/dev/null 2>&1 || { echo "FATAL: the inputs heredoc is not valid JSON — refusing."; exit 1; }
+ARG=$(jq -r '.arg // empty' "$INPUTS")
+STORY=$(jq -r '.story // empty' "$INPUTS")
+# Read from its OWN file, never out of the inputs document: nothing about this value's text can
+# reach a JSON key, and its emptiness is refused by the ref-name shape gate below.
+BRANCH=$(cat "$BRANCH_FILE")
+# `flagged` and `teams` are TYPE-checked at the source, not merely non-empty: `flagged` reaches
+# `jq --argjson` below, where the string "true" would produce the string "true" in the stack
+# entry and `isValidStackEntry` demands a strict boolean.
+FLAGGED=$(jq -r 'if (.flagged|type)=="boolean" then (.flagged|tostring) else empty end' "$INPUTS")
+LINEAR_FACTS_JSON=$(jq -c 'if (.teams|type)=="array" then {teams:.teams} else empty end' "$INPUTS")
+for v in ARG STORY FLAGGED LINEAR_FACTS_JSON; do
+  val="${!v}"
+  [ -n "$val" ] && [ "$val" != "null" ] || { echo "FATAL: $v is empty, null, or the wrong JSON type in the inputs heredoc — refusing."; exit 1; }
+done
+# --- end read the substituted inputs --------------------------------------------------------
+
+# $ARG is interpolated into the state-file path, so it must be a single safe path segment —
+# the same shape run-state.ts's `isSafePathSegment` enforces on the value it round-trips.
+case "$ARG" in ''|*/*|*'\'*|*..*) echo "FATAL: ARG is not a safe path segment — refusing."; exit 1;; esac
+
+# --- branch ref-name shape gate ------------------------------------------------------------
+# $BRANCH comes from an agent report and reaches `--head` and the stack entry. Gated HERE, at
+# the top, before it can reach either. Mirrors ship-config.ts's REF_NAME_SHAPE plus its `.lock`
+# refusal — i.e. exactly what run-state.ts's `isValidStackEntry` re-applies to the entry
+# written below, so a branch that would brick the state file is refused before a PR is ever
+# opened for it. `[[ =~ ]]` and not a `grep` pipeline: grep matches LINE by line, so a BRANCH
+# carrying an embedded newline would satisfy it twice over while `isValidRefName` refuses that
+# same value. `LC_ALL=C` inside the subshell keeps `A-Za-z0-9` byte ranges rather than locale
+# collation ranges. (The `/` is written FIRST inside the bracket expression on purpose: this
+# file is scanned for concrete GitHub org-and-repo slugs, and a slash between two word
+# characters reads as one.)
+( LC_ALL=C; [[ "$BRANCH" =~ ^[A-Za-z0-9][/A-Za-z0-9._-]*$ ]] ) || { echo "FATAL: BRANCH is not a valid git ref name — refusing."; exit 1; }
+case "$BRANCH" in *..*|*"@{"*|*.lock) echo "FATAL: BRANCH is not a valid git ref name — refusing."; exit 1;; esac
+# --- end branch ref-name shape gate ---------------------------------------------------------
+
+# $CONFIG is re-resolved from $PWD here, so BOTH of Preflight's guards run again, verbatim.
+# Dropping them lets a branch under review plant `.drawbar/ship.config.json` and feed its own
+# `projectDir` into `--project-dir` and `git -C`; an equality guard does not help, because both
+# sides then agree — on the attacker's directory. (The tracked-config refusal keeps Preflight's
+# `&& { ... } || true` shape deliberately: it is the same guard, not a reworded copy of it, and
+# it is asked about the symlink-resolved path for the reason Preflight's copy spells out.)
+CONFIG="${DRAWBAR_SHIP_CONFIG:-$PWD/.drawbar/ship.config.json}"
+[ -f "$CONFIG" ] || { echo "FATAL: no config at $CONFIG — copy .drawbar/ship.config.example.json, fill in real values, and either place the copy there or set DRAWBAR_SHIP_CONFIG to point at it."; exit 1; }
+CONFIG_REAL=$(readlink -f "$CONFIG") || { echo "FATAL: cannot resolve $CONFIG to a real path — refusing."; exit 1; }
+git -C "$(dirname "$CONFIG_REAL")" ls-files --error-unmatch "$CONFIG_REAL" >/dev/null 2>&1 \
+  && { echo "FATAL: $CONFIG is tracked by git — a committed ship config is never trusted. Untrack it (git rm --cached) and keep it out of version control."; exit 1; } \
+  || true
+
+# MUST-CHECK r3-must-not-source-project-dir-from-pasted-run-state: the trust root is this FRESH
+# validate, run in this block. Never `jq '.resolved_config' "$STATE"` and never anything else
+# read out of `runs/` — the state file is agent-writable, and a `--project-dir` taken from it
+# turns stack.ts's equality guard into a tautology about the attacker's own directory.
+RESOLVED=$(echo "$LINEAR_FACTS_JSON" | bun run "${CLAUDE_PLUGIN_ROOT}/scripts/lib/ship-config.ts" validate --config "$CONFIG") \
+  || { echo "FATAL: ship-config validation refused — see stderr above for the specific reason."; exit 1; }
+
+# --- derive from the resolved config (§4) --------------------------------------------------
+ENV_DIR=$(echo "$RESOLVED" | jq -r '.envDir // empty')
+PROJECT_DIR=$(echo "$RESOLVED" | jq -r '.projectDir // empty')
+REPO=$(echo "$RESOLVED" | jq -r '.repo // empty')
+for v in ENV_DIR PROJECT_DIR REPO; do
+  val="${!v}"
+  [ -n "$val" ] && [ "$val" != "null" ] || { echo "FATAL: $v is empty or null after validation — refusing."; exit 1; }
+done
+# --- end derive from the resolved config (§4) ----------------------------------------------
+STATE="$ENV_DIR/.drawbar/runs/$ARG.json"
+
+# Check 1 of 3 — chain integrity. `--project-dir` is the operator-authored trust root, taken
+# from the fresh validate above, never from the state file's own `resolved_config` copy.
+CHAIN_JSON=$(bun run "${CLAUDE_PLUGIN_ROOT}/scripts/lib/stack.ts" assert-chain --state "$STATE" --project-dir "$PROJECT_DIR")
+CHAIN_OK=$(printf '%s' "${CHAIN_JSON:-null}" | jq -r 'if (type=="object" and .ok==true) then "true" else "false" end' 2>/dev/null)
+# Echo the verdict's `.reason` and NOTHING else. `.detail` carries absolute paths and the real
+# repo slug, this repo is public, and the Hard rules require refusal text be paraphrased rather
+# than pasted into `parked_reason`, the §5 comment, or a KB entry.
+[ "$CHAIN_OK" = "true" ] || { CHAIN_REASON=$(printf '%s' "${CHAIN_JSON:-null}" | jq -r '.reason // "unreadable-verdict"' 2>/dev/null); echo "NO_PR: assert-chain refused ($CHAIN_REASON) — park the story; paraphrase, never paste, the detail on stderr."; exit 1; }
+
+# Check 2 of 3 — the base. Locked A: `resolve-base` is the only producer of this value.
+BASE_JSON=$(bun run "${CLAUDE_PLUGIN_ROOT}/scripts/lib/stack.ts" resolve-base --state "$STATE" --story "$STORY")
+BASE=$(printf '%s' "${BASE_JSON:-null}" | jq -r 'if (type=="object" and .ok==true) then .base else empty end' 2>/dev/null)
+[ -n "$BASE" ] && [ "$BASE" != "null" ] || { BASE_REASON=$(printf '%s' "${BASE_JSON:-null}" | jq -r '.reason // "unreadable-verdict"' 2>/dev/null); echo "NO_PR: resolve-base refused ($BASE_REASON) — park the story; paraphrase, never paste, the detail on stderr."; exit 1; }
+
+# Check 3 of 3 — open it. `--title` reads the file at RUNTIME as one quoted argument and
+# `--body-file` reads it inside `gh`, so no report text is ever part of this command line.
+PR_URL=$(gh pr create --repo "$REPO" --base "$BASE" --head "$BRANCH" --title "$(cat "$PR_TITLE_FILE")" --body-file "$PR_BODY_FILE") \
+  || { echo "NO_PR: gh pr create failed — park the story; paraphrase, never paste, the detail on stderr."; exit 1; }
+
+# --- pr number shape gate --------------------------------------------------------------------
+# Never `basename "$PR_URL"`: unvalidated, and `isValidStackEntry` requires a positive INTEGER.
+PR=$(gh pr view "$PR_URL" --repo "$REPO" --json number -q .number) || { echo "PR_UNRECORDED: gh pr create left no readable PR number — the PR is open; park the story with that reason (Outcome C) and repair the run state by hand."; exit 1; }
+case "$PR" in ''|*[!0-9]*) echo "PR_UNRECORDED: PR number is not digits-only — the PR is open; park the story with that reason (Outcome C) and repair the run state by hand."; exit 1;; esac
+[ "$PR" -gt 0 ] || { echo "PR_UNRECORDED: PR number is not a positive integer — the PR is open; park the story with that reason (Outcome C) and repair the run state by hand."; exit 1; }
+# --- end pr number shape gate -----------------------------------------------------------------
+
+# --- stack entry -------------------------------------------------------------------------------
+# run-state.ts's `isValidStackEntry` requires `pr` to be a positive integer and `flagged` a
+# strict boolean. Bash produces strings, and a string in either field makes `parseRunState`
+# reject the WHOLE file on the next read — stack.ts then writes its usage error to stderr with
+# EMPTY stdout, so the operator sees a bare `refused ()` and the state file is permanently
+# unreadable by its own tooling. Hence `--argjson` for those two, never `--arg`.
+case "$FLAGGED" in true|false) ;; *) echo "PR_UNRECORDED: FLAGGED must be the JSON literal true or false — the PR is open; park the story with that reason (Outcome C) and repair the run state by hand."; exit 1;; esac
+ENTRY=$(jq -nc --arg story "$STORY" --arg branch "$BRANCH" --argjson pr "$PR" --arg base "$BASE" --argjson flagged "$FLAGGED" '{story:$story,branch:$branch,pr:$pr,base:$base,flagged:$flagged}') || { echo "PR_UNRECORDED: could not build the stack entry — the PR is open; park the story with that reason (Outcome C) and repair the run state by hand."; exit 1; }
+# --- end stack entry ----------------------------------------------------------------------------
+
+NEXT_STATE=$(jq -c --argjson entry "$ENTRY" '.stack += [$entry]' "$STATE") || { echo "PR_UNRECORDED: could not append the stack entry to the run state — the PR is open; park the story with that reason (Outcome C) and repair the run state by hand."; exit 1; }
+printf '%s\n' "$NEXT_STATE" > "$STATE.tmp" && mv "$STATE.tmp" "$STATE" || { echo "PR_UNRECORDED: could not write the run state — the PR is open; park the story with that reason (Outcome C) and repair the run state by hand."; exit 1; }
+
+# Round-trip what was just written through `parseRunState` — `assert-chain` parses the state
+# with it and re-verifies the chain including the entry appended above. A wrong JSON type is
+# caught HERE, in the step that wrote it, instead of bricking every later read.
+VERIFY_JSON=$(bun run "${CLAUDE_PLUGIN_ROOT}/scripts/lib/stack.ts" assert-chain --state "$STATE" --project-dir "$PROJECT_DIR")
+VERIFY_OK=$(printf '%s' "${VERIFY_JSON:-null}" | jq -r 'if (type=="object" and .ok==true) then "true" else "false" end' 2>/dev/null)
+[ "$VERIFY_OK" = "true" ] || { VERIFY_REASON=$(printf '%s' "${VERIFY_JSON:-null}" | jq -r '.reason // "unreadable-verdict"' 2>/dev/null); echo "PR_UNRECORDED: the recorded stack entry did not round-trip ($VERIFY_REASON) — the PR is open; park the story with that reason (Outcome C) and repair the run state by hand."; exit 1; }
+
+echo "PR_OPENED: $PR_URL (base $BASE)"
+```
+
+**These three outcomes differ in kind, not merely in degree — the header below names which one
+you're in; never file this under one shared "satisfied if any of the following" list.** Each
+one has its own prefix in the fence's output, and every refusal carries exactly one of them:
+`NO_PR:` is Outcome A, `PR_UNRECORDED:` is Outcome C, `PR_OPENED:` is Outcome B.
 
 **Outcome A — no PR could be opened (halt, distinct from flagged).** A refusal at any of the
 three required checks — assert-chain refusing, resolve-base refusing, or `gh pr create`
@@ -367,7 +587,18 @@ flagged case: go to *Parking a story*, with `parked_reason` naming which call re
 
 **Outcome B — the PR opened.** Record `{story, branch, pr, base, flagged}` in the run state's
 `stack` array — `pr` as a JSON number (a positive integer, never the string form) and
-`flagged` as a JSON boolean — then continue to §5.
+`flagged` as a JSON boolean — which is what the fence's `jq --argjson` builds and what its
+closing `assert-chain` re-read proves round-trips, then continue to §5.
+
+**Outcome C — the PR opened but the run state does not record it (halt).** Every refusal after
+`gh pr create` returns — an unreadable or non-integer PR number, a `FLAGGED` that is not a JSON
+literal, an entry that cannot be built, appended, or written, or a round-trip that fails — is
+prefixed `PR_UNRECORDED:` and leaves a real pull request open with nothing in the `stack` array
+pointing at it. It is not Outcome A: no `NO_PR:` line is printed, because a PR exists. Go to
+*Parking a story*, and make `parked_reason` say that the PR is open and unrecorded, with its
+URL. **Never re-run this step for that story** — the identical head+base pair is exactly the
+422 collision this section's opening paragraph warns about — and never hand-edit the `stack`
+array during the run: the repair belongs to the operator's morning review.
 
 ## 5. Post the summary comment, leave In Progress
 
