@@ -25,7 +25,49 @@ going instead of stopping there: it picks the next story, delegates it, and adva
 story after story — but it never merges the PR it opens.
 
 Sequential only. **Never** run two stories concurrently — they are dependency-ordered, and
-story N assumes N−1 is on `main`.
+story N is based on story N−1's branch, which does not exist until N−1 has finished.
+
+## The stack model
+
+Each story becomes one pull request, and the pull requests form a **stack**: every PR is based
+on the one before it, so each diff shows only its own story's changes and every branch is
+buildable on its own. Stories are dependency-ordered, so this is required rather than
+incidental — story N+1 generally does not compile against the configured base at all.
+
+**How a base is chosen (Locked A).** The base is the configured `baseBranch` for the **first**
+story of a run, and the **previous story's branch** for every story after it. Exactly one thing
+produces that value — `scripts/lib/stack.ts`'s `resolve-base` verb, invoked in §4 — and it is
+**never re-derived in bash**, never lifted out of the run-state file by hand, and never left to
+a default. `resolve-base` is the only producer that shape-gates the branch name with
+`isValidRefName`; the run state it reads is agent-writable, so a base copied straight out of
+`stack[]` carries no validation at all. Omitting `--base` is the same failure from the other
+side: `gh` would fall back to the repo's default branch, producing a PR whose diff carries every
+earlier story's work too — green, plausible, and near-impossible to spot in the morning. The
+story-lead is **handed** its base and cuts from it; it never resolves one.
+
+**What `flagged` means.** A `flagged` story is one whose single fix pass left Important findings
+alive. **The PR opens anyway**, annotated with an `## Unresolved findings` section, and **the
+stack continues on top of it** — the next story is based on this story's branch exactly as if it
+had come back clean. A story that is 90% right belongs in front of the operator at 8am,
+annotated, rather than costing the rest of the night's throughput.
+
+**"No PR could be opened" differs in kind from `flagged`, not in degree.** With no pull request
+there is no branch for the next story to base on, so the chain has no anchor and the run
+**parks and halts** (§4, Outcome A). Never collapse the two: `flagged` continues stacking, a
+missing PR stops the night.
+
+**The operator's contract in the morning: review bottom-up and merge bottom-up, in order.** The
+stack was built bottom-up, so only the bottom PR's diff is meaningful against the configured
+base; every PR above it is meaningful only once the one below has landed. Reviewing or merging
+out of order reads a diff against a base that has moved.
+
+**Locked F — `drawbar-ship` never merges, never verifies a merge, and never inspects whether one
+happened.** Keeping the stack mergeable is the operator's job. **No detection or repair of
+out-of-order merges exists or is planned** — that is a contract, not a gap awaiting a follow-up,
+so do not file one for it. Building it back would re-introduce exactly the merge-state gating
+this design deleted: nothing here can know whether a merge was clean or in order without the
+gate that made the old design expensive and unwanted. If a stack does get merged out of order,
+the recovery is a human rebase, and this command has no opinion about it.
 
 ## Preflight (halt on any failure)
 
@@ -38,8 +80,10 @@ command -v drawbar-kb >/dev/null || { echo "no drawbar-kb — run /drawbar-setup
 command -v gh        >/dev/null && gh auth status >/dev/null 2>&1 || { echo "gh not authed"; exit 1; }
 
 # MUST-CHECK repo-anchor-guard-is-what-gates-an-unfixed-vulnerability: fail closed if the
-# plugin root isn't set — nothing below can find ship-config.ts without it. Same guard
-# drawbar-story-lead §7 uses.
+# plugin root isn't set — nothing below can find ship-config.ts without it. Every later fence
+# in THIS file (§4 and §6) re-declares this same guard, because no shell state survives across
+# two Bash tool calls. The story-lead runs no such guard — it is handed absolute paths and
+# invokes no plugin script — so do not cross-reference it here.
 : "${CLAUDE_PLUGIN_ROOT:?CLAUDE_PLUGIN_ROOT must be set}"
 
 # Locked 17: CONFIG comes from config, resolved EXPLICITLY. No walking up to a parent
@@ -64,7 +108,13 @@ CONFIG="${DRAWBAR_SHIP_CONFIG:-$PWD/.drawbar/ship.config.json}"
 # config is NEVER tracked by git. Fails closed on a genuine tracked hit; a `git` failure
 # (e.g. $CONFIG's directory isn't a repo at all) is not itself the vulnerability this guards
 # against, so it does not need special-casing here.
-git -C "$(dirname "$CONFIG")" ls-files --error-unmatch "$CONFIG" >/dev/null 2>&1 \
+# A committed DIRECTORY SYMLINK would otherwise defeat this refusal outright: `git -C` chdirs
+# THROUGH the symlink, git's cwd becomes the link target, and the absolute pathspec then matches
+# nothing in the index (which knows the real path), so `--error-unmatch` exits 1 and the guard
+# reads "not tracked" for a config the branch under review has committed. Resolve every
+# symlinked component first and ask git about the real path.
+CONFIG_REAL=$(readlink -f "$CONFIG") || { echo "FATAL: cannot resolve $CONFIG to a real path — refusing."; exit 1; }
+git -C "$(dirname "$CONFIG_REAL")" ls-files --error-unmatch "$CONFIG_REAL" >/dev/null 2>&1 \
   && { echo "FATAL: $CONFIG is tracked by git — a committed ship config is never trusted. Untrack it (git rm --cached) and keep it out of version control."; exit 1; } \
   || true
 
@@ -115,7 +165,17 @@ KB="$ENV_DIR/.drawbar/memory"
 # clean, `merge=union`-covered, and carrying a `.drawbar/runs/.gitignore`. Delegated whole to
 # `kb-sync.ts preflight` — no second, hand-copied bash implementation of any of its three
 # assertions here (single-implementation-site regression discipline).
+# `--config-path` is REQUIRED and is the TRUST ROOT for `--env-dir`: kb-sync.ts re-reads the
+# operator-authored config itself (via ship-config.ts's `parseShipConfig`) and refuses unless
+# the config's `envDir` equals the `--env-dir` it was handed — so a wrong or planted `$ENV_DIR`
+# cannot reach a single `git -C` call. It also pins WHICH file may vouch (the one this
+# environment's own `$DRAWBAR_SHIP_CONFIG`/`$PWD` resolve to) and re-runs the tracked-config
+# refusal above with its own injected runner, so naming a planted config as its own trust root is
+# refused too. `$CONFIG_REAL` (not `$CONFIG`) is passed because the flag requires a clean absolute
+# path and `DRAWBAR_SHIP_CONFIG` may legitimately be relative; the module compares the two
+# symlink-resolved, so both forms agree.
 bun run "${CLAUDE_PLUGIN_ROOT}/scripts/lib/kb-sync.ts" preflight --env-dir "$ENV_DIR" --dir "$KB" \
+    --config-path "$CONFIG_REAL" \
   || { echo "FATAL: kb-sync.ts preflight refused — see stderr above for the specific reason."; exit 1; }
 ```
 
@@ -300,9 +360,10 @@ Then dispatch **one** `drawbar-story-lead` agent (Opus). The brief must carry:
   Linear's `gitBranchName` from `get_issue`, which guarantees the PR auto-links
 - that it must **not** merge and has no Linear authority
 
-It returns the JSON report in its §8: `{status, pr, branch, mutation_pairs, out_of_scope,
-lessons, summary}`. **Do not ask it for the diff.** If you find yourself wanting one, the
-split is not working.
+It returns the JSON report in its §7: `{status, branch, base, findings, mutation_pairs,
+out_of_scope, lessons, summary}`. It carries no `pr` — it opens none; §4 below is what opens
+the PR and learns its number. **Do not ask it for the diff.** If you find yourself wanting
+one, the split is not working.
 
 `status: parked` → skip to *Parking a story*.
 
@@ -313,6 +374,23 @@ sub-issue under the same parent: title naming the bug not the symptom; descripti
 file:line, what is wrong, why it is out of scope here, and the PR that surfaced it; status
 `Unplanned`; label `found-in-review`. Never file it `Todo` — `Unplanned → Todo` is the human
 triage gate, and this command has no authority to walk a finding through it unattended.
+
+**File one sub-issue for every surviving `findings[]` entry too**, under the same rules —
+status `Unplanned`, label `found-in-review`, a `## Dependencies` section — and record its id
+alongside the `out_of_scope` ones. `findings[]` carries the Critical and Important findings
+that outlived the story-lead's one fix pass, unfixed **security** findings included, and §4's
+`## Unresolved findings` section is allowed to name a finding by sub-issue id and title only:
+with no sub-issue filed here there is no id for §4 to render, so a flagged story's surviving
+findings would be unpublishable and would die with the session exactly as an unfiled
+`out_of_scope` entry does. Put the finding's `detail` in the sub-issue body — a Linear issue
+is not world-readable the way the pull request is, which is the whole reason the split exists.
+
+**The title of every sub-issue filed here carries no `file:line`, no path, and no quoted
+source** — those go in the body only, and this rule outranks any wording that reads as
+encouraging them, because §4 publishes the title verbatim in a public PR body while forbidding
+exactly those three things there. A title like "path traversal in `scripts/lib/stack.ts:165`"
+satisfies "name the bug not the symptom" and still announces an unpatched detail to every repo
+watcher; name the bug and its component instead.
 
 **Give every filed sub-issue a `## Dependencies` section**, stating `none — filed from review
 of <PR>` when it has none. Step 0 halts on a snapshot member that carries no such section, and
@@ -327,10 +405,10 @@ Not added to the snapshot — they wait for the next run.
 
 ## 4. Open the stacked PR
 
-The story-lead's own §6 already runs `gh pr create` against `$BASE_BRANCH` — the configured
-base, correct only for the first story of a run. That call is a **transitional duplicate**:
-this step opens the PR that actually anchors the stack, and the story-lead's own PR creation
-is **removed entirely once R4 (PCO-367) lands**, closing this overlap for good.
+**This step is the only thing in the whole run that opens a pull request.** The story-lead's
+own §6 pushes its branch and stops there — it opens none. Were both to open one, they would
+submit the identical head+base pair on the run's first story, GitHub would refuse the second
+with a 422, and the run would park on story 1 every night.
 
 This step resolves the base by delegating to `stack.ts` — never re-derived in bash — and
 opens the PR with an explicit `--base <base>` flag; `--base` is never omitted (Locked A): the
@@ -338,26 +416,221 @@ default would silently fall back to the repo's default branch, producing a PR wh
 carries every earlier story's work too — green, plausible, and near-impossible to spot in
 the morning.
 
-**Deliberately not specified here: the executable fence.** This section's stacked-PR-opening
-logic — resolving the base, asserting chain integrity, and calling `gh pr create` — is
-deferred to **PCO-370** and must land together with **R4 (PCO-367)**; nobody should hand-write
-a substitute here in the meantime. Two reasons block it today: the story-lead currently cuts
-every branch from `main`, so a recorded chain would refuse `branch_moved` from the third story
-onward; and the story-lead still opens its own PR, so a second `gh pr create` here would
-collide with it for story 1.
-
-`FLAGGED` comes from the story-lead's §8 report `status` field — written against the `ok |
-flagged` contract R4 (PCO-367) lands (today's story-lead still reports `ready_to_merge |
-parked`; this step is already written against the contract its successor is landing). On a
+`FLAGGED` comes from the story-lead's §7 report `status` field, on the `ok | flagged`
+contract: `flagged` becomes the JSON boolean `true`, `ok` becomes `false` — a `parked` story
+never reaches this step at all, because §2 routes it straight to *Parking a story*. On a
 **flagged** story, the PR body carries an `## Unresolved findings` section, built before
-`gh pr create` runs, never appended after. That section names each out-of-scope finding by
+`gh pr create` runs, never appended after. That section names each surviving finding by
 its filed sub-issue id and title only — never the finding body, `file:line`, or a quoted
 source excerpt; the full write-up already lives in the sub-issue §3 filed for it, and
 republishing it in a public PR body announces an unpatched detail to every repo watcher
 before the operator's morning review.
 
-**These two outcomes differ in kind, not merely in degree — the header below names which one
-you're in; never file this under one shared "satisfied if any of the following" list.**
+**Nothing carries over into the fence below.** No shell state survives across two Bash tool
+calls, so every value it consumes is re-derived inside it from one source of truth — a fresh
+`ship-config.ts validate`, behind the same two `$CONFIG` guards Preflight runs, because
+`$CONFIG` is re-resolved from `$PWD` and a branch under review can plant one. An ambient
+exported `REPO` would otherwise win and aim every `gh` call at an unvalidated repository, and
+an empty `$BASE` yields `--base ""`, which is Locked A's exact failure mode.
+
+**Every value you substitute goes into a quoted heredoc, never into an assignment.** The
+branch name, the PR title and the PR body all originate in text produced from the repository
+under review, and you paste them in literally — so a single `"` would close a double-quoted
+assignment and the `$(...)` after it would run. Inside `<<'SENTINEL'` nothing expands and
+nothing executes; the fence reads the values back out with `jq -r` and `cat`.
+
+**Before you substitute anything, check every value for a line equal to the terminator you
+are pasting it under, and halt the run if you find one** — park the story with that as the
+reason, and never rewrite, escape, or truncate the value to make it fit. A quoted heredoc
+protects the value's `"`, `$` and backticks, but it still ends at the first line equal to its
+terminator, and these terminators are fixed literals published in this repository: a report
+line reading exactly `DRAWBAR_PR_BODY_SENTINEL` closes the body heredoc early and every line
+after it is parsed as shell — arbitrary command execution under the operator's authenticated
+`gh`, with the written file left looking entirely correct. A check inside the fence cannot
+save you here: by the time any line of it runs, the injected commands have already run.
+
+**No value that came out of the repository under review is ever pasted into a JSON document.**
+The branch name gets its own heredoc file and is read back with `cat`, because a `"` in a value
+pasted between two `"` inside the inputs document does not produce invalid JSON that `jq -e .`
+would refuse — it appends keys, and `jq` resolves duplicate keys last-wins, so it silently
+overrides any key declared above it (`arg` names the state file, `story` picks the base). Both
+shape gates then pass, because they see only the laundered values. A key whitelist is not a
+defence: the injected document has exactly the same key set.
+
+```bash
+: "${CLAUDE_PLUGIN_ROOT:?CLAUDE_PLUGIN_ROOT must be set}"
+
+# EVERY agent-substituted value enters through the four QUOTED heredocs below and nowhere
+# else — this is the explicit-assignment convention §6 uses for $LESSONS_JSON, hardened.
+# Substituted into an ordinary double-quoted assignment, one `"` in report text closes the
+# string and `$(...)`/backticks then execute; even single quotes only move the problem to `'`.
+# The branch name, the title and the body all derive from the repository under review, so
+# nothing here is assigned by interpolation at all: inside a QUOTED heredoc (`<<'SENTINEL'`)
+# nothing expands and no command runs, and the values are read back out with `jq -r` / `cat`,
+# never eval'd. A value consumed but never bound would merely halt the run every night; a
+# value bound by interpolation is arbitrary code execution. The one thing a quoted heredoc does
+# NOT protect against is a substituted line equal to the terminator itself — that closes the
+# heredoc and the rest is parsed as shell, so the halt instruction above this fence is part of
+# the guarantee, not an aside, and no check placed here could replace it.
+# `mktemp -d` and not a fixed path: the four `cat >` redirects below follow symlinks, so a
+# guessable directory lets a local user pre-plant one and have this fence truncate an arbitrary
+# file — and substitute the body it then hands to `gh --body-file`.
+IN_DIR=$(mktemp -d) || { echo "FATAL: mktemp -d failed — refusing."; exit 1; }
+INPUTS="${IN_DIR}/inputs.json"
+BRANCH_FILE="${IN_DIR}/branch"
+PR_TITLE_FILE="${IN_DIR}/title"
+PR_BODY_FILE="${IN_DIR}/body"
+
+# `branch` is NOT a key in this document: it derives from the repository under review, and a `"`
+# in a value pasted between two `"` here appends keys rather than breaking the parse — jq takes
+# the LAST of a duplicate key, so an injected `"arg"`/`"story"` silently wins and aims $STATE,
+# assert-chain and resolve-base at a different run. Only values the repository under review
+# cannot author live in here.
+cat > "$INPUTS" <<'DRAWBAR_INPUTS_SENTINEL'
+{
+  "arg":     "<the id THIS RUN was invoked with — it names the state file>",
+  "story":   "<TEAM>-####",
+  "teams":   <the list_teams result for this session, as a JSON array>,
+  "flagged": <the report `status`: flagged -> true, ok -> false; a JSON boolean, never a string>
+}
+DRAWBAR_INPUTS_SENTINEL
+
+cat > "$BRANCH_FILE" <<'DRAWBAR_BRANCH_SENTINEL'
+<the story-lead report's `branch` field, verbatim, one line — nothing here expands>
+DRAWBAR_BRANCH_SENTINEL
+
+cat > "$PR_TITLE_FILE" <<'DRAWBAR_PR_TITLE_SENTINEL'
+<the PR title, one line, verbatim — nothing here expands>
+DRAWBAR_PR_TITLE_SENTINEL
+
+cat > "$PR_BODY_FILE" <<'DRAWBAR_PR_BODY_SENTINEL'
+<the PR body, verbatim — nothing here expands. On a flagged story it is written out here with
+its `## Unresolved findings` section already in it, listing each surviving finding as
+`<SUB-ISSUE-ID> — <sub-issue title>` and nothing else: never the finding body, never a
+`file:line`, never a quoted source excerpt.>
+DRAWBAR_PR_BODY_SENTINEL
+
+# --- read the substituted inputs ------------------------------------------------------------
+jq -e . "$INPUTS" >/dev/null 2>&1 || { echo "FATAL: the inputs heredoc is not valid JSON — refusing."; exit 1; }
+ARG=$(jq -r '.arg // empty' "$INPUTS")
+STORY=$(jq -r '.story // empty' "$INPUTS")
+# Read from its OWN file, never out of the inputs document: nothing about this value's text can
+# reach a JSON key, and its emptiness is refused by the ref-name shape gate below.
+BRANCH=$(cat "$BRANCH_FILE")
+# `flagged` and `teams` are TYPE-checked at the source, not merely non-empty: `flagged` reaches
+# `jq --argjson` below, where the string "true" would produce the string "true" in the stack
+# entry and `isValidStackEntry` demands a strict boolean.
+FLAGGED=$(jq -r 'if (.flagged|type)=="boolean" then (.flagged|tostring) else empty end' "$INPUTS")
+LINEAR_FACTS_JSON=$(jq -c 'if (.teams|type)=="array" then {teams:.teams} else empty end' "$INPUTS")
+for v in ARG STORY FLAGGED LINEAR_FACTS_JSON; do
+  val="${!v}"
+  [ -n "$val" ] && [ "$val" != "null" ] || { echo "FATAL: $v is empty, null, or the wrong JSON type in the inputs heredoc — refusing."; exit 1; }
+done
+# --- end read the substituted inputs --------------------------------------------------------
+
+# $ARG is interpolated into the state-file path, so it must be a single safe path segment —
+# the same shape run-state.ts's `isSafePathSegment` enforces on the value it round-trips.
+case "$ARG" in ''|*/*|*'\'*|*..*) echo "FATAL: ARG is not a safe path segment — refusing."; exit 1;; esac
+
+# --- branch ref-name shape gate ------------------------------------------------------------
+# $BRANCH comes from an agent report and reaches `--head` and the stack entry. Gated HERE, at
+# the top, before it can reach either. Mirrors ship-config.ts's REF_NAME_SHAPE plus its `.lock`
+# refusal — i.e. exactly what run-state.ts's `isValidStackEntry` re-applies to the entry
+# written below, so a branch that would brick the state file is refused before a PR is ever
+# opened for it. `[[ =~ ]]` and not a `grep` pipeline: grep matches LINE by line, so a BRANCH
+# carrying an embedded newline would satisfy it twice over while `isValidRefName` refuses that
+# same value. `LC_ALL=C` inside the subshell keeps `A-Za-z0-9` byte ranges rather than locale
+# collation ranges. (The `/` is written FIRST inside the bracket expression on purpose: this
+# file is scanned for concrete GitHub org-and-repo slugs, and a slash between two word
+# characters reads as one.)
+( LC_ALL=C; [[ "$BRANCH" =~ ^[A-Za-z0-9][/A-Za-z0-9._-]*$ ]] ) || { echo "FATAL: BRANCH is not a valid git ref name — refusing."; exit 1; }
+case "$BRANCH" in *..*|*"@{"*|*.lock) echo "FATAL: BRANCH is not a valid git ref name — refusing."; exit 1;; esac
+# --- end branch ref-name shape gate ---------------------------------------------------------
+
+# $CONFIG is re-resolved from $PWD here, so BOTH of Preflight's guards run again, verbatim.
+# Dropping them lets a branch under review plant `.drawbar/ship.config.json` and feed its own
+# `projectDir` into `--project-dir` and `git -C`; an equality guard does not help, because both
+# sides then agree — on the attacker's directory. (The tracked-config refusal keeps Preflight's
+# `&& { ... } || true` shape deliberately: it is the same guard, not a reworded copy of it, and
+# it is asked about the symlink-resolved path for the reason Preflight's copy spells out.)
+CONFIG="${DRAWBAR_SHIP_CONFIG:-$PWD/.drawbar/ship.config.json}"
+[ -f "$CONFIG" ] || { echo "FATAL: no config at $CONFIG — copy .drawbar/ship.config.example.json, fill in real values, and either place the copy there or set DRAWBAR_SHIP_CONFIG to point at it."; exit 1; }
+CONFIG_REAL=$(readlink -f "$CONFIG") || { echo "FATAL: cannot resolve $CONFIG to a real path — refusing."; exit 1; }
+git -C "$(dirname "$CONFIG_REAL")" ls-files --error-unmatch "$CONFIG_REAL" >/dev/null 2>&1 \
+  && { echo "FATAL: $CONFIG is tracked by git — a committed ship config is never trusted. Untrack it (git rm --cached) and keep it out of version control."; exit 1; } \
+  || true
+
+# MUST-CHECK r3-must-not-source-project-dir-from-pasted-run-state: the trust root is this FRESH
+# validate, run in this block. Never `jq '.resolved_config' "$STATE"` and never anything else
+# read out of `runs/` — the state file is agent-writable, and a `--project-dir` taken from it
+# turns stack.ts's equality guard into a tautology about the attacker's own directory.
+RESOLVED=$(echo "$LINEAR_FACTS_JSON" | bun run "${CLAUDE_PLUGIN_ROOT}/scripts/lib/ship-config.ts" validate --config "$CONFIG") \
+  || { echo "FATAL: ship-config validation refused — see stderr above for the specific reason."; exit 1; }
+
+# --- derive from the resolved config (§4) --------------------------------------------------
+ENV_DIR=$(echo "$RESOLVED" | jq -r '.envDir // empty')
+PROJECT_DIR=$(echo "$RESOLVED" | jq -r '.projectDir // empty')
+REPO=$(echo "$RESOLVED" | jq -r '.repo // empty')
+for v in ENV_DIR PROJECT_DIR REPO; do
+  val="${!v}"
+  [ -n "$val" ] && [ "$val" != "null" ] || { echo "FATAL: $v is empty or null after validation — refusing."; exit 1; }
+done
+# --- end derive from the resolved config (§4) ----------------------------------------------
+STATE="$ENV_DIR/.drawbar/runs/$ARG.json"
+
+# Check 1 of 3 — chain integrity. `--project-dir` is the operator-authored trust root, taken
+# from the fresh validate above, never from the state file's own `resolved_config` copy.
+CHAIN_JSON=$(bun run "${CLAUDE_PLUGIN_ROOT}/scripts/lib/stack.ts" assert-chain --state "$STATE" --project-dir "$PROJECT_DIR")
+CHAIN_OK=$(printf '%s' "${CHAIN_JSON:-null}" | jq -r 'if (type=="object" and .ok==true) then "true" else "false" end' 2>/dev/null)
+# Echo the verdict's `.reason` and NOTHING else. `.detail` carries absolute paths and the real
+# repo slug, this repo is public, and the Hard rules require refusal text be paraphrased rather
+# than pasted into `parked_reason`, the §5 comment, or a KB entry.
+[ "$CHAIN_OK" = "true" ] || { CHAIN_REASON=$(printf '%s' "${CHAIN_JSON:-null}" | jq -r '.reason // "unreadable-verdict"' 2>/dev/null); echo "NO_PR: assert-chain refused ($CHAIN_REASON) — park the story; paraphrase, never paste, the detail on stderr."; exit 1; }
+
+# Check 2 of 3 — the base. Locked A: `resolve-base` is the only producer of this value.
+BASE_JSON=$(bun run "${CLAUDE_PLUGIN_ROOT}/scripts/lib/stack.ts" resolve-base --state "$STATE" --story "$STORY")
+BASE=$(printf '%s' "${BASE_JSON:-null}" | jq -r 'if (type=="object" and .ok==true) then .base else empty end' 2>/dev/null)
+[ -n "$BASE" ] && [ "$BASE" != "null" ] || { BASE_REASON=$(printf '%s' "${BASE_JSON:-null}" | jq -r '.reason // "unreadable-verdict"' 2>/dev/null); echo "NO_PR: resolve-base refused ($BASE_REASON) — park the story; paraphrase, never paste, the detail on stderr."; exit 1; }
+
+# Check 3 of 3 — open it. `--title` reads the file at RUNTIME as one quoted argument and
+# `--body-file` reads it inside `gh`, so no report text is ever part of this command line.
+PR_URL=$(gh pr create --repo "$REPO" --base "$BASE" --head "$BRANCH" --title "$(cat "$PR_TITLE_FILE")" --body-file "$PR_BODY_FILE") \
+  || { echo "NO_PR: gh pr create failed — park the story; paraphrase, never paste, the detail on stderr."; exit 1; }
+
+# --- pr number shape gate --------------------------------------------------------------------
+# Never `basename "$PR_URL"`: unvalidated, and `isValidStackEntry` requires a positive INTEGER.
+PR=$(gh pr view "$PR_URL" --repo "$REPO" --json number -q .number) || { echo "PR_UNRECORDED: gh pr create left no readable PR number — the PR is open; park the story with that reason (Outcome C) and repair the run state by hand."; exit 1; }
+case "$PR" in ''|*[!0-9]*) echo "PR_UNRECORDED: PR number is not digits-only — the PR is open; park the story with that reason (Outcome C) and repair the run state by hand."; exit 1;; esac
+[ "$PR" -gt 0 ] || { echo "PR_UNRECORDED: PR number is not a positive integer — the PR is open; park the story with that reason (Outcome C) and repair the run state by hand."; exit 1; }
+# --- end pr number shape gate -----------------------------------------------------------------
+
+# --- stack entry -------------------------------------------------------------------------------
+# run-state.ts's `isValidStackEntry` requires `pr` to be a positive integer and `flagged` a
+# strict boolean. Bash produces strings, and a string in either field makes `parseRunState`
+# reject the WHOLE file on the next read — stack.ts then writes its usage error to stderr with
+# EMPTY stdout, so the operator sees a bare `refused ()` and the state file is permanently
+# unreadable by its own tooling. Hence `--argjson` for those two, never `--arg`.
+case "$FLAGGED" in true|false) ;; *) echo "PR_UNRECORDED: FLAGGED must be the JSON literal true or false — the PR is open; park the story with that reason (Outcome C) and repair the run state by hand."; exit 1;; esac
+ENTRY=$(jq -nc --arg story "$STORY" --arg branch "$BRANCH" --argjson pr "$PR" --arg base "$BASE" --argjson flagged "$FLAGGED" '{story:$story,branch:$branch,pr:$pr,base:$base,flagged:$flagged}') || { echo "PR_UNRECORDED: could not build the stack entry — the PR is open; park the story with that reason (Outcome C) and repair the run state by hand."; exit 1; }
+# --- end stack entry ----------------------------------------------------------------------------
+
+NEXT_STATE=$(jq -c --argjson entry "$ENTRY" '.stack += [$entry]' "$STATE") || { echo "PR_UNRECORDED: could not append the stack entry to the run state — the PR is open; park the story with that reason (Outcome C) and repair the run state by hand."; exit 1; }
+printf '%s\n' "$NEXT_STATE" > "$STATE.tmp" && mv "$STATE.tmp" "$STATE" || { echo "PR_UNRECORDED: could not write the run state — the PR is open; park the story with that reason (Outcome C) and repair the run state by hand."; exit 1; }
+
+# Round-trip what was just written through `parseRunState` — `assert-chain` parses the state
+# with it and re-verifies the chain including the entry appended above. A wrong JSON type is
+# caught HERE, in the step that wrote it, instead of bricking every later read.
+VERIFY_JSON=$(bun run "${CLAUDE_PLUGIN_ROOT}/scripts/lib/stack.ts" assert-chain --state "$STATE" --project-dir "$PROJECT_DIR")
+VERIFY_OK=$(printf '%s' "${VERIFY_JSON:-null}" | jq -r 'if (type=="object" and .ok==true) then "true" else "false" end' 2>/dev/null)
+[ "$VERIFY_OK" = "true" ] || { VERIFY_REASON=$(printf '%s' "${VERIFY_JSON:-null}" | jq -r '.reason // "unreadable-verdict"' 2>/dev/null); echo "PR_UNRECORDED: the recorded stack entry did not round-trip ($VERIFY_REASON) — the PR is open; park the story with that reason (Outcome C) and repair the run state by hand."; exit 1; }
+
+echo "PR_OPENED: $PR_URL (base $BASE)"
+```
+
+**These three outcomes differ in kind, not merely in degree — the header below names which one
+you're in; never file this under one shared "satisfied if any of the following" list.** Each
+one has its own prefix in the fence's output, and every refusal carries exactly one of them:
+`NO_PR:` is Outcome A, `PR_UNRECORDED:` is Outcome C, `PR_OPENED:` is Outcome B.
 
 **Outcome A — no PR could be opened (halt, distinct from flagged).** A refusal at any of the
 three required checks — assert-chain refusing, resolve-base refusing, or `gh pr create`
@@ -366,7 +639,18 @@ flagged case: go to *Parking a story*, with `parked_reason` naming which call re
 
 **Outcome B — the PR opened.** Record `{story, branch, pr, base, flagged}` in the run state's
 `stack` array — `pr` as a JSON number (a positive integer, never the string form) and
-`flagged` as a JSON boolean — then continue to §5.
+`flagged` as a JSON boolean — which is what the fence's `jq --argjson` builds and what its
+closing `assert-chain` re-read proves round-trips, then continue to §5.
+
+**Outcome C — the PR opened but the run state does not record it (halt).** Every refusal after
+`gh pr create` returns — an unreadable or non-integer PR number, a `FLAGGED` that is not a JSON
+literal, an entry that cannot be built, appended, or written, or a round-trip that fails — is
+prefixed `PR_UNRECORDED:` and leaves a real pull request open with nothing in the `stack` array
+pointing at it. It is not Outcome A: no `NO_PR:` line is printed, because a PR exists. Go to
+*Parking a story*, and make `parked_reason` say that the PR is open and unrecorded, with its
+URL. **Never re-run this step for that story** — the identical head+base pair is exactly the
+422 collision this section's opening paragraph warns about — and never hand-edit the `stack`
+array during the run: the repair belongs to the operator's morning review.
 
 ## 5. Post the summary comment, leave In Progress
 
@@ -389,11 +673,51 @@ continuing silently (F8: the old loop's `break` fired only on success, so total 
 printed nothing and execution continued anyway).
 
 ```bash
-RESOLVED="<Preflight's resolved_config JSON>"     # separate Bash invocation from Preflight's — no shell state survives across tool calls, so re-declared
+: "${CLAUDE_PLUGIN_ROOT:?CLAUDE_PLUGIN_ROOT must be set}"
+
+# --- the trust root, re-derived here (separate Bash invocation from Preflight's — no shell
+# --- state survives across tool calls, so $CONFIG must be re-declared, not remembered) -------
+#
+# $CONFIG is re-resolved from $PWD here, so BOTH of Preflight's guards run again, verbatim —
+# MUST-CHECK cross-invocation-guard-applies-per-variable-not-per-fence: the re-declare-AND-assert
+# discipline applies to every variable a later fence re-derives, and $CONFIG's assertion IS the
+# tracked-config refusal. §6 runs AFTER §4/§5's branch work, so "Preflight already checked" does
+# not cover a `.drawbar/ship.config.json` that appears mid-run, and this fence's $PWD need not be
+# Preflight's. Dropping the guards lets a branch under review plant a config and feed its own
+# `envDir` into `--env-dir` and `git -C`; an equality guard does not help, because both sides then
+# agree — on the attacker's directory. (The tracked-config refusal keeps Preflight's
+# `&& { ... } || true` shape deliberately: it is the same guard, not a reworded copy of it, and it
+# is asked about the symlink-resolved path for the reason Preflight's copy spells out.)
+#
+# Cross-reference: this fallback duplicates ship-config.ts's `resolveConfigPath` and Preflight's
+# own copy of it — keep all three in sync if the default location or the env-var name changes.
+# If DRAWBAR_SHIP_CONFIG is used at all it must be EXPORTED, not merely set in this fence:
+# kb-sync.ts re-derives the same default from the environment IT inherits and refuses a
+# `--config-path` that disagrees.
+CONFIG="${DRAWBAR_SHIP_CONFIG:-$PWD/.drawbar/ship.config.json}"
+[ -f "$CONFIG" ] || { echo "FATAL: no config at $CONFIG — copy .drawbar/ship.config.example.json, fill in real values, and either place the copy there or set DRAWBAR_SHIP_CONFIG to point at it."; exit 1; }
+CONFIG_REAL=$(readlink -f "$CONFIG") || { echo "FATAL: cannot resolve $CONFIG to a real path — refusing."; exit 1; }
+git -C "$(dirname "$CONFIG_REAL")" ls-files --error-unmatch "$CONFIG_REAL" >/dev/null 2>&1 \
+  && { echo "FATAL: $CONFIG is tracked by git — a committed ship config is never trusted. Untrack it (git rm --cached) and keep it out of version control."; exit 1; } \
+  || true
+
+RESOLVED="<Preflight's resolved_config JSON>"     # re-declared for the same reason
 ENV_DIR=$(echo "$RESOLVED" | jq -r '.envDir // empty')
 [ -n "$ENV_DIR" ] && [ "$ENV_DIR" != "null" ] || { echo "FATAL: ENV_DIR is empty or null after validation — refusing."; exit 1; }
+# The non-emptiness check above is a typo guard, NOT a security boundary, and this fence no
+# longer pretends otherwise. `$RESOLVED` is a prose placeholder THIS MODEL fills in from its own
+# context, so `$ENV_DIR` is agent-held mutable state, and it reaches `git -C` inside kb-sync.ts —
+# an arbitrary-code-execution sink (git reads the named directory's own repository config, which
+# supplies `core.sshCommand` on a pull and a `reference-transaction` hook on a successful push). What
+# actually contains that is `--config-path` below: kb-sync.ts parses $CONFIG_REAL with
+# ship-config.ts's `parseShipConfig` and REFUSES unless the config's `envDir` equals the
+# `--env-dir` it was handed. That equality is only worth anything because the module also pins
+# WHICH file may vouch — it must be the one this environment's own $DRAWBAR_SHIP_CONFIG/$PWD
+# resolve to, and it must not be tracked by git — so naming a planted config as its own trust root
+# no longer works. The guards above are this fence's half of that: they refuse a tracked config
+# before it is ever passed, and they are the reason a `--config-path` reaching the module has
+# already been checked twice.
 KB="$ENV_DIR/.drawbar/memory"
-: "${CLAUDE_PLUGIN_ROOT:?CLAUDE_PLUGIN_ROOT must be set}"
 STORY="<TEAM>-####"      # the story this iteration shipped
 
 # The report's `lessons` array, as JSON — the same shape `drawbar-kb add` accepts per entry,
@@ -404,7 +728,8 @@ LESSONS_JSON='{"lessons":<the report'"'"'s lessons array, JSON>}'
 # Fail CLOSED on every one of: a non-zero exit from the module itself, or unparseable/empty
 # stdout.
 SYNC_JSON=$(echo "$LESSONS_JSON" | bun run "${CLAUDE_PLUGIN_ROOT}/scripts/lib/kb-sync.ts" sync \
-              --env-dir "$ENV_DIR" --dir "$KB" --message "kb: $STORY sync")
+              --env-dir "$ENV_DIR" --dir "$KB" --message "kb: $STORY sync" \
+              --config-path "$CONFIG_REAL")
 SYNC_EXIT=$?
 [ "$SYNC_EXIT" -eq 0 ] || { echo "REFUSING: kb-sync.ts sync exited $SYNC_EXIT — see stderr above ($SYNC_JSON)"; exit 1; }
 SYNC_OK=$(echo "$SYNC_JSON" | jq -r 'if (type=="object" and has("ok")) then .ok else "unparseable" end' 2>/dev/null)
@@ -453,6 +778,13 @@ guard: `now - in_flight.agent_dispatched_at` exceeding 2x the heartbeat) **route
 — that is Locked 13's whole point: a crashed run must not deadlock every later invocation by
 leaving `in_flight` permanently "fresh" from a no-op's point of view.
 
+**Recovery re-establishes the stack base, not merely the in-flight story.** That is the
+responsibility this section gained with the stack: a resumed run that resolves the wrong base
+opens a pull request whose diff carries another story's work — green, plausible, and
+near-impossible to spot in the morning. It is the one crash-resume failure that produces no
+error at all, which is exactly why the base is re-established by `stack.ts` and confirmed before
+anything is re-dispatched, never inferred from the branch that happens to be checked out.
+
 1. **Read the state file** for the story that was in flight (`in_flight.story`, or — if
    `in_flight` is somehow already null — the last id not in `stories_done`).
 2. **Read that story's Linear comments** — step 2's start comment names the branch and time.
@@ -461,13 +793,104 @@ leaving `in_flight` permanently "fresh" from a no-op's point of view.
    crash-recovery tool ONLY — it has a blind window between dispatch and first commit,
    demonstrated when it read "indistinguishable from never started" one minute after a live
    dispatch. Never use it to gate the fresh-in-window no-op check in step 2.)
-4. **Resume at the earliest incomplete step.** Uncommitted work is *not* discarded — it is
+4. **Re-establish the base before re-dispatching anything.** One state skips this step: if step
+   3 found the PR already open **and** the `stack` array already records this story, the
+   PR-opening step completed and only the tail of the run was lost. That state is correct, not
+   broken — resolve **no** new base for it, and resume at §5 (post the summary comment).
+   `resolve-base` refuses `story_already_stacked` for exactly that state, and that one reason
+   means "already stacked", never "park". Every other resume re-establishes the base *here*,
+   through the fence below, never from the branch that happens to be checked out and never
+   re-derived in bash: `stack.ts assert-chain` confirms every recorded predecessor branch still
+   exists and still points where the `stack` array says, then a fresh `stack.ts resolve-base`
+   produces the base for this story. Any other refusal from either call **parks the story**:
+   refuse rather than guess, because guessing here is what silently re-parents the story onto
+   another story's work. Echo each verdict's `.reason` and nothing else — paraphrase, never
+   paste, a `detail`.
+
+   **`--project-dir` is a trust root, and this fence is the only sanctioned way to produce one.**
+   MUST-CHECK `r3-must-not-source-project-dir-from-pasted-run-state`: the value handed to
+   `--project-dir` comes from the fresh `ship-config.ts validate` inside this block and from
+   nowhere else — never `jq '.resolved_config' "$STATE"`, and never the `resolved_config` that
+   step 1 has already read into context. The state file is agent-writable, so a `--project-dir`
+   taken from it turns `stack.ts`'s equality guard into a tautology about whatever directory that
+   file names, and hands `git -C` a repository an attacker chose. Recovery is also the worst
+   moment to drop the config guards: it runs with a dirty tree and the branch under review checked
+   out, which is precisely the tree that can plant a config of its own. Both of Preflight's guards
+   therefore run again here, verbatim.
+
+   ```bash
+   # Crash recovery re-derives its own trust roots. Variables do not survive between blocks, and
+   # nothing already in this session's context is one — least of all the run state.
+   ARG="<the id THIS RUN was invoked with — it names the state file>"
+   STORY="<the in-flight story id established in step 1>"
+   LINEAR_FACTS_RAW='{"teams":<the list_teams result for this session, as a JSON array>}'
+   LINEAR_FACTS_JSON=$(printf '%s' "$LINEAR_FACTS_RAW" | jq -c 'if (.teams|type)=="array" then {teams:.teams} else empty end' 2>/dev/null)
+   for v in ARG STORY LINEAR_FACTS_JSON; do
+     val="${!v}"
+     [ -n "$val" ] && [ "$val" != "null" ] || { echo "FATAL: $v is empty, null, or the wrong JSON type — refusing."; exit 1; }
+   done
+   # $ARG is interpolated into the state-file path, so it must be a single safe path segment.
+   case "$ARG" in ''|*/*|*'\'*|*..*) echo "FATAL: ARG is not a safe path segment — refusing."; exit 1;; esac
+
+   # $CONFIG is re-resolved from $PWD here, so BOTH of Preflight's guards run again, verbatim.
+   # Dropping them lets the branch under review — which this procedure has checked out, in a dirty
+   # tree — plant `.drawbar/ship.config.json` and feed its own `projectDir` into `--project-dir`
+   # and `git -C`; an equality guard does not help, because both sides then agree.
+   CONFIG="${DRAWBAR_SHIP_CONFIG:-$PWD/.drawbar/ship.config.json}"
+   [ -f "$CONFIG" ] || { echo "FATAL: no config at $CONFIG — copy .drawbar/ship.config.example.json, fill in real values, and either place the copy there or set DRAWBAR_SHIP_CONFIG to point at it."; exit 1; }
+   CONFIG_REAL=$(readlink -f "$CONFIG") || { echo "FATAL: cannot resolve $CONFIG to a real path — refusing."; exit 1; }
+   git -C "$(dirname "$CONFIG_REAL")" ls-files --error-unmatch "$CONFIG_REAL" >/dev/null 2>&1 \
+     && { echo "FATAL: $CONFIG is tracked by git — a committed ship config is never trusted. Untrack it (git rm --cached) and keep it out of version control."; exit 1; } \
+     || true
+
+   # MUST-CHECK r3-must-not-source-project-dir-from-pasted-run-state: the trust root is this FRESH
+   # validate, run in this block. Never `jq '.resolved_config' "$STATE"` and never anything else
+   # read out of the run state — the state file is agent-writable, and a `--project-dir` taken
+   # from it turns stack.ts's equality guard into a tautology about the attacker's own directory.
+   RESOLVED=$(echo "$LINEAR_FACTS_JSON" | bun run "${CLAUDE_PLUGIN_ROOT}/scripts/lib/ship-config.ts" validate --config "$CONFIG") \
+     || { echo "FATAL: ship-config validation refused — see stderr above for the specific reason."; exit 1; }
+
+   # --- derive from the resolved config (crash recovery) --------------------------------------
+   ENV_DIR=$(echo "$RESOLVED" | jq -r '.envDir // empty')
+   PROJECT_DIR=$(echo "$RESOLVED" | jq -r '.projectDir // empty')
+   for v in ENV_DIR PROJECT_DIR; do
+     val="${!v}"
+     [ -n "$val" ] && [ "$val" != "null" ] || { echo "FATAL: $v is empty or null after validation — refusing."; exit 1; }
+   done
+   # --- end derive from the resolved config (crash recovery) ----------------------------------
+   STATE="$ENV_DIR/.drawbar/runs/$ARG.json"
+
+   # Chain integrity. `--project-dir` is the operator-authored trust root, taken from the fresh
+   # validate above, never from the state file's own `resolved_config` copy. Echo the verdict's
+   # `.reason` and NOTHING else: `.detail` carries absolute paths and the real repo slug, this
+   # repo is public, and the Hard rules require refusal text be paraphrased rather than pasted.
+   CHAIN_JSON=$(bun run "${CLAUDE_PLUGIN_ROOT}/scripts/lib/stack.ts" assert-chain --state "$STATE" --project-dir "$PROJECT_DIR")
+   CHAIN_OK=$(printf '%s' "${CHAIN_JSON:-null}" | jq -r 'if (type=="object" and .ok==true) then "true" else "false" end' 2>/dev/null)
+   [ "$CHAIN_OK" = "true" ] || { CHAIN_REASON=$(printf '%s' "${CHAIN_JSON:-null}" | jq -r '.reason // "unreadable-verdict"' 2>/dev/null); echo "PARK: assert-chain refused ($CHAIN_REASON) — park the story; paraphrase, never paste, the detail on stderr."; exit 1; }
+
+   # The base. `story_already_stacked` is the ONE refusal that is not a park: it means the
+   # PR-opening step already completed for this story and the entry is recorded, so there is no
+   # base to resolve and the resume point is the summary comment.
+   BASE_JSON=$(bun run "${CLAUDE_PLUGIN_ROOT}/scripts/lib/stack.ts" resolve-base --state "$STATE" --story "$STORY")
+   BASE=$(printf '%s' "${BASE_JSON:-null}" | jq -r 'if (type=="object" and .ok==true) then .base else empty end' 2>/dev/null)
+   if [ -n "$BASE" ] && [ "$BASE" != "null" ]; then
+     echo "BASE_REESTABLISHED: $BASE"
+   else
+     BASE_REASON=$(printf '%s' "${BASE_JSON:-null}" | jq -r '.reason // "unreadable-verdict"' 2>/dev/null)
+     case "$BASE_REASON" in
+       story_already_stacked) echo "ALREADY_STACKED: the PR is already recorded — resume at the summary comment; resolve no base.";;
+       *) echo "PARK: resolve-base refused ($BASE_REASON) — park the story; paraphrase, never paste, the detail on stderr."; exit 1;;
+     esac
+   fi
+   ```
+5. **Resume at the earliest incomplete step.** Uncommitted work is *not* discarded — it is
    the crashed run's output. Commit it on the story branch first so it is inspectable, then
-   re-dispatch the story-lead pointing at that branch, **re-writing `in_flight`** with the new
-   dispatch time exactly as step 2 does for a fresh dispatch.
-5. If the tree is dirty but the state file names **no** in-flight story, halt and notify —
+   re-dispatch the story-lead pointing at that branch and at the base step 4 re-established,
+   **re-writing `in_flight`** with the new dispatch time exactly as step 2 does for a fresh
+   dispatch.
+6. If the tree is dirty but the state file names **no** in-flight story, halt and notify —
    that is unexplained, and unexplained state is not something to resolve unattended.
-6. If recovery instead determines the story is unrecoverable and must be halted outright,
+7. If recovery instead determines the story is unrecoverable and must be halted outright,
    **clear `in_flight`** (`in_flight: null`) before halting — same as *Parking a story*.
 
 > Discipline that makes this work: commit each verified increment (the story-lead's §2), and
@@ -484,9 +907,20 @@ then `ScheduleWakeup({stop: true})`.
 
 - Sequential. One story per invocation. Never parallel.
 - Halt on failure; never skip a story.
-- `--base` comes from `scripts/lib/stack.ts`'s `resolveBase`: the configured `baseBranch` for
-  the first story of a run, the previous story's recorded branch for every story after that
-  (Locked A). The run never merges.
+- `--base` comes from `scripts/lib/stack.ts`'s `resolveBase`, invoked as `stack.ts resolve-base`:
+  the configured `baseBranch` for the first story of a run, the previous story's recorded branch
+  for every story after that (Locked A). Never re-derive it in bash, never read it out of the
+  run-state file by hand, and never omit `--base`.
+- **Locked F: never merge, never verify a merge, and never inspect whether one happened.** There
+  is no merge step, no merge check, and no out-of-order-merge detection or repair anywhere in
+  this command, and none is planned. The operator merges, bottom-up and in order.
+- A `flagged` story still gets its PR and the stack still continues on top of it; a story with
+  **no** PR parks and halts the run, because the chain has no anchor. Never treat the two as
+  degrees of the same outcome.
+- **Any guard refusal text — `ship-config.ts`, `stack.ts`, `kb-sync.ts` alike — must be
+  paraphrased, never pasted**, into `parked_reason`, a Linear comment, or a KB entry. Echo the
+  verdict's `.reason` and nothing else: a `detail` carries absolute paths and the real repo slug,
+  and this repo is public.
 - Never `--no-verify`, never force-push, never commit to `main` directly.
 - **Never set `Done` / `Ready For QA` / `Ready for Rollout` / `Rolled Out`** — and never
   grant a subagent Linear authority.
@@ -496,6 +930,20 @@ then `ScheduleWakeup({stop: true})`.
 
 ## Operator notes
 
+- **In the morning: review bottom-up and merge bottom-up, in order.** The run leaves you a stack
+  of open pull requests, each based on the one below it and each story left `In Progress`. Only
+  the bottom PR's diff is meaningful against the configured base; every PR above it becomes
+  meaningful as the one below it lands. Merging out of order leaves later PRs showing a diff
+  against a base that has moved.
+- **Keeping the stack mergeable is yours, and nothing here checks it.** Per Locked F this command
+  never merges, never verifies a merge, and never inspects whether one happened — there is no
+  detection or repair of an out-of-order merge, and none is planned. If it happens, the recovery
+  is a rebase you do by hand. This is a contract rather than a missing feature, so it is not
+  something to file.
+- **A `flagged` PR is a PR to review, not a failure.** Its `## Unresolved findings` section names
+  each surviving finding by sub-issue id and title; the write-ups are in those Linear sub-issues,
+  deliberately not in the public PR body. A story that could not open a PR at all is the other
+  case entirely: the run parked and stopped there, so the stack ends at the story below it.
 - **A config file must exist before running.** Copy `.drawbar/ship.config.example.json`,
   fill in real `envDir` / `projectDir` / `repo` / `team` / `baseBranch` /
   `requiredChecks` values, and either save it at `<cwd>/.drawbar/ship.config.json` or point
@@ -516,8 +964,10 @@ then `ScheduleWakeup({stop: true})`.
   file inside a working directory rather than exported env vars, and any repository's tree
   (including a contributor PR) can otherwise plant one. Keep it untracked, as `.gitignore`
   already enforces for the default path.
-- **Ship-config refusal text must be paraphrased, never pasted**, into a KB entry or a Linear
-  comment. Refusal `detail` strings echo absolute paths and the real repo slug, and the
+- **Any guard refusal text must be paraphrased, never pasted**, into a KB entry or a Linear
+  comment — `stack.ts`'s verdicts exactly as much as `ship-config.ts`'s, and a `parked_reason`
+  exactly as much as a comment. Refusal `detail` strings echo absolute paths and the real repo
+  slug (`assert-chain`'s name a predecessor branch and the `projectDir` it was asked about), and the
   slug leak-scan rule is deliberately out of scope for `knowledge.jsonl` (prose there produces
   too many false-positive "word / word" matches to allowlist) — pasting a refusal verbatim
   would leak it unscanned.
