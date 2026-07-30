@@ -1,0 +1,5 @@
+# /drawbar-ship section 4 inputs (branch, title, body, inputs.json). Local scratch — never
+# committed. The fence deletes all four on every exit path; this exists so a crash between
+# the Write calls and the fence cannot leave a PR body stageable.
+*
+!.gitignore
