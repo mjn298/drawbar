@@ -127,6 +127,20 @@ describe("ported files carry no private-org identifiers (leak regression)", () =
     // run-state.test.ts. The leak scan errors on a missing path, so both must exist on disk.
     "scripts/lib/stack.ts",
     "scripts/lib/stack.test.ts",
+    // PCO-372/373 (fix pass): the two reviewer agent docs. Same precedent as I10 above — they are
+    // shipped, permanently public, and agent-editable prose, and this is the first change to port
+    // another team's retrospective incident detail INTO them (the modal harness, the PII blacklist
+    // regex, the 17-row block), which is exactly the material the scrub exists to keep generic.
+    // They were outside every rule until now. No live leak was found in either (verified against
+    // all three ALL_FILES rules before adding); this closes the gap so the next story appending
+    // retrospective prose to a reviewer doc is scanned too — public git history is not reversible,
+    // so the coverage has to land before the leak, not after. Deliberately NOT added to the
+    // owner/repo slug rule below: like knowledge.jsonl and this file, they are prose-heavy and
+    // produce many ordinary word "/" word matches ("SQL/NoSQL", "debug/verbose", "Critical/
+    // Important"), and an allowlist covering those would be unbounded — see MUST-CHECK
+    // leak-scan-self-reference-needs-per-rule-file-scope.
+    "agents/code-reviewer.md",
+    "agents/security-reviewer.md",
   ];
   const ALL_FILES = [...DOC_FILES, ...SELF_FILES, ...NEW_PUBLIC_FILES];
 
@@ -284,6 +298,19 @@ describe("ported files carry no private-org identifiers (leak regression)", () =
       });
     }
   }
+
+  // Scan COVERAGE is itself unpinned without this. Every assertion above is generated per file in
+  // the list, so dropping a file from the list deletes its tests and turns the suite green with
+  // less coverage than before — a silent revert no red catches, and the exact shape of defect
+  // PCO-372's rubric exists to name. Scoped to the two reviewer docs this fix pass added (the
+  // first files to carry ported retrospective incident detail); the rest of the list is asserted
+  // by its own longstanding tests, and widening this to every agent doc is a separate story.
+  test("both reviewer agent docs stay inside the leak scan's file list", () => {
+    for (const f of ["agents/code-reviewer.md", "agents/security-reviewer.md"]) {
+      expect(ALL_FILES, `${f} must stay covered by the leak regression scan`).toContain(f);
+      expect(existsSync(join(root, f))).toBe(true);
+    }
+  });
 });
 
 // PCO-348 (S3): the EXPECTED_REPO env-var guard is gone — Locked 17 replaces it with a
@@ -4618,5 +4645,585 @@ describe("PCO-369 R6: cross-references reconciled, the stack model documented, L
 
   test("the story-lead no longer says its caller owns the merge", () => {
     expect(agent()).not.toContain("owns the merge");
+  });
+});
+
+// PCO-372 / PCO-373: reviewer finding QUALITY. Both stories come from a retrospective on a real
+// four-story run in which drawbar's reviewers were used in anger. Everything pinned below is a
+// rule whose absence has already cost a review round on that run.
+//
+// Pinning strategy, and why it is not the `toContain` wall it started as. Per MUST-CHECK
+// doc-grep-assertion-must-normalize-whitespace every assertion is whitespace-normalized, and per
+// MUST-CHECK pco352-fixpass-prose-gate-mutation-must-cover-rephrase-not-only-delete every pin is
+// on one CONTIGUOUS phrase carrying its qualifiers rather than on independent tokens. That much
+// survives deletion and rephrase. It does NOT survive the third attack, which mutation testing
+// found alive here: text ADDED beside a correct sentence. `toContain("...is Critical (must
+// fix)")` is satisfied word-for-word by a section that then says "grade these case by case", and
+// an enumerated blacklist of forbidden spellings ("your judgement", "usually worth", …) is
+// evaded by the next synonym — which is precisely rubric entry 4's own defect, a blacklist
+// standing in for an allowlist. So the load-bearing assertions here are CLOSED: `units()` reduces
+// a section to its logical units and `toEqual` states the complete permitted contents. A closed
+// pin fails on deletion, on rephrase, AND on addition, and needs no list of synonyms to do it.
+//
+// Split a markdown slice into its logical units — one per heading, paragraph, or list item —
+// folding hard-wrapped continuation lines back together and normalizing whitespace within each.
+function docUnits(text: string): string[] {
+  const out: string[] = [];
+  for (const chunk of text.split(/\n[ \t]*\n/)) {
+    let fresh = true;
+    for (const raw of chunk.split("\n")) {
+      const line = raw.trim();
+      if (!line) continue;
+      if (fresh || /^(?:\d+\.|[-*]|#{1,6})\s/.test(line)) {
+        out.push(line);
+        fresh = false;
+      } else {
+        out[out.length - 1] += " " + line;
+      }
+    }
+  }
+  return out.map((u) => u.replace(/\s+/g, " "));
+}
+
+// A section of an agent doc, from its own heading to the next heading of the same or shallower
+// depth (or EOF), asserted to exist exactly once.
+//
+// The heading is matched as a WHOLE LINE, not as a substring, and this is load-bearing rather than
+// tidiness: a substring match treats `### A test that cannot fail is Critical (must fix)` as a hit
+// on `## A test …`, so a mutation that demotes the whole rubric to a subsection of a new
+// `## Minor / hardening notes` parent ("these are worth mentioning but rarely block a merge")
+// sliced identically and left every assertion in this file green. Mutation testing found that one
+// alive; whole-line matching plus the section-inventory test below is what kills it.
+function docSection(relPath: string, heading: string): string {
+  const lines = readNonEmpty(join(root, relPath)).split("\n");
+  const hits = lines.flatMap((l, i) => (l.trim() === heading ? [i] : []));
+  expect(
+    hits.length,
+    `'${heading}' must occur exactly once as a whole-line heading in ${relPath}, found ${hits.length}`,
+  ).toBe(1);
+  const start = hits[0]!;
+  const depth = heading.match(/^#+/)![0]!.length;
+  let end = lines.length;
+  for (let i = start + 1; i < lines.length; i++) {
+    const m = lines[i]!.match(/^(#{1,6})\s/);
+    if (m && m[1]!.length <= depth) {
+      end = i;
+      break;
+    }
+  }
+  return lines.slice(start, end).join("\n");
+}
+
+// The complete list of top-level sections each reviewer is allowed to have, in order. An
+// allowlist, not a scan for bad ones: the closed pins below cover what is INSIDE the rubric and
+// Output sections, and this covers the remaining move — bolting a whole new section onto the file
+// to say what those sections are no longer allowed to say.
+const REVIEWER_SECTIONS: Record<string, string[]> = {
+  "agents/code-reviewer.md": [
+    "## Inputs you are given",
+    "## What to do",
+    "## A test that cannot fail is Critical (must fix)",
+    "## Output (return to the caller — do NOT write to Linear)",
+  ],
+  "agents/security-reviewer.md": [
+    "## Inputs you are given",
+    "## What to do",
+    "## A test that cannot fail is Critical (must fix)",
+    "## Output (return to the caller — do NOT write to Linear)",
+  ],
+};
+
+describe("PCO-372: a test that cannot fail is a must-fix rubric entry in BOTH reviewers", () => {
+  const REVIEWERS = ["agents/code-reviewer.md", "agents/security-reviewer.md"];
+  const RUBRIC_HEADING = "## A test that cannot fail is Critical (must fix)";
+  const OUTPUT_HEADING = "## Output (return to the caller — do NOT write to Linear)";
+
+  function normalized(relPath: string): string {
+    return readNonEmpty(join(root, relPath)).replace(/\s+/g, " ");
+  }
+
+  // The rubric section only. Scoping matters for the tier assertions: "Important (should fix)" is
+  // a legitimate OUTPUT tier in both files, so a whole-file absence check would be permanently
+  // false, and a whole-file presence check for "Critical (must fix)" was already satisfied by the
+  // output tier list before this story existed (proved by mutation — deleting the whole rubric
+  // left it green).
+  function rubricSection(relPath: string): string {
+    return docSection(relPath, RUBRIC_HEADING).replace(/\s+/g, " ");
+  }
+
+  // Each entry as the COMPLETE text of its list item, so the item is pinned closed: a mutation
+  // that leaves the entry word-for-word intact and appends "Such tests are acceptable when the
+  // behaviour is hard to reach" changes the unit and fails this entry's own named test. A
+  // `toContain` pin on the same string cannot see that sentence at all — the pinned text is still
+  // a prefix of the mutated item.
+  const RUBRIC: ReadonlyArray<readonly [string, string]> = [
+    [
+      "1 — asserts against implementation source text",
+      // The scoping clause is NOT the excuse-clause shape mutation testing killed elsewhere
+      // ("acceptable when the behaviour is hard to reach" — a judgement call reinstated). It is
+      // decidable from the file's type, and it swaps in a STRICTER obligation rather than removing
+      // one. Without it the entry obliges both reviewers to file every doc-gate test in this repo
+      // as Critical — including the ones below — and per agents/drawbar-story-lead.md a surviving
+      // Critical parks the story, so PCO-372 as first written parked itself.
+      "**Asserts against implementation source text** — `readFileSync` on the file under test plus a " +
+        "regex over its own source. It restates the diff, and can fail only if someone edits that " +
+        "line. This entry does not reach a file that is itself the deliverable — a prompt, an agent " +
+        "doc, a config whose text *is* the behavior — where its text is the only thing there is to " +
+        "assert against; what that case owes instead is a pin closed against deletion, rephrase " +
+        "**and** addition, and a token grep over such a file still fails this entry.",
+    ],
+    [
+      "2 — asserts a failure without pinning which failure",
+      "**Asserts that a failure occurred without pinning which failure** — `success === false`, or a " +
+        "bare `toThrow()`. It passes for the wrong error exactly as happily as for the right one.",
+    ],
+    [
+      "3 — one-direction isolation, or a fixture outside the observable set",
+      "**Checks tenant or permission isolation in one direction only, or against a fixture that sits " +
+        "outside the observable set** — either shape is vacuously true, and passes unchanged against " +
+        "an implementation with no isolation at all.",
+    ],
+    [
+      "4 — PII blacklist regex instead of an allowlist",
+      "**Asserts PII absence with a blacklist regex instead of an allowlist of permitted fields** — a " +
+        "blacklist misses every field nobody thought to name, and a `\\b` word boundary never fires " +
+        "inside `firstName`.",
+    ],
+    [
+      "5 — reduced fixture standing in for the real input",
+      // "and no other test exercises the real input" is what makes the incident a defect: the
+      // 2-row sample was the ONLY coverage of the case the story existed to handle. Without the
+      // conjunct, a minimal fixture in a focused unit test sitting alongside an integration test on
+      // the full input is Critical, which is a false positive on good practice.
+      "**Stands a reduced fixture in for the real input the story was written against, and no other " +
+        "test exercises the real input** — a 2-row sample for the customer's 17-row block is not " +
+        "the case the story exists to handle.",
+    ],
+    [
+      "6 — status code or bare success where the claim is about content",
+      "**Asserts a status code or a bare success where the story's claim is about rendered output or " +
+        "content** — a 200 proves the handler ran, not that it rendered what was asked for.",
+    ],
+    [
+      // Entry 7 carries its incident in the same list item, so the item's closed text carries it
+      // too; the incident additionally gets its own named test below for diagnostics.
+      "7 — harness that does not drive the component as its real parent does",
+      // The middle diagnostic is scoped to the observable condition. "literal props the parent
+      // computes" described every focused component test ever written — passing literal props is
+      // how a unit test isolates a component — and under mechanical application made them Critical.
+      // The incident was narrower: `isOpen` was a literal AND no test drove the transition it gates.
+      "**Uses a harness that does not drive the component the way its real parent does** — inert " +
+        "callbacks, a literal prop whose transitions are the behavior the test claims to cover " +
+        "with nothing driving them, missing state transitions. **This entry is " +
+        "the highest-value and the least obvious one here:** a suite that rendered a modal with " +
+        "`isOpen` passed as a literal and `onComplete` as an inert spy never drove it the way its " +
+        "real parent does, which is precisely why all three of that story's must-fix bugs got past " +
+        "an eleven-test suite.",
+    ],
+  ];
+
+  // The tier prose. This is the point of PCO-372: across four stories every one of these entries
+  // was DETECTED and then graded should-fix, so the tier and the "no judgement call" clause are the
+  // load-bearing sentences, not the list.
+  //
+  // The two files DIVERGE here, deliberately. The security-reviewer's mandate scopes it to "a test
+  // that is the only thing standing behind a security property", but its operative clause used to
+  // be unscoped ("**any** entry below") eleven lines later — entries 5, 6 and 7 (a reduced CSV
+  // fixture, a status code, a modal harness) are not security properties, so the same file handed
+  // the same agent two conflicting instructions about the same input, and the broader one was the
+  // one that said not to think about it. The operative clause is what an agent applies, so the
+  // operative clause is what carries the scope.
+  const TIER_MECHANICAL: Record<string, string> = {
+    "agents/code-reviewer.md":
+      "Apply this list mechanically: a new or changed test matching **any** entry below is " +
+      "Critical, with no severity judgement call.",
+    "agents/security-reviewer.md":
+      "Apply this list mechanically: a new or changed test matching **any** entry below, where " +
+      "that test is the only thing standing behind a security property, is Critical, with no " +
+      "severity judgement call. A test matching an entry below that stands behind no security " +
+      "property is the code-reviewer's to grade, not yours.",
+  };
+
+  function tierProse(relPath: string): string {
+    return (
+      "**This is Critical (must fix)** — never Minor, and never carried as an Important. " +
+      `${TIER_MECHANICAL[relPath]!} ` +
+      "Detection was never the problem — these get found and then graded too low, which is how a " +
+      "story whose every test was inert passed review with zero must-fix findings."
+    );
+  }
+
+  // Each file opens the section with its own framing sentence; everything after it is shared.
+  const OPENER: Record<string, string> = {
+    "agents/code-reviewer.md":
+      "A test that is structurally incapable of failing verifies nothing, and the behavior it " +
+      "claims to cover is untested however many tests surround it.",
+    "agents/security-reviewer.md":
+      "When the test standing behind a security property is structurally incapable of failing, the " +
+      "property is unverified — an isolation test that cannot fail is indistinguishable from no " +
+      "isolation test, and the diff ships as if it had one.",
+  };
+
+  // The complete permitted contents of each file's Output section. Pinned closed for the same
+  // reason as the rubric: the Output section is where severity is finally assigned, so a hatch
+  // added there ("grade rubric findings as you see fit") undoes PCO-372 without touching the
+  // rubric section at all.
+  const OUTPUT_UNITS: Record<string, string[]> = {
+    "agents/code-reviewer.md": [
+      OUTPUT_HEADING,
+      "- **Spec compliance:** ✅ compliant | ❌ issues (with file:line)",
+      "- **Critical (must fix):** [findings]",
+      "- **Important (should fix):** [findings]",
+      "- **Minor:** [findings]",
+      "For each finding: file:line, what's wrong, why it matters, how to fix. Acknowledge strengths briefly first.",
+    ],
+    "agents/security-reviewer.md": [
+      OUTPUT_HEADING,
+      "- **Critical (must fix):** [findings]",
+      "- **Important (should fix):** [findings]",
+      "- **Minor / hardening:** [findings]",
+      "- **MUST-CHECK coverage:** which logged security constraints apply and whether the diff honors them.",
+      "- **`checked` (required):** an array with one entry per security-relevant `Locked` decision " +
+        "and per security-relevant acceptance criterion, each naming your verdict **and the " +
+        "specific evidence you examined** — the test you read or the code you traced, by file:line. " +
+        '"Reviewed the diff" names no evidence and is not an entry. If no decision and no ' +
+        "criterion is security-relevant, say that as an entry, naming what you read to reach it — " +
+        "that is the entry the array must carry, and an empty array is not it.",
+      "**An empty `findings` alongside an empty or absent `checked` is a malformed report, and your " +
+        "caller must treat it as one** — not as an approval. A bare `{\"findings\": [], \"verdict\": " +
+        '"APPROVE"}` leaves nobody able to tell "looked and found nothing" from "did not look": ' +
+        "that payload is what shipped a PII assertion whose blacklist regex could not match " +
+        "`firstName`, `employeeName` or `lastName` — no word boundary fires inside camelCase — and " +
+        "never looked for email, phone or ssn at all. The code-reviewer caught it; this report said " +
+        "nothing, and nothing was the same shape as everything being fine.",
+      "For each finding: file:line, the exposure, why it matters (attacker capability), and a " +
+        "concrete fix. If you found nothing, say so plainly — do not invent findings to look " +
+        "thorough. **`checked` exists to make silence accountable, not to make silence " +
+        'impossible**, and it is never a reason to manufacture a finding: an entry that says ' +
+        '"checked, no exposure, here is the test I read" is a complete answer.',
+      "**Reasoning a finding *down* is correct behaviour, and required of you.** When you have " +
+        "named something and the evidence puts it below the bar — data-integrity rather than " +
+        "confidentiality, a parameter that selects a formatter rather than a data scope — say so, " +
+        'and say what you are doing with it: *"I am flagging it, not requesting a change."* ' +
+        "Severity inflation is a review defect like any other, and a report padded to look thorough " +
+        "costs the caller exactly what an empty one does.",
+      "Use the same Critical/Important/Minor labels as the code-reviewer so the caller can merge " +
+        "both reviews into one fix loop.",
+    ],
+  };
+
+  // Backstop for the regions NOT pinned closed above (the intro line, `## Inputs`, `## What to
+  // do`). Deliberately regex FAMILIES rather than fixed spellings: an enumerated list of banned
+  // phrases is a blacklist, is evaded by the next synonym, and is the exact defect rubric entry 4
+  // exists to catch. These are the shapes that hand back the severity judgement the tier removed.
+  const DISCRETION_SHAPES: ReadonlyArray<readonly [RegExp, string]> = [
+    [/\b(?:use|using|at|to|exercise)\s+your\s+(?:own\s+|best\s+)?(?:judgement|judgment|discretion)\b/i, "severity handed back to the reviewer's judgement"],
+    [/\bcase[-\s]by[-\s]case\b/i, "severity made case-by-case"],
+    [/\b(?:is|are|purely|merely)\s+advisory\b|\bnot\s+binding\b|\bnon-?binding\b/i, "the rubric declared advisory"],
+    [/\bdown-?grade\b/i, "an explicit downgrade path"],
+    [/\bas\s+(?:you\s+see\s+fit|appropriate)\b/i, "severity left to taste"],
+    [/\bwhen\s+in\s+doubt[^.]{0,80}\brais(?:e|ing)\b/i, "an inflate-when-unsure instruction"],
+  ];
+
+  for (const relPath of REVIEWERS) {
+    test(`${relPath} carries the inert-test rubric under its own heading`, () => {
+      expect(rubricSection(relPath)).toContain("A test is **inert** when it:");
+    });
+
+    // No new section may appear, and the rubric must stay a top-level one. Both halves matter:
+    // a `## Minor / hardening notes` parent wrapping the rubric as a `###` subsection re-tiers the
+    // whole list without editing a word of it, and an extra section anywhere is room to say the
+    // opposite of what the closed sections say.
+    test(`${relPath} has exactly these top-level sections, in this order`, () => {
+      const found = readNonEmpty(join(root, relPath))
+        .split("\n")
+        .filter((l) => /^##\s/.test(l))
+        .map((l) => l.trim());
+      expect(found).toEqual(REVIEWER_SECTIONS[relPath]!);
+      const deeper = readNonEmpty(join(root, relPath))
+        .split("\n")
+        .filter((l) => /^#{3,6}\s/.test(l));
+      expect(deeper, `${relPath} must not nest content under sub-headings`).toEqual([]);
+    });
+
+    for (const [label, body] of RUBRIC) {
+      // Closed on the whole list item: deletion, rephrase, dropped qualifier, and an appended
+      // carve-out all change this unit and fail this entry's own named test.
+      test(`${relPath} rubric entry ${label}`, () => {
+        const n = label.slice(0, label.indexOf(" "));
+        const item = docUnits(docSection(relPath, RUBRIC_HEADING)).find((u) => u.startsWith(`${n}. `));
+        expect(item, `rubric entry ${n} is missing from ${relPath}`).toBeDefined();
+        expect(item).toBe(`${n}. ${body}`);
+      });
+    }
+
+    // Ordering + containment: all seven live inside the ONE rubric section, in order. Without
+    // this, a mutation that scatters the entries across the file (or moves one under the Minor
+    // tier) leaves all seven presence tests above green.
+    test(`${relPath} keeps all seven entries in one ordered list inside the rubric section`, () => {
+      const body = rubricSection(relPath);
+      let cursor = -1;
+      for (const [label, phrase] of RUBRIC) {
+        const at = body.indexOf(phrase);
+        expect(at, `entry ${label} is outside the rubric section in ${relPath}`).toBeGreaterThan(-1);
+        expect(at, `entry ${label} is out of order in ${relPath}`).toBeGreaterThan(cursor);
+        cursor = at;
+      }
+      expect(body).toMatch(/1\. \*\*Asserts against implementation source text\*\*/);
+      expect(body).toMatch(/7\. \*\*Uses a harness that does not drive the component/);
+    });
+
+    // The closed pin. Everything the rubric section is allowed to say, and nothing else. This is
+    // the only assertion here that can see an eighth entry, an "this section is advisory" line, or
+    // a carve-out sentence appended after the tier prose — mutations that leave every `toContain`
+    // pin above green while gutting the story.
+    //
+    // It also discharges MUST-CHECK pco352-fixpass-satisfies-the-gate-header-must-not-cover-a-
+    // repick-clause: the header "a new or changed test matching **any** entry below is Critical"
+    // covers exactly these seven items and one outcome. An entry with a different downstream
+    // outcome ("raise this with the author first") cannot be added under that header without
+    // failing here, which forces the author to re-state the header rather than fold a second
+    // outcome under the shared one.
+    test(`${relPath}'s rubric section carries exactly these units and nothing else`, () => {
+      expect(docUnits(docSection(relPath, RUBRIC_HEADING))).toEqual([
+        RUBRIC_HEADING,
+        `${OPENER[relPath]} ${tierProse(relPath)}`,
+        "A test is **inert** when it:",
+        ...RUBRIC.map(([label, body]) => `${label.slice(0, label.indexOf(" "))}. ${body}`),
+      ]);
+    });
+
+    test(`${relPath} puts the rubric in the must-fix tier, applied without a severity judgement call`, () => {
+      const body = rubricSection(relPath);
+      expect(body).toContain(
+        "**This is Critical (must fix)** — never Minor, and never carried as an Important.",
+      );
+      expect(body).toContain(TIER_MECHANICAL[relPath]!);
+      expect(body).toContain(
+        "Detection was never the problem — these get found and then graded too low, which is how a " +
+          "story whose every test was inert passed review with zero must-fix findings.",
+      );
+      // The rephrase attack this section is most exposed to: re-tiering the rubric wholesale by
+      // swapping the tier label while leaving all seven entries word-for-word intact.
+      expect(body, "the rubric must not be demoted to the should-fix tier").not.toContain("(should fix)");
+      expect(body, "the rubric must not be demoted to the Minor tier").not.toContain("Minor / hardening");
+    });
+
+    // The severity judgement the tier removed must not be handed back anywhere in the file,
+    // including the regions no closed pin covers.
+    test(`${relPath} nowhere hands the severity judgement back to the reviewer`, () => {
+      const txt = normalized(relPath);
+      for (const [shape, why] of DISCRETION_SHAPES) {
+        expect(txt, `${why} in ${relPath}: ${shape}`).not.toMatch(shape);
+      }
+    });
+
+    // Entry 7 is the one the retrospective singled out as highest-value and least obvious, and the
+    // concrete incident is what makes it stick — an unattributed rule reads as a style preference.
+    test(`${relPath} keeps entry 7's incident: the harness is why three must-fix bugs got past an 11-test suite`, () => {
+      const body = rubricSection(relPath);
+      expect(body).toContain("**This entry is the highest-value and the least obvious one here:**");
+      expect(body).toContain(
+        "a suite that rendered a modal with `isOpen` passed as a literal and `onComplete` as an " +
+          "inert spy never drove it the way its real parent does, which is precisely why all three " +
+          "of that story's must-fix bugs got past an eleven-test suite.",
+      );
+    });
+  }
+
+  // The Output sections, pinned closed. The rubric assigns Critical; this is where the reviewer
+  // reports it, and a hatch added beside the tier list ("Minor is fine when the fix is large")
+  // reinstates the failure with the rubric untouched.
+  test("code-reviewer's Output section carries exactly these units and nothing else", () => {
+    expect(docUnits(docSection("agents/code-reviewer.md", OUTPUT_HEADING))).toEqual(
+      OUTPUT_UNITS["agents/code-reviewer.md"],
+    );
+  });
+
+  test("security-reviewer's Output section carries exactly these units and nothing else", () => {
+    expect(docUnits(docSection("agents/security-reviewer.md", OUTPUT_HEADING))).toEqual(
+      OUTPUT_UNITS["agents/security-reviewer.md"],
+    );
+  });
+
+  // The code-reviewer's step 3 has always said "a test that asserts nothing is a finding" — an
+  // unsevered severity. It now routes to the rubric, so the reviewer meets the tier before it
+  // reaches the Output section. Pinned as the complete list item so a trailing "though this is
+  // often Minor" cannot ride along behind it.
+  test("code-reviewer's Tests step routes a test that cannot fail to the Critical tier", () => {
+    const item = docUnits(docSection("agents/code-reviewer.md", "## What to do")).find((u) =>
+      u.startsWith("3. **Tests**"),
+    );
+    expect(item, "the code-reviewer's Tests step is missing").toBeDefined();
+    expect(item).toBe(
+      "3. **Tests** — Do new tests verify real behavior (not mocks)? Are the story's edge cases " +
+        "covered? Is the test output clean? A test that asserts nothing is a finding, and a test " +
+        "that cannot fail is a Critical one — apply the rubric below.",
+    );
+  });
+
+  // The security-reviewer's opening mandate explicitly EXCLUDED test structure, which would have
+  // made its copy of the rubric unreachable. The carve-out is scoped — general test structure
+  // still belongs to the code-reviewer — so this pins the whole opening paragraph closed: dropping
+  // either half changes what the agent may raise, and widening it to test structure at large
+  // hands the code-reviewer's mandate to the security reviewer.
+  test("security-reviewer's mandate carves out exactly the security-property test, not test structure at large", () => {
+    const head = readNonEmpty(join(root, "agents/security-reviewer.md"));
+    const opening = docUnits(head.slice(head.indexOf("---", 4) + 3, head.indexOf("\n## ")))[0];
+    expect(opening).toBe(
+      "You are an adversarial application-security reviewer gating one story's diff. Security is " +
+        "your **only** mandate — do not comment on spec compliance, style, or general test " +
+        "structure; another reviewer owns those. The one exception is a test that is the only thing " +
+        "standing behind a security property: when that test cannot fail, the property is " +
+        "unverified, and that is yours to raise. Your single job is to find the security problem " +
+        "the general reviewer will miss because its attention is split.",
+    );
+  });
+
+  // The operative clause is the one an agent applies, so it is the one that must agree with the
+  // file's own mandate. The security-reviewer's mandate excludes general test structure; an
+  // unscoped "**any** entry below is Critical" eleven lines later contradicted it for entries 5, 6
+  // and 7, and the reviewer would either duplicate the code-reviewer's findings (inflating a fix
+  // pass that commands/drawbar-work.md requires stay proportional) or silently ignore its own
+  // rubric, with no way to tell which. Asserted as a DIVERGENCE so a future "tidy-up" that
+  // re-unifies the two copies fails here rather than silently restoring the contradiction.
+  test("the security-reviewer scopes its mechanical clause to the security-property test; the code-reviewer does not", () => {
+    const sec = rubricSection("agents/security-reviewer.md");
+    expect(sec).toContain(
+      "a new or changed test matching **any** entry below, where that test is the only thing " +
+        "standing behind a security property, is Critical, with no severity judgement call.",
+    );
+    expect(sec).toContain(
+      "A test matching an entry below that stands behind no security property is the " +
+        "code-reviewer's to grade, not yours.",
+    );
+    // The general reviewer's clause stays unscoped — narrowing it there would gut PCO-372.
+    expect(rubricSection("agents/code-reviewer.md")).toContain(
+      "a new or changed test matching **any** entry below is Critical, with no severity judgement call.",
+    );
+    expect(TIER_MECHANICAL["agents/code-reviewer.md"]).not.toBe(
+      TIER_MECHANICAL["agents/security-reviewer.md"],
+    );
+  });
+
+  // The two files carry the seven entries verbatim by design (each agent runs alone and neither
+  // reads the other). Nothing above asserts the copies AGREE — each file is only checked against
+  // the expected text — so a future edit that "fixes" one entry in one reviewer is caught as
+  // "entry missing" rather than as "the two reviewers now disagree". State the equality directly.
+  test("both reviewers carry byte-identical rubric entries", () => {
+    const [a, b] = REVIEWERS.map((p) =>
+      docUnits(docSection(p, RUBRIC_HEADING)).filter((u) => /^\d+\. /.test(u)),
+    );
+    expect(a).toHaveLength(7);
+    expect(a).toEqual(b);
+  });
+});
+
+describe("PCO-373: an empty findings list must enumerate what was checked", () => {
+  const SEC = "agents/security-reviewer.md";
+
+  function secDoc(): string {
+    return readNonEmpty(join(root, SEC)).replace(/\s+/g, " ");
+  }
+
+  test("the report requires a `checked` array keyed to Locked decisions and acceptance criteria", () => {
+    expect(secDoc()).toContain(
+      "- **`checked` (required):** an array with one entry per security-relevant `Locked` decision " +
+        "and per security-relevant acceptance criterion, each naming your verdict **and the specific " +
+        "evidence you examined** — the test you read or the code you traced, by file:line.",
+    );
+  });
+
+  // Evidence has to be SPECIFIC or `checked` degenerates into a second empty payload with more
+  // words in it. Pinned separately: this sentence is the one a rephrase would drop first.
+  test("`checked` refuses 'reviewed the diff' as evidence", () => {
+    expect(secDoc()).toContain('"Reviewed the diff" names no evidence and is not an entry.');
+  });
+
+  // `checked` is defined as one entry per security-relevant Locked decision and criterion, and an
+  // empty `checked` beside empty `findings` is declared malformed. For a story with NO
+  // security-relevant decision or criterion — a doc-only story, this one included — that defined a
+  // diligent, correct review as malformed, leaving only two exits: inflate "security-relevant", or
+  // manufacture a finding. Both are what this story exists to prevent, so the contract needs a
+  // satisfiable floor. It is phrased as an OBLIGATION (write the negative entry, name what you
+  // read), never as the hatch mutation testing correctly killed ("an empty `checked` array is
+  // fine") — which is why the no-hatch shapes below must still pass over this sentence.
+  test("`checked` stays satisfiable when nothing is security-relevant, as an entry rather than an exemption", () => {
+    expect(secDoc()).toContain(
+      "If no decision and no criterion is security-relevant, say that as an entry, naming what you " +
+        "read to reach it — that is the entry the array must carry, and an empty array is not it.",
+    );
+  });
+
+  test("an empty findings list alongside an empty or absent `checked` is a malformed report the caller must reject", () => {
+    const txt = secDoc();
+    expect(txt).toContain(
+      "**An empty `findings` alongside an empty or absent `checked` is a malformed report, and your " +
+        "caller must treat it as one** — not as an approval.",
+    );
+    expect(txt).toContain(
+      'A bare `{"findings": [], "verdict": "APPROVE"}` leaves nobody able to tell "looked and found ' +
+        'nothing" from "did not look"',
+    );
+  });
+
+  // The incident behind the rule. Without it the requirement reads as bureaucracy; with it, the
+  // agent knows which shape of assertion the bare payload was hiding.
+  test("the malformed-report rule cites the blacklist regex that could not match camelCase, and that the code-reviewer caught it", () => {
+    const txt = secDoc();
+    expect(txt).toContain(
+      "that payload is what shipped a PII assertion whose blacklist regex could not match " +
+        "`firstName`, `employeeName` or `lastName` — no word boundary fires inside camelCase — and " +
+        "never looked for email, phone or ssn at all.",
+    );
+    expect(txt).toContain("The code-reviewer caught it; this report said nothing");
+  });
+
+  // --- Do not break what worked -------------------------------------------------------------
+  //
+  // On the run this story comes from, the same agent reasoned a finding DOWN correctly and said so.
+  // A `checked` requirement is exactly the kind of change that pressures an agent into padding, so
+  // the anti-inflation instruction is pinned as hard as the new requirement itself.
+  test("reasoning a finding down is preserved as correct behaviour, with the exact words to use", () => {
+    const txt = secDoc();
+    expect(txt).toContain("**Reasoning a finding *down* is correct behaviour, and required of you.**");
+    expect(txt).toContain(
+      "When you have named something and the evidence puts it below the bar — data-integrity rather " +
+        "than confidentiality, a parameter that selects a formatter rather than a data scope — say " +
+        "so, and say what you are doing with it: *\"I am flagging it, not requesting a change.\"*",
+    );
+    expect(txt).toContain("Severity inflation is a review defect like any other");
+  });
+
+  test("`checked` is stated to make silence accountable, not impossible, and is never a reason to manufacture a finding", () => {
+    const txt = secDoc();
+    expect(txt).toContain("If you found nothing, say so plainly — do not invent findings to look thorough.");
+    expect(txt).toContain(
+      "**`checked` exists to make silence accountable, not to make silence impossible**, and it is " +
+        "never a reason to manufacture a finding: an entry that says \"checked, no exposure, here is " +
+        "the test I read\" is a complete answer.",
+    );
+  });
+
+  // The inverse of the pins above. The Output section itself is pinned CLOSED by PCO-372's
+  // "security-reviewer's Output section carries exactly these units and nothing else", which is
+  // what actually catches a hatch added beside a correct sentence there; these regex families are
+  // the backstop for the rest of the file, where no closed pin reaches. They are shapes rather
+  // than fixed spellings on purpose: a list of banned phrases is a blacklist, is evaded by the
+  // next synonym, and is the defect rubric entry 4 exists to catch.
+  test("no wording anywhere makes `checked` optional or an empty report acceptable", () => {
+    const txt = secDoc();
+    const shapes: ReadonlyArray<readonly [RegExp, string]> = [
+      [/`?checked`?[^.]{0,120}\b(?:optional|encouraged|nice[- ]to[- ]have|best[- ]effort|aspirational)\b/i, "`checked` softened to optional"],
+      [/\b(?:optional|best[- ]effort)\b[^.]{0,120}`checked`/i, "`checked` softened to optional"],
+      [/\b(?:may|can|could|need\s+not)\s+(?:be\s+)?(?:omit|omitted|skip|skipped|left\s+(?:out|empty|blank))\b/i, "entries made skippable"],
+      [/\bempty\s+`?checked`?[^.]{0,60}\bis\s+(?:fine|ok|okay|acceptable|enough|still)\b/i, "an empty `checked` blessed"],
+      [/\bcaller\s+may\s+(?:still\s+)?(?:accept|approve|treat|read)\b/i, "the caller told it may accept a malformed report"],
+      [/\bif\s+you\s+have\s+time\b|\bwhere\s+useful\b/i, "`checked` made a courtesy"],
+      [/\b(?:prefer\s+to\s+name\s+something|reflects?\s+poorly|look\s+again\s+until)\b/i, "a padding incentive"],
+    ];
+    for (const [shape, why] of shapes) {
+      expect(txt, `${why} in ${SEC}: ${shape}`).not.toMatch(shape);
+    }
   });
 });
