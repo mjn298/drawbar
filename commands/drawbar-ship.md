@@ -25,7 +25,49 @@ going instead of stopping there: it picks the next story, delegates it, and adva
 story after story — but it never merges the PR it opens.
 
 Sequential only. **Never** run two stories concurrently — they are dependency-ordered, and
-story N assumes N−1 is on `main`.
+story N is based on story N−1's branch, which does not exist until N−1 has finished.
+
+## The stack model
+
+Each story becomes one pull request, and the pull requests form a **stack**: every PR is based
+on the one before it, so each diff shows only its own story's changes and every branch is
+buildable on its own. Stories are dependency-ordered, so this is required rather than
+incidental — story N+1 generally does not compile against the configured base at all.
+
+**How a base is chosen (Locked A).** The base is the configured `baseBranch` for the **first**
+story of a run, and the **previous story's branch** for every story after it. Exactly one thing
+produces that value — `scripts/lib/stack.ts`'s `resolve-base` verb, invoked in §4 — and it is
+**never re-derived in bash**, never lifted out of the run-state file by hand, and never left to
+a default. `resolve-base` is the only producer that shape-gates the branch name with
+`isValidRefName`; the run state it reads is agent-writable, so a base copied straight out of
+`stack[]` carries no validation at all. Omitting `--base` is the same failure from the other
+side: `gh` would fall back to the repo's default branch, producing a PR whose diff carries every
+earlier story's work too — green, plausible, and near-impossible to spot in the morning. The
+story-lead is **handed** its base and cuts from it; it never resolves one.
+
+**What `flagged` means.** A `flagged` story is one whose single fix pass left Important findings
+alive. **The PR opens anyway**, annotated with an `## Unresolved findings` section, and **the
+stack continues on top of it** — the next story is based on this story's branch exactly as if it
+had come back clean. A story that is 90% right belongs in front of the operator at 8am,
+annotated, rather than costing the rest of the night's throughput.
+
+**"No PR could be opened" differs in kind from `flagged`, not in degree.** With no pull request
+there is no branch for the next story to base on, so the chain has no anchor and the run
+**parks and halts** (§4, Outcome A). Never collapse the two: `flagged` continues stacking, a
+missing PR stops the night.
+
+**The operator's contract in the morning: review bottom-up and merge bottom-up, in order.** The
+stack was built bottom-up, so only the bottom PR's diff is meaningful against the configured
+base; every PR above it is meaningful only once the one below has landed. Reviewing or merging
+out of order reads a diff against a base that has moved.
+
+**Locked F — `drawbar-ship` never merges, never verifies a merge, and never inspects whether one
+happened.** Keeping the stack mergeable is the operator's job. **No detection or repair of
+out-of-order merges exists or is planned** — that is a contract, not a gap awaiting a follow-up,
+so do not file one for it. Building it back would re-introduce exactly the merge-state gating
+this design deleted: nothing here can know whether a merge was clean or in order without the
+gate that made the old design expensive and unwanted. If a stack does get merged out of order,
+the recovery is a human rebase, and this command has no opinion about it.
 
 ## Preflight (halt on any failure)
 
@@ -736,6 +778,13 @@ guard: `now - in_flight.agent_dispatched_at` exceeding 2x the heartbeat) **route
 — that is Locked 13's whole point: a crashed run must not deadlock every later invocation by
 leaving `in_flight` permanently "fresh" from a no-op's point of view.
 
+**Recovery re-establishes the stack base, not merely the in-flight story.** That is the
+responsibility this section gained with the stack: a resumed run that resolves the wrong base
+opens a pull request whose diff carries another story's work — green, plausible, and
+near-impossible to spot in the morning. It is the one crash-resume failure that produces no
+error at all, which is exactly why the base is re-established by `stack.ts` and confirmed before
+anything is re-dispatched, never inferred from the branch that happens to be checked out.
+
 1. **Read the state file** for the story that was in flight (`in_flight.story`, or — if
    `in_flight` is somehow already null — the last id not in `stories_done`).
 2. **Read that story's Linear comments** — step 2's start comment names the branch and time.
@@ -744,13 +793,104 @@ leaving `in_flight` permanently "fresh" from a no-op's point of view.
    crash-recovery tool ONLY — it has a blind window between dispatch and first commit,
    demonstrated when it read "indistinguishable from never started" one minute after a live
    dispatch. Never use it to gate the fresh-in-window no-op check in step 2.)
-4. **Resume at the earliest incomplete step.** Uncommitted work is *not* discarded — it is
+4. **Re-establish the base before re-dispatching anything.** One state skips this step: if step
+   3 found the PR already open **and** the `stack` array already records this story, the
+   PR-opening step completed and only the tail of the run was lost. That state is correct, not
+   broken — resolve **no** new base for it, and resume at §5 (post the summary comment).
+   `resolve-base` refuses `story_already_stacked` for exactly that state, and that one reason
+   means "already stacked", never "park". Every other resume re-establishes the base *here*,
+   through the fence below, never from the branch that happens to be checked out and never
+   re-derived in bash: `stack.ts assert-chain` confirms every recorded predecessor branch still
+   exists and still points where the `stack` array says, then a fresh `stack.ts resolve-base`
+   produces the base for this story. Any other refusal from either call **parks the story**:
+   refuse rather than guess, because guessing here is what silently re-parents the story onto
+   another story's work. Echo each verdict's `.reason` and nothing else — paraphrase, never
+   paste, a `detail`.
+
+   **`--project-dir` is a trust root, and this fence is the only sanctioned way to produce one.**
+   MUST-CHECK `r3-must-not-source-project-dir-from-pasted-run-state`: the value handed to
+   `--project-dir` comes from the fresh `ship-config.ts validate` inside this block and from
+   nowhere else — never `jq '.resolved_config' "$STATE"`, and never the `resolved_config` that
+   step 1 has already read into context. The state file is agent-writable, so a `--project-dir`
+   taken from it turns `stack.ts`'s equality guard into a tautology about whatever directory that
+   file names, and hands `git -C` a repository an attacker chose. Recovery is also the worst
+   moment to drop the config guards: it runs with a dirty tree and the branch under review checked
+   out, which is precisely the tree that can plant a config of its own. Both of Preflight's guards
+   therefore run again here, verbatim.
+
+   ```bash
+   # Crash recovery re-derives its own trust roots. Variables do not survive between blocks, and
+   # nothing already in this session's context is one — least of all the run state.
+   ARG="<the id THIS RUN was invoked with — it names the state file>"
+   STORY="<the in-flight story id established in step 1>"
+   LINEAR_FACTS_RAW='{"teams":<the list_teams result for this session, as a JSON array>}'
+   LINEAR_FACTS_JSON=$(printf '%s' "$LINEAR_FACTS_RAW" | jq -c 'if (.teams|type)=="array" then {teams:.teams} else empty end' 2>/dev/null)
+   for v in ARG STORY LINEAR_FACTS_JSON; do
+     val="${!v}"
+     [ -n "$val" ] && [ "$val" != "null" ] || { echo "FATAL: $v is empty, null, or the wrong JSON type — refusing."; exit 1; }
+   done
+   # $ARG is interpolated into the state-file path, so it must be a single safe path segment.
+   case "$ARG" in ''|*/*|*'\'*|*..*) echo "FATAL: ARG is not a safe path segment — refusing."; exit 1;; esac
+
+   # $CONFIG is re-resolved from $PWD here, so BOTH of Preflight's guards run again, verbatim.
+   # Dropping them lets the branch under review — which this procedure has checked out, in a dirty
+   # tree — plant `.drawbar/ship.config.json` and feed its own `projectDir` into `--project-dir`
+   # and `git -C`; an equality guard does not help, because both sides then agree.
+   CONFIG="${DRAWBAR_SHIP_CONFIG:-$PWD/.drawbar/ship.config.json}"
+   [ -f "$CONFIG" ] || { echo "FATAL: no config at $CONFIG — copy .drawbar/ship.config.example.json, fill in real values, and either place the copy there or set DRAWBAR_SHIP_CONFIG to point at it."; exit 1; }
+   CONFIG_REAL=$(readlink -f "$CONFIG") || { echo "FATAL: cannot resolve $CONFIG to a real path — refusing."; exit 1; }
+   git -C "$(dirname "$CONFIG_REAL")" ls-files --error-unmatch "$CONFIG_REAL" >/dev/null 2>&1 \
+     && { echo "FATAL: $CONFIG is tracked by git — a committed ship config is never trusted. Untrack it (git rm --cached) and keep it out of version control."; exit 1; } \
+     || true
+
+   # MUST-CHECK r3-must-not-source-project-dir-from-pasted-run-state: the trust root is this FRESH
+   # validate, run in this block. Never `jq '.resolved_config' "$STATE"` and never anything else
+   # read out of the run state — the state file is agent-writable, and a `--project-dir` taken
+   # from it turns stack.ts's equality guard into a tautology about the attacker's own directory.
+   RESOLVED=$(echo "$LINEAR_FACTS_JSON" | bun run "${CLAUDE_PLUGIN_ROOT}/scripts/lib/ship-config.ts" validate --config "$CONFIG") \
+     || { echo "FATAL: ship-config validation refused — see stderr above for the specific reason."; exit 1; }
+
+   # --- derive from the resolved config (crash recovery) --------------------------------------
+   ENV_DIR=$(echo "$RESOLVED" | jq -r '.envDir // empty')
+   PROJECT_DIR=$(echo "$RESOLVED" | jq -r '.projectDir // empty')
+   for v in ENV_DIR PROJECT_DIR; do
+     val="${!v}"
+     [ -n "$val" ] && [ "$val" != "null" ] || { echo "FATAL: $v is empty or null after validation — refusing."; exit 1; }
+   done
+   # --- end derive from the resolved config (crash recovery) ----------------------------------
+   STATE="$ENV_DIR/.drawbar/runs/$ARG.json"
+
+   # Chain integrity. `--project-dir` is the operator-authored trust root, taken from the fresh
+   # validate above, never from the state file's own `resolved_config` copy. Echo the verdict's
+   # `.reason` and NOTHING else: `.detail` carries absolute paths and the real repo slug, this
+   # repo is public, and the Hard rules require refusal text be paraphrased rather than pasted.
+   CHAIN_JSON=$(bun run "${CLAUDE_PLUGIN_ROOT}/scripts/lib/stack.ts" assert-chain --state "$STATE" --project-dir "$PROJECT_DIR")
+   CHAIN_OK=$(printf '%s' "${CHAIN_JSON:-null}" | jq -r 'if (type=="object" and .ok==true) then "true" else "false" end' 2>/dev/null)
+   [ "$CHAIN_OK" = "true" ] || { CHAIN_REASON=$(printf '%s' "${CHAIN_JSON:-null}" | jq -r '.reason // "unreadable-verdict"' 2>/dev/null); echo "PARK: assert-chain refused ($CHAIN_REASON) — park the story; paraphrase, never paste, the detail on stderr."; exit 1; }
+
+   # The base. `story_already_stacked` is the ONE refusal that is not a park: it means the
+   # PR-opening step already completed for this story and the entry is recorded, so there is no
+   # base to resolve and the resume point is the summary comment.
+   BASE_JSON=$(bun run "${CLAUDE_PLUGIN_ROOT}/scripts/lib/stack.ts" resolve-base --state "$STATE" --story "$STORY")
+   BASE=$(printf '%s' "${BASE_JSON:-null}" | jq -r 'if (type=="object" and .ok==true) then .base else empty end' 2>/dev/null)
+   if [ -n "$BASE" ] && [ "$BASE" != "null" ]; then
+     echo "BASE_REESTABLISHED: $BASE"
+   else
+     BASE_REASON=$(printf '%s' "${BASE_JSON:-null}" | jq -r '.reason // "unreadable-verdict"' 2>/dev/null)
+     case "$BASE_REASON" in
+       story_already_stacked) echo "ALREADY_STACKED: the PR is already recorded — resume at the summary comment; resolve no base.";;
+       *) echo "PARK: resolve-base refused ($BASE_REASON) — park the story; paraphrase, never paste, the detail on stderr."; exit 1;;
+     esac
+   fi
+   ```
+5. **Resume at the earliest incomplete step.** Uncommitted work is *not* discarded — it is
    the crashed run's output. Commit it on the story branch first so it is inspectable, then
-   re-dispatch the story-lead pointing at that branch, **re-writing `in_flight`** with the new
-   dispatch time exactly as step 2 does for a fresh dispatch.
-5. If the tree is dirty but the state file names **no** in-flight story, halt and notify —
+   re-dispatch the story-lead pointing at that branch and at the base step 4 re-established,
+   **re-writing `in_flight`** with the new dispatch time exactly as step 2 does for a fresh
+   dispatch.
+6. If the tree is dirty but the state file names **no** in-flight story, halt and notify —
    that is unexplained, and unexplained state is not something to resolve unattended.
-6. If recovery instead determines the story is unrecoverable and must be halted outright,
+7. If recovery instead determines the story is unrecoverable and must be halted outright,
    **clear `in_flight`** (`in_flight: null`) before halting — same as *Parking a story*.
 
 > Discipline that makes this work: commit each verified increment (the story-lead's §2), and
@@ -767,9 +907,20 @@ then `ScheduleWakeup({stop: true})`.
 
 - Sequential. One story per invocation. Never parallel.
 - Halt on failure; never skip a story.
-- `--base` comes from `scripts/lib/stack.ts`'s `resolveBase`: the configured `baseBranch` for
-  the first story of a run, the previous story's recorded branch for every story after that
-  (Locked A). The run never merges.
+- `--base` comes from `scripts/lib/stack.ts`'s `resolveBase`, invoked as `stack.ts resolve-base`:
+  the configured `baseBranch` for the first story of a run, the previous story's recorded branch
+  for every story after that (Locked A). Never re-derive it in bash, never read it out of the
+  run-state file by hand, and never omit `--base`.
+- **Locked F: never merge, never verify a merge, and never inspect whether one happened.** There
+  is no merge step, no merge check, and no out-of-order-merge detection or repair anywhere in
+  this command, and none is planned. The operator merges, bottom-up and in order.
+- A `flagged` story still gets its PR and the stack still continues on top of it; a story with
+  **no** PR parks and halts the run, because the chain has no anchor. Never treat the two as
+  degrees of the same outcome.
+- **Any guard refusal text — `ship-config.ts`, `stack.ts`, `kb-sync.ts` alike — must be
+  paraphrased, never pasted**, into `parked_reason`, a Linear comment, or a KB entry. Echo the
+  verdict's `.reason` and nothing else: a `detail` carries absolute paths and the real repo slug,
+  and this repo is public.
 - Never `--no-verify`, never force-push, never commit to `main` directly.
 - **Never set `Done` / `Ready For QA` / `Ready for Rollout` / `Rolled Out`** — and never
   grant a subagent Linear authority.
@@ -779,6 +930,20 @@ then `ScheduleWakeup({stop: true})`.
 
 ## Operator notes
 
+- **In the morning: review bottom-up and merge bottom-up, in order.** The run leaves you a stack
+  of open pull requests, each based on the one below it and each story left `In Progress`. Only
+  the bottom PR's diff is meaningful against the configured base; every PR above it becomes
+  meaningful as the one below it lands. Merging out of order leaves later PRs showing a diff
+  against a base that has moved.
+- **Keeping the stack mergeable is yours, and nothing here checks it.** Per Locked F this command
+  never merges, never verifies a merge, and never inspects whether one happened — there is no
+  detection or repair of an out-of-order merge, and none is planned. If it happens, the recovery
+  is a rebase you do by hand. This is a contract rather than a missing feature, so it is not
+  something to file.
+- **A `flagged` PR is a PR to review, not a failure.** Its `## Unresolved findings` section names
+  each surviving finding by sub-issue id and title; the write-ups are in those Linear sub-issues,
+  deliberately not in the public PR body. A story that could not open a PR at all is the other
+  case entirely: the run parked and stopped there, so the stack ends at the story below it.
 - **A config file must exist before running.** Copy `.drawbar/ship.config.example.json`,
   fill in real `envDir` / `projectDir` / `repo` / `team` / `baseBranch` /
   `requiredChecks` values, and either save it at `<cwd>/.drawbar/ship.config.json` or point
@@ -799,8 +964,10 @@ then `ScheduleWakeup({stop: true})`.
   file inside a working directory rather than exported env vars, and any repository's tree
   (including a contributor PR) can otherwise plant one. Keep it untracked, as `.gitignore`
   already enforces for the default path.
-- **Ship-config refusal text must be paraphrased, never pasted**, into a KB entry or a Linear
-  comment. Refusal `detail` strings echo absolute paths and the real repo slug, and the
+- **Any guard refusal text must be paraphrased, never pasted**, into a KB entry or a Linear
+  comment — `stack.ts`'s verdicts exactly as much as `ship-config.ts`'s, and a `parked_reason`
+  exactly as much as a comment. Refusal `detail` strings echo absolute paths and the real repo
+  slug (`assert-chain`'s name a predecessor branch and the `projectDir` it was asked about), and the
   slug leak-scan rule is deliberately out of scope for `knowledge.jsonl` (prose there produces
   too many false-positive "word / word" matches to allowlist) — pasting a refusal verbatim
   would leak it unscanned.

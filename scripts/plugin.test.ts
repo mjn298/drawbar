@@ -608,12 +608,17 @@ describe("PCO-348 fix pass: --base parameterization is not silently re-hardcoded
     expect(txt).not.toMatch(/--base\s+main\b/);
   });
 
-  // Fix pass 2, Important 3: the producer (this bullet, §2) and the consumer
-  // (agents/drawbar-story-lead.md, which runs `gh pr create --base "$BASE_BRANCH"` in §6)
-  // must agree on what the brief carries. As shipped, only the consumer side named
-  // $BASE_BRANCH — the producer's "brief must carry" list still named just $KB, $PROJECT_DIR,
-  // $REPO and the branch name, so a story-lead built from this brief alone would run
-  // `gh pr create --base ""` and fail mid-story after the implementation was already done.
+  // Fix pass 2, Important 3: the producer (this bullet, ship §2) and the consumer must agree on
+  // what the brief carries. As shipped, only the consumer side named $BASE_BRANCH — the
+  // producer's "brief must carry" list still named just $KB, $PROJECT_DIR, $REPO and the branch
+  // name, so a story-lead built from this brief alone had no base to work from and would fail
+  // mid-story, after the implementation was already done.
+  //
+  // PCO-369 (R6): this comment used to name the consumer as "agents/drawbar-story-lead.md, which
+  // runs `gh pr create --base "$BASE_BRANCH"` in §6" — false since R4. The story-lead opens no
+  // PR at all; its §6 is commit-and-push, and $BASE_BRANCH is consumed by §2's checkout of the
+  // base it was handed. The agreement this test enforces is unchanged; only the description of
+  // where the value lands was stale.
   test("commands/drawbar-ship.md's 'brief must carry' list names $BASE_BRANCH, matching agents/drawbar-story-lead.md's consumption of it (Important 3)", () => {
     const txt = readNonEmpty(join(root, "commands/drawbar-ship.md"));
     const idx = txt.indexOf("The brief must carry:");
@@ -3401,9 +3406,14 @@ describe("PCO-367 R4: the story-lead takes a base branch, opens no PR, returns o
       "it is the boundary that keeps a story agent from ever setting a completion status.",
     );
     // The sentence that assigns each of those responsibilities to the caller. Mutation weakened
-    // it to "usually opens … generally owns the merge" with everything else still green.
+    // it to "usually opens … generally owns every Linear write" with everything else still green.
+    //
+    // PCO-369 (R6): this sentence used to read "owns the merge" — false under Locked F, and the
+    // last surviving claim in either file that anything in the pipeline merges. The caller does
+    // not own a merge; the OPERATOR does, and no code in this plugin performs or checks one. The
+    // replacement is pinned here, and its absence is pinned by the Locked-F test below.
     expect(txt).toContain(
-      "Your caller opens the stacked pull request, owns the merge, every Linear write, the " +
+      "Your caller opens the stacked pull request, and owns every Linear write, the " +
         "knowledge-base push, and the burn-down state.",
     );
     expect(txt).toContain("Your final message IS your return value.");
@@ -3549,5 +3559,1064 @@ describe("PCO-371 R7: §6's $CONFIG guards are Preflight's, byte-identically", (
     // consequence has to be written down where the operator will see it.
     const f = sectionSixFence();
     expect(f).toContain("EXPORTED");
+  });
+});
+
+// --- PCO-369 R6: the documentation pass -------------------------------------------------------
+//
+// R1 deleted the merge machinery, R2 replaced `merged: {}` with `stack: [...]`, R3/R3b rewrote
+// ship §4/§5, and R4 rewrote the story-lead and renumbered its report §8 -> §7. Each left the
+// two docs internally consistent only where its own diff happened to reach. R6 reconciles the
+// rest: every cross-reference between the two files, every trace of prose describing a merge,
+// and the three things the redesign assumed a reader knew but neither file ever stated — how a
+// base is chosen, what `flagged` means, and Locked F.
+//
+// Every prose pin below is ONE CONTIGUOUS whitespace-normalized phrase, per MUST-CHECK
+// pco352-fixpass-prose-gate-mutation-must-cover-rephrase-not-only-delete: demoting a hard
+// conjunct to a parenthetical, or weakening a qualifier, must fail the same test a deletion
+// does. Claims that name a flag or a derivation are pinned on the literal invocation line, per
+// MUST-CHECK prose-pins-dont-cover-the-bash-fence-they-describe.
+describe("PCO-369 R6: cross-references reconciled, the stack model documented, Locked F stated", () => {
+  const SHIP = "commands/drawbar-ship.md";
+  const AGENT = "agents/drawbar-story-lead.md";
+
+  function shipRaw(): string {
+    return readNonEmpty(join(root, SHIP));
+  }
+  function agentRaw(): string {
+    return readNonEmpty(join(root, AGENT));
+  }
+  const ship = () => shipRaw().replace(/\s+/g, " ");
+  const agent = () => agentRaw().replace(/\s+/g, " ");
+
+  // `## N.` heading map for one doc: N -> heading text after the number. Duplicate numbers are
+  // refused outright — `indexOf`-based slicing elsewhere in this file silently picks the FIRST
+  // occurrence, so a duplicated number is a defect in its own right.
+  function numberedHeadings(raw: string, label: string): Map<number, string> {
+    const out = new Map<number, string>();
+    for (const m of raw.matchAll(/^##\s+(\d+)\.\s*(.+)$/gm)) {
+      const n = Number(m[1]);
+      expect(out.has(n), `${label}: duplicate '## ${n}.' heading`).toBe(false);
+      out.set(n, m[2]!.trim());
+    }
+    expect(out.size, `${label}: no numbered headings found — the regex or the doc is broken`).toBeGreaterThan(3);
+    return out;
+  }
+
+  // Sentences of a whitespace-normalized doc. Used to attribute each `§N` reference — and each
+  // merge word — to the sentence that makes the claim, rather than to a fixed-width character
+  // window: a window wide enough to catch "story-lead" also catches an unrelated "caller's" from
+  // the paragraph above, which mis-files an own-file reference as a cross-file one.
+  //
+  // The trailing-markup class is load-bearing, and mutation proved it so. Both docs end a great
+  // many sentences inside `**bold**`, and a plain `(?<=[.!?])\s+` never splits after one: the
+  // lookbehind sees `*`, not `.`. Reintroducing the exact merge prose R6 removed ("…owns the
+  // merge, every Linear write…") therefore left the attribution scan below GREEN, because the
+  // offending sentence was glued to the bolded "**You do not open the pull request, you do not
+  // merge…**" ahead of it and inherited that sentence's denial.
+  function sentences(norm: string): string[] {
+    return norm.split(/(?<=[.!?][*`"'）)\]]{0,3})\s+/);
+  }
+
+  function sectionRefs(raw: string): { n: number; sentence: string }[] {
+    const out: { n: number; sentence: string }[] = [];
+    for (const sentence of sentences(raw.replace(/\s+/g, " "))) {
+      for (const m of sentence.matchAll(/§(\d+)/g)) out.push({ n: Number(m[1]), sentence });
+    }
+    return out;
+  }
+
+  // --- Cross-reference integrity ------------------------------------------------------------
+
+  // Enumerated, not inferred. Each entry is a reference in one doc that points into the OTHER
+  // doc; the phrase is pinned verbatim (so deleting or rewording the reference fails here), the
+  // number is resolved against the target doc's real headings, and `title` asserts the heading
+  // it lands on actually carries what the reference claims. R4 renumbered the story-lead's
+  // report §8 -> §7 and deleted the old §7 ("Drive it green") entirely, so every one of these
+  // was a candidate for pointing at the wrong thing.
+  const CROSS_REFS: { from: "ship" | "agent"; phrase: string; n: number; title: string }[] = [
+    { from: "ship", phrase: "It returns the JSON report in its §7", n: 7, title: "Report" },
+    {
+      from: "ship",
+      phrase: "The story-lead's own §6 pushes its branch and stops there",
+      n: 6,
+      title: "Commit and push",
+    },
+    {
+      from: "ship",
+      phrase: "`FLAGGED` comes from the story-lead's §7 report `status` field",
+      n: 7,
+      title: "Report",
+    },
+    {
+      from: "ship",
+      phrase: "commit each verified increment (the story-lead's §2)",
+      n: 2,
+      title: "Branch and implement",
+    },
+    {
+      from: "agent",
+      phrase: "Your caller's §4 opens the stacked pull request",
+      n: 4,
+      title: "Open the stacked PR",
+    },
+  ];
+
+  test("every enumerated cross-doc §-reference is present verbatim and resolves to a heading carrying what it claims", () => {
+    const docs = {
+      ship: { norm: ship(), headings: numberedHeadings(shipRaw(), SHIP) },
+      agent: { norm: agent(), headings: numberedHeadings(agentRaw(), AGENT) },
+    };
+    for (const ref of CROSS_REFS) {
+      const source = docs[ref.from];
+      const target = docs[ref.from === "ship" ? "agent" : "ship"];
+      expect(source.norm, `${ref.from}: cross-reference '${ref.phrase}' is missing`).toContain(ref.phrase);
+      const heading = target.headings.get(ref.n);
+      expect(heading, `'${ref.phrase}' points at §${ref.n}, which is not a heading in the target doc`).toBeDefined();
+      expect(
+        heading,
+        `'${ref.phrase}' points at §${ref.n}, whose heading is '${heading}' — it must carry '${ref.title}'`,
+      ).toContain(ref.title);
+    }
+  });
+
+  // The complement of the pin above: any §-reference NOT enumerated as a cross-doc one must
+  // resolve inside its own doc. This is what catches an orphan — a pointer left behind by a
+  // renumbering, aimed at a section number that no longer exists.
+  test("every other §-reference in either doc resolves to a numbered heading in that same doc", () => {
+    for (const [label, raw] of [[SHIP, shipRaw()], [AGENT, agentRaw()]] as const) {
+      const headings = numberedHeadings(raw, label);
+      const refs = sectionRefs(raw);
+      expect(refs.length, `${label}: no §-references found — the extractor is broken`).toBeGreaterThan(3);
+      let ownFile = 0;
+      for (const ref of refs) {
+        if (CROSS_REFS.some((c) => ref.sentence.includes(c.phrase))) continue;
+        ownFile++;
+        expect(
+          headings.has(ref.n),
+          `${label}: §${ref.n} is referenced but is not a heading in this doc — orphaned reference in: ${ref.sentence.slice(0, 160)}`,
+        ).toBe(true);
+      }
+      expect(ownFile, `${label}: every reference was classified as cross-doc — the classifier is broken`).toBeGreaterThan(3);
+    }
+  });
+
+  // The pin above is a heading-EXISTS check, and that is not enough. Three stories in a row have
+  // introduced a stale cross-reference, and the shape that survived R6's own first mutation pass
+  // was a reference redirected to a REAL BUT WRONG section: "the sub-issue §3 filed for it" ->
+  // "§1", "because §2 routes it straight to Parking a story" -> "§1", "§1's pick rule" -> "§3",
+  // "the §5 comment" -> "§7". Every one of those still resolves to a heading that exists, so the
+  // existence check stays green while the runbook now points a reader at the wrong step.
+  //
+  // OWN_REFS closes that hole for every own-doc reference the two files make. Each entry pins the
+  // referring phrase VERBATIM, including its `§n` — so a redirect stops matching — and separately
+  // asserts the heading `n` resolves to carries `title`, so RENUMBERING the target without
+  // updating the reference fails too. `ns` is a list because several phrases name more than one
+  // section at once ("(§4 and §6)", "§6 runs AFTER §4/§5's branch work").
+  const OWN_REFS: { doc: "ship" | "agent"; anchor: string; ns: { n: number; title: string }[] }[] = [
+    // --- commands/drawbar-ship.md, referring to itself ---------------------------------------
+    { doc: "ship", anchor: "`resolve-base` verb, invoked in §4 —", ns: [{ n: 4, title: "Open the stacked PR" }] },
+    { doc: "ship", anchor: "the run **parks and halts** (§4, Outcome A)", ns: [{ n: 4, title: "Open the stacked PR" }] },
+    {
+      doc: "ship",
+      anchor: "in THIS file (§4 and §6) re-declares this same guard",
+      ns: [{ n: 4, title: "Open the stacked PR" }, { n: 6, title: "Capture and sync knowledge" }],
+    },
+    { doc: "ship", anchor: "**halt** — §1's pick rule and the blocker gate", ns: [{ n: 1, title: "Pick the story" }] },
+    { doc: "ship", anchor: "it opens none; §4 below is what opens the PR", ns: [{ n: 4, title: "Open the stacked PR" }] },
+    {
+      doc: "ship",
+      anchor: "and §4's `## Unresolved findings` section is allowed to name a finding",
+      ns: [{ n: 4, title: "Open the stacked PR" }],
+    },
+    { doc: "ship", anchor: "there is no id for §4 to render", ns: [{ n: 4, title: "Open the stacked PR" }] },
+    {
+      doc: "ship",
+      anchor: "because §4 publishes the title verbatim in a public PR body",
+      ns: [{ n: 4, title: "Open the stacked PR" }],
+    },
+    {
+      doc: "ship",
+      anchor: "because §2 routes it straight to *Parking a story*",
+      ns: [{ n: 2, title: "Delegate the whole story" }],
+    },
+    {
+      doc: "ship",
+      anchor: "the full write-up already lives in the sub-issue §3 filed for it",
+      ns: [{ n: 3, title: "File out-of-scope findings as sub-issues" }],
+    },
+    {
+      doc: "ship",
+      anchor: "the explicit-assignment convention §6 uses for $LESSONS_JSON",
+      ns: [{ n: 6, title: "Capture and sync knowledge" }],
+    },
+    { doc: "ship", anchor: "# --- derive from the resolved config (§4)", ns: [{ n: 4, title: "Open the stacked PR" }] },
+    {
+      doc: "ship",
+      anchor: "# --- end derive from the resolved config (§4)",
+      ns: [{ n: 4, title: "Open the stacked PR" }],
+    },
+    {
+      doc: "ship",
+      anchor: "pasted into `parked_reason`, the §5 comment, or a KB entry",
+      ns: [{ n: 5, title: "Post the summary comment" }],
+    },
+    { doc: "ship", anchor: "round-trips, then continue to §5.", ns: [{ n: 5, title: "Post the summary comment" }] },
+    {
+      doc: "ship",
+      anchor: "the sub-issues filed in §3, and the story-lead's `mutation_pairs`",
+      ns: [{ n: 3, title: "File out-of-scope findings as sub-issues" }],
+    },
+    {
+      doc: "ship",
+      anchor: "§6 runs AFTER §4/§5's branch work",
+      ns: [
+        { n: 6, title: "Capture and sync knowledge" },
+        { n: 4, title: "Open the stacked PR" },
+        { n: 5, title: "Post the summary comment" },
+      ],
+    },
+    {
+      doc: "ship",
+      anchor: "not** cleared here — §5 (post the summary comment) does not clear it either",
+      ns: [{ n: 5, title: "Post the summary comment" }],
+    },
+    // Crash recovery's step 4 (fix pass): the already-stacked resume target. The reference and
+    // the exemption are one claim — a story whose PR is already recorded resolves no new base and
+    // rejoins the run at the summary-comment step, not at the PR-opening one.
+    {
+      doc: "ship",
+      anchor: "resolve **no** new base for it, and resume at §5 (post the summary comment)",
+      ns: [{ n: 5, title: "Post the summary comment" }],
+    },
+    // --- agents/drawbar-story-lead.md, referring to itself -----------------------------------
+    { doc: "agent", anchor: "Make it the report in §7, nothing else.", ns: [{ n: 7, title: "Report" }] },
+    {
+      doc: "agent",
+      anchor: "goes into the implementer's brief in §2 verbatim",
+      ns: [{ n: 2, title: "Branch and implement" }],
+    },
+    {
+      doc: "agent",
+      anchor: "then re-run §3 and §4 on the fixes",
+      ns: [{ n: 3, title: "Verification gate" }, { n: 4, title: "Mutation gate" }],
+    },
+    {
+      doc: "agent",
+      anchor:
+        "The verify gate (§3) or the mutation gate (§4) could not be satisfied, or a Critical " +
+        "finding survived the one fix pass (§5).",
+      ns: [
+        { n: 3, title: "Verification gate" },
+        { n: 4, title: "Mutation gate" },
+        { n: 5, title: "exactly one fix pass" },
+      ],
+    },
+  ];
+
+  test("every own-doc §-reference is enumerated, present verbatim, and lands on a heading carrying what it claims", () => {
+    const headings = { ship: numberedHeadings(shipRaw(), SHIP), agent: numberedHeadings(agentRaw(), AGENT) };
+    let checked = 0;
+    for (const ref of OWN_REFS) {
+      const norm = ref.doc === "ship" ? ship() : agent();
+      const count = norm.split(ref.anchor).length - 1;
+      expect(count, `${ref.doc}: own-doc reference '${ref.anchor}' must occur exactly once, found ${count}`).toBe(1);
+      for (const { n, title } of ref.ns) {
+        const heading = headings[ref.doc].get(n);
+        expect(heading, `${ref.doc}: '${ref.anchor}' names §${n}, which is not a heading in that doc`).toBeDefined();
+        expect(
+          heading,
+          `${ref.doc}: '${ref.anchor}' names §${n}, whose heading is '${heading}' — it must carry '${title}'`,
+        ).toContain(title);
+        checked++;
+      }
+    }
+    expect(checked, "OWN_REFS is empty or the loop is broken").toBeGreaterThan(20);
+  });
+
+  // Completeness, and the reason the pin above is worth anything: strike every ENUMERATED
+  // reference — cross-doc and own-doc — out of each doc, and no `§` may remain. So a NEW
+  // reference must be enumerated (with its target heading asserted) before the suite goes green,
+  // and a redirected one shows up here as an unenumerated leftover even if someone also edits its
+  // OWN_REFS anchor to match.
+  test("no §-reference in either doc is left unenumerated", () => {
+    for (const [label, doc] of [[SHIP, "ship"], [AGENT, "agent"]] as const) {
+      let norm = doc === "ship" ? ship() : agent();
+      const total = [...norm.matchAll(/§\d+/g)].length;
+      expect(total, `${label}: no §-references found — the extractor is broken`).toBeGreaterThan(5);
+      for (const c of CROSS_REFS.filter((c) => c.from === doc)) norm = norm.split(c.phrase).join("");
+      for (const o of OWN_REFS.filter((o) => o.doc === doc)) norm = norm.split(o.anchor).join("");
+      const leftovers = [...norm.matchAll(/§\d+/g)].map((m) => {
+        const at = m.index ?? 0;
+        return norm.slice(Math.max(0, at - 70), at + 40);
+      });
+      expect(leftovers, `${label}: §-reference(s) not enumerated in CROSS_REFS or OWN_REFS`).toEqual([]);
+    }
+  });
+
+  // A reference into the story-lead is the one most likely to be stale, because R4 both deleted
+  // a section and renumbered another onto its number. Every §-number ATTRIBUTED to the other doc
+  // — "the story-lead's §6", "in its §7", "your caller's §4" — must be one of the enumerated,
+  // resolved cross-references above; an unenumerated one would be checked against the WRONG doc
+  // by the test above and could pass by coincidence whenever both docs happen to have that
+  // number. Keyed on the possessive attachment rather than on the sentence merely mentioning the
+  // other agent: ship §3 legitimately says "the story-lead's one fix pass … and §4's `##
+  // Unresolved findings` section", where the §4 is ship's own.
+  const ATTRIBUTED_REF = /(?:story-lead(?:'s)?(?:\s+own)?|caller(?:'s)?(?:\s+own)?|in its)\s+§(\d+)/g;
+
+  test("the attributed-reference pattern keys on possession, not on a sentence mentioning the other agent", () => {
+    const hits = (s: string) => [...s.matchAll(ATTRIBUTED_REF)].map((m) => m[1]);
+    expect(hits("The story-lead's own §6 pushes its branch")).toEqual(["6"]);
+    expect(hits("It returns the JSON report in its §7")).toEqual(["7"]);
+    expect(hits("Your caller's §4 opens the stacked pull request")).toEqual(["4"]);
+    expect(hits("the story-lead's one fix pass, and §4's `## Unresolved findings` section")).toEqual([]);
+    expect(hits("re-run §3 and §4 on the fixes")).toEqual([]);
+  });
+
+  test("no unenumerated cross-doc §-reference survives in either doc", () => {
+    for (const [label, raw, from] of [
+      [SHIP, shipRaw(), "ship"],
+      [AGENT, agentRaw(), "agent"],
+    ] as const) {
+      let attributed = 0;
+      for (const ref of sectionRefs(raw)) {
+        for (const m of ref.sentence.matchAll(ATTRIBUTED_REF)) {
+          if (Number(m[1]) !== ref.n) continue;
+          attributed++;
+          expect(
+            CROSS_REFS.some((c) => c.from === from && ref.sentence.includes(c.phrase)),
+            `${label}: unenumerated cross-doc reference to §${ref.n}: ${ref.sentence.slice(0, 160)}`,
+          ).toBe(true);
+        }
+      }
+      expect(attributed, `${label}: no attributed cross-doc references found — the pattern is broken`).toBeGreaterThan(0);
+    }
+  });
+
+  // R4 deleted the story-lead's old §7 (the CI poll) and renumbered §8 -> §7. Two absence pins
+  // that a stale pointer would trip: no doc may reference a §8 at all, and the runbook may not
+  // describe the story-lead as polling CI or driving a branch green.
+  test("no §8 reference survives in either doc, and neither describes the story-lead polling CI", () => {
+    for (const [label, norm] of [[SHIP, ship()], [AGENT, agent()]] as const) {
+      expect(norm, `${label}: §8 no longer exists in either doc`).not.toMatch(/§[89]\b/);
+      expect(norm, `${label}: the CI-polling step was deleted by R4`).not.toMatch(/drive it green|drive the branch green/i);
+    }
+    // And the runbook must not have picked the deleted responsibility back up itself.
+    expect(ship()).not.toMatch(/gh\s+(?:pr\s+checks|run\s+(?:watch|list))/i);
+  });
+
+  // --- No prose describing a merge -----------------------------------------------------------
+
+  // Attribution scan, not a bare absence check: both docs legitimately say a great deal about
+  // merging — that the OPERATOR merges, and that this tooling never does. What must not survive
+  // is a sentence attributing a merge to the tooling. Every sentence carrying a merge word must
+  // therefore carry one of the reviewed tokens below; the exact sentence R6 removed ("Your
+  // caller opens the stacked pull request, owns the merge, …") carries none of them, which the
+  // self-test on this scan proves.
+  const MERGE_WORD = /\bmerg(?:e|es|ed|ing|eable|e-state)\b/i;
+  function mergeSentenceIsAttributed(s: string): boolean {
+    return (
+      /operator/i.test(s) || // attributed to the human who actually does it
+      /\bnever\b|\bnot\b|\bno\b|\bnothing\b/i.test(s) || // an explicit denial
+      /out[- ]of[- ]order/i.test(s) || // about a merge the operator got wrong
+      /merge=union|union-merge/i.test(s) || // the KB repo's gitattributes, unrelated
+      /merged findings/i.test(s) || // the review fix pass's merged finding list
+      /mergeable/i.test(s) // "keeping the stack mergeable is the operator's job"
+    );
+  }
+
+  // Splitter self-test: proves the trailing-markup class actually separates a claim from a
+  // bolded denial ahead of it. Without this, the scan below is satisfiable by placing the
+  // offending sentence after any `**…**` sentence containing "not".
+  test("the sentence splitter separates a claim from a bolded sentence ahead of it", () => {
+    expect(
+      sentences(
+        "**You do not open the pull request, you do not merge.** Your caller owns the merge, every Linear write.",
+      ),
+    ).toEqual([
+      "**You do not open the pull request, you do not merge.**",
+      "Your caller owns the merge, every Linear write.",
+    ]);
+    // A period inside a sentence must not split it.
+    expect(sentences("Run `stack.ts resolve-base` first. Then open it.")).toEqual([
+      "Run `stack.ts resolve-base` first.",
+      "Then open it.",
+    ]);
+  });
+
+  test("the merge-attribution scan flags a sentence that gives the tooling a merge", () => {
+    // The literal claim R6 deleted from the story-lead — the last one in either file.
+    expect(
+      mergeSentenceIsAttributed(
+        "Your caller opens the stacked pull request, owns the merge, every Linear write, the knowledge-base push, and the burn-down state.",
+      ),
+    ).toBe(false);
+    expect(mergeSentenceIsAttributed("Then merge the PR once the required checks pass.")).toBe(false);
+    expect(mergeSentenceIsAttributed("§4 merges the story and advances.")).toBe(false);
+    // ...and does not flag the true statements both docs make.
+    expect(mergeSentenceIsAttributed("It never merges — the operator reviews and merges.")).toBe(true);
+    expect(
+      mergeSentenceIsAttributed("Merging out of order leaves later PRs showing a diff against a base that has moved."),
+    ).toBe(true);
+  });
+
+  test("no sentence in either doc attributes a merge to this tooling", () => {
+    for (const [label, norm] of [[SHIP, ship()], [AGENT, agent()]] as const) {
+      const withMerge = sentences(norm).filter((s) => MERGE_WORD.test(s));
+      expect(withMerge.length, `${label}: no merge-word sentences found — the scan is vacuous`).toBeGreaterThan(3);
+      const offenders = withMerge.filter((s) => !mergeSentenceIsAttributed(s)).map((s) => s.slice(0, 160));
+      expect(offenders, `${label}: merge attributed to the tooling`).toEqual([]);
+    }
+  });
+
+  // The specific false claim R1's deletions left in the runbook's opening: with the stack, story
+  // N is based on N−1's BRANCH — nothing is ever on the default branch during a run. Pinned in
+  // both directions so the replacement cannot be re-weakened to the old one.
+  test("the runbook's sequential-only rule states the stack relationship, not a merge to the default branch", () => {
+    const txt = ship();
+    expect(txt).not.toMatch(/assumes N.{0,3}1 is on/);
+    expect(txt).toContain(
+      "they are dependency-ordered, and story N is based on story N−1's branch, which does not " +
+        "exist until N−1 has finished.",
+    );
+  });
+
+  // --- The stack model is documented ---------------------------------------------------------
+
+  function stackModel(): string {
+    for (const m of ["## The stack model", "## Preflight (halt on any failure)"]) assertOccursOnce(m);
+    const txt = shipRaw();
+    const start = txt.indexOf("## The stack model");
+    const end = txt.indexOf("## Preflight (halt on any failure)", start);
+    expect(end, "Preflight heading not found after the stack model section").toBeGreaterThan(start);
+    return txt.slice(start, end).replace(/\s+/g, " ");
+  }
+
+  test("the runbook carries a stack-model section, ahead of Preflight", () => {
+    const txt = shipRaw();
+    expect(txt.indexOf("## The stack model")).toBeGreaterThan(-1);
+    expect(txt.indexOf("## The stack model")).toBeLessThan(txt.indexOf("## Preflight (halt on any failure)"));
+    expect(stackModel().length, "the stack-model section is suspiciously short").toBeGreaterThan(1500);
+  });
+
+  // The section's opening claim: what a stack IS, and that it is required rather than a
+  // stylistic preference. Deleting this paragraph left the length floor above satisfied and every
+  // other stack-model pin green, so the one paragraph that answers "why stack at all" was
+  // free to remove.
+  test("the stack model defines the stack itself, and says dependency ordering makes it required not incidental", () => {
+    expect(stackModel()).toContain(
+      "Each story becomes one pull request, and the pull requests form a **stack**: every PR is " +
+        "based on the one before it, so each diff shows only its own story's changes and every " +
+        "branch is buildable on its own. Stories are dependency-ordered, so this is required " +
+        "rather than incidental — story N+1 generally does not compile against the configured " +
+        "base at all.",
+    );
+  });
+
+  test("the stack model states how a base is chosen — configured baseBranch first, previous story's branch after (Locked A)", () => {
+    expect(stackModel()).toContain(
+      "**How a base is chosen (Locked A).** The base is the configured `baseBranch` for the " +
+        "**first** story of a run, and the **previous story's branch** for every story after it.",
+    );
+  });
+
+  // Names a derivation, so it is pinned on the literal producer invocation rather than on the
+  // prose around it (MUST-CHECK prose-pins-dont-cover-the-bash-fence-they-describe): the claim
+  // is that ONE named verb produces the value and bash never re-derives it.
+  test("the stack model names `resolve-base` as the sole producer and forbids re-deriving the base in bash", () => {
+    expect(stackModel()).toContain(
+      "Exactly one thing produces that value — `scripts/lib/stack.ts`'s `resolve-base` verb, " +
+        "invoked in §4 — and it is **never re-derived in bash**, never lifted out of the " +
+        "run-state file by hand, and never left to a default.",
+    );
+  });
+
+  // WHY `resolve-base` is the sole producer, kept attached to the rule. Without it "never
+  // re-derived in bash" reads as a style rule rather than the validation boundary it is, and the
+  // reason a value copied out of `stack[]` is untrusted (the run state is agent-writable) is the
+  // whole argument. Deleting this sentence left every other base pin green.
+  test("the stack model gives the reason resolve-base is the sole producer: shape-gating, over agent-writable run state", () => {
+    expect(stackModel()).toContain(
+      "`resolve-base` is the only producer that shape-gates the branch name with " +
+        "`isValidRefName`; the run state it reads is agent-writable, so a base copied straight " +
+        "out of `stack[]` carries no validation at all.",
+    );
+  });
+
+  // The half of Locked A that constrains the OTHER agent: the story-lead consumes a base and
+  // never produces one. Deleting it leaves the runbook silent on whether the story-lead may
+  // resolve its own base — which is exactly the re-derivation the rule above forbids.
+  test("the stack model states the story-lead is handed its base and never resolves one", () => {
+    expect(stackModel()).toContain(
+      "The story-lead is **handed** its base and cuts from it; it never resolves one.",
+    );
+  });
+
+  test("the stack model names the consequence of an omitted --base: a diff carrying every earlier story's work", () => {
+    expect(stackModel()).toContain(
+      "Omitting `--base` is the same failure from the other side: `gh` would fall back to the " +
+        "repo's default branch, producing a PR whose diff carries every earlier story's work " +
+        "too — green, plausible, and near-impossible to spot in the morning.",
+    );
+  });
+
+  test("the stack model states that flagged opens the PR anyway and the stack continues on top of it", () => {
+    const body = stackModel();
+    expect(body).toContain(
+      "A `flagged` story is one whose single fix pass left Important findings alive. **The PR " +
+        "opens anyway**, annotated with an `## Unresolved findings` section, and **the stack " +
+        "continues on top of it** — the next story is based on this story's branch exactly as " +
+        "if it had come back clean.",
+    );
+  });
+
+  // The rationale for opening a flagged PR rather than halting on it. This is the sentence that
+  // stops a later reader "fixing" flagged into a halt, so it is pinned alongside the rule.
+  test("the stack model justifies why flagged opens the PR rather than costing the night's throughput", () => {
+    expect(stackModel()).toContain(
+      "A story that is 90% right belongs in front of the operator at 8am, annotated, rather than " +
+        "costing the rest of the night's throughput.",
+    );
+  });
+
+  test("the stack model distinguishes 'no PR could be opened' in kind from flagged, and says it parks and halts", () => {
+    expect(stackModel()).toContain(
+      "**\"No PR could be opened\" differs in kind from `flagged`, not in degree.** With no pull " +
+        "request there is no branch for the next story to base on, so the chain has no anchor " +
+        "and the run **parks and halts** (§4, Outcome A).",
+    );
+  });
+
+  test("the stack model states the operator's morning contract: review bottom-up and merge bottom-up, in order", () => {
+    expect(stackModel()).toContain(
+      "**The operator's contract in the morning: review bottom-up and merge bottom-up, in order.**",
+    );
+    // The reason, kept attached. "in order" without it is an unexplained instruction, and an
+    // unexplained instruction is the one an operator in a hurry overrides. Deleting these two
+    // sentences left the bolded header pin above green on its own.
+    expect(stackModel()).toContain(
+      "The stack was built bottom-up, so only the bottom PR's diff is meaningful against the " +
+        "configured base; every PR above it is meaningful only once the one below has landed. " +
+        "Reviewing or merging out of order reads a diff against a base that has moved.",
+    );
+  });
+
+  // Locked F, in three parts, each of which a reader could act wrongly on if it were softened:
+  // the three things the command never does, whose job the stack is, and — the part the design
+  // document is emphatic about — that the missing out-of-order-merge detection is a CONTRACT and
+  // not a gap somebody should file a follow-up for.
+  test("Locked F is stated without hedging: never merges, never verifies a merge, never inspects whether one happened", () => {
+    expect(stackModel()).toContain(
+      "**Locked F — `drawbar-ship` never merges, never verifies a merge, and never inspects " +
+        "whether one happened.** Keeping the stack mergeable is the operator's job.",
+    );
+  });
+
+  test("Locked F states that out-of-order-merge detection and repair does not exist, is not planned, and is not a gap to file", () => {
+    expect(stackModel()).toContain(
+      "**No detection or repair of out-of-order merges exists or is planned** — that is a " +
+        "contract, not a gap awaiting a follow-up, so do not file one for it.",
+    );
+    // The reason, kept attached: without it "not planned" reads as an oversight rather than a
+    // consequence of the deletion this whole redesign is.
+    expect(stackModel()).toContain(
+      "Building it back would re-introduce exactly the merge-state gating this design deleted",
+    );
+    // And the remedy, which is what makes "not planned" actionable rather than merely a refusal:
+    // a reader who hits an out-of-order merge is told what to do about it. Deleting this sentence
+    // left the "exists or is planned" pin green while removing the only answer the doc offers.
+    expect(stackModel()).toContain(
+      "If a stack does get merged out of order, the recovery is a human rebase, and this command " +
+        "has no opinion about it.",
+    );
+  });
+
+  // --- Crash recovery re-establishes the base ------------------------------------------------
+
+  function crashRecovery(): string {
+    for (const m of ["## Crash recovery", "## Finishing the run"]) assertOccursOnce(m);
+    const txt = shipRaw();
+    const start = txt.indexOf("## Crash recovery");
+    const end = txt.indexOf("## Finishing the run", start);
+    expect(end, "'## Finishing the run' not found after '## Crash recovery'").toBeGreaterThan(start);
+    return txt.slice(start, end).replace(/\s+/g, " ");
+  }
+
+  test("Crash recovery names its new responsibility — the stack base, not merely the in-flight story", () => {
+    expect(crashRecovery()).toContain(
+      "**Recovery re-establishes the stack base, not merely the in-flight story.**",
+    );
+  });
+
+  // The consequence has to sit WHERE THE RECOVERY STEPS ARE, not only in the stack-model
+  // section: a resumed run resolving the wrong base is the one crash failure that produces no
+  // error at all, and an operator reading only this section would otherwise never learn it.
+  test("Crash recovery names the wrong-base consequence: a PR whose diff carries another story's work", () => {
+    expect(crashRecovery()).toContain(
+      "a resumed run that resolves the wrong base opens a pull request whose diff carries " +
+        "another story's work — green, plausible, and near-impossible to spot in the morning.",
+    );
+  });
+
+  // Names two derivations (`assert-chain`, `resolve-base`), so the pin carries both literal verb
+  // invocations rather than the prose around them.
+  test("Crash recovery re-establishes the base via assert-chain and a fresh resolve-base, never from the checked-out branch", () => {
+    const body = crashRecovery();
+    expect(body).toContain(
+      "Every other resume re-establishes the base *here*, through the fence below, never from the " +
+        "branch that happens to be checked out and never re-derived in bash: `stack.ts " +
+        "assert-chain` confirms every recorded predecessor branch still exists and still points " +
+        "where the `stack` array says, then a fresh `stack.ts resolve-base` produces the base for " +
+        "this story.",
+    );
+    expect(body).toContain(
+      "Any other refusal from either call **parks the story**: refuse rather than guess",
+    );
+  });
+
+  // --- Fix pass: step 4 must not park a recoverable run ---------------------------------------
+  //
+  // `resolveBase` refuses `story_already_stacked` whenever the story already has a `stack[]`
+  // entry (scripts/lib/stack.ts). §7 does not clear `in_flight`, so a crash between the PR
+  // opening and Advance leaves a CORRECT state that Preflight routes to Crash recovery. An
+  // unconditional "a refusal from either call parks the story" therefore ends the night over a
+  // run that only lost its tail. The exemption is one claim — step 3's finding, the reason it is
+  // correct rather than broken, that no new base is resolved, and the named reason code — so it
+  // is pinned as one contiguous phrase and a hedge ("may mean", "usually") breaks it.
+  test("Crash recovery step 4 exempts the already-stacked story instead of parking it", () => {
+    const body = crashRecovery();
+    expect(body).toContain(
+      "One state skips this step: if step 3 found the PR already open **and** the `stack` array " +
+        "already records this story, the PR-opening step completed and only the tail of the run " +
+        "was lost. That state is correct, not broken — resolve **no** new base for it, and " +
+        "resume at §5 (post the summary comment). `resolve-base` refuses `story_already_stacked` " +
+        'for exactly that state, and that one reason means "already stacked", never "park".',
+    );
+    // ...and the fence has to act on it, not merely describe it: the `case` arm is what an
+    // unattended agent actually follows. Pinned on the literal branch, per MUST-CHECK
+    // prose-pins-dont-cover-the-bash-fence-they-describe.
+    const f = crashFence();
+    expect(f).toContain(
+      "story_already_stacked) echo \"ALREADY_STACKED: the PR is already recorded — resume at the " +
+        'summary comment; resolve no base.";;',
+    );
+    // The generic park arm must still be the DEFAULT, so the exemption cannot widen into
+    // "any refusal is fine".
+    expect(f).toContain(
+      '*) echo "PARK: resolve-base refused ($BASE_REASON) — park the story; paraphrase, never ' +
+        'paste, the detail on stderr."; exit 1;;',
+    );
+  });
+
+  // --- Fix pass (CRITICAL): the SECOND assert-chain site needs the same trust root -----------
+  //
+  // MUST-CHECK r3-must-not-source-project-dir-from-pasted-run-state is scoped verbatim to "R3
+  // (PCO-366) and any later consumer of stack.ts assert-chain", and `--project-dir` is only a
+  // trust root when its value comes from a FRESH `ship-config.ts validate` in the SAME bash
+  // block. §4's pin (`CRITICAL 1`) reads a §4-scoped fence, so Crash recovery's new invocation
+  // landed outside it with the suite green — MUST-CHECK
+  // defense-applied-at-n-sites-needs-a-test-at-each-site in its documented form. This pin is
+  // WHOLE-DOCUMENT: every `assert-chain` invocation anywhere in the runbook, in any section
+  // added later, must sit in a fence that also carries the validate line and must anchor on
+  // `$PROJECT_DIR`.
+  // A fence nested inside a numbered list item is indented, so every pin that compares its lines
+  // to an unindented fence's must strip the COMMON indent — not a fixed number of spaces, which
+  // would leave continuation lines off by however much they are further indented.
+  function dedent(block: string): string {
+    const lines = block.split("\n");
+    const indents = lines.filter((l) => l.trim().length > 0).map((l) => l.match(/^[ \t]*/)![0].length);
+    const common = indents.length === 0 ? 0 : Math.min(...indents);
+    return lines.map((l) => l.slice(common)).join("\n");
+  }
+
+  function shipBashFences(): { body: string; at: number }[] {
+    const txt = shipRaw();
+    const out: { body: string; at: number }[] = [];
+    for (const m of txt.matchAll(/[ \t]*```bash\n([\s\S]*?)[ \t]*```/g)) {
+      out.push({ body: m[1]!, at: m.index ?? 0 });
+    }
+    expect(out.length, "no bash fences found in the runbook — the extractor is broken").toBeGreaterThan(3);
+    return out;
+  }
+
+  const VALIDATE_LINE =
+    'RESOLVED=$(echo "$LINEAR_FACTS_JSON" | bun run "${CLAUDE_PLUGIN_ROOT}/scripts/lib/ship-config.ts" validate --config "$CONFIG")';
+
+  test("EVERY assert-chain invocation in the runbook sits in a fence with a fresh ship-config validate and --project-dir \"$PROJECT_DIR\"", () => {
+    const fences = shipBashFences();
+    const txt = shipRaw();
+    // Every invocation line, wherever it is — including one in no fence at all, which is the
+    // shape this diff introduced.
+    const allCalls = txt.split("\n").filter((l) => l.includes('stack.ts" assert-chain'));
+    expect(allCalls.length, "no assert-chain invocations found — the extractor is broken").toBeGreaterThan(2);
+    let seen = 0;
+    for (const { body } of fences) {
+      const calls = body.split("\n").filter((l) => l.includes('stack.ts" assert-chain'));
+      if (calls.length === 0) continue;
+      seen += calls.length;
+      const dedented = dedent(body);
+      expect(
+        dedented,
+        "a fence invoking assert-chain must derive --project-dir from a FRESH ship-config validate in the SAME block (MUST-CHECK r3-must-not-source-project-dir-from-pasted-run-state)",
+      ).toContain(VALIDATE_LINE);
+      expect(dedented, "the fence must derive $PROJECT_DIR from $RESOLVED, not from the run state").toContain(
+        `PROJECT_DIR=$(echo "$RESOLVED" | jq -r '.projectDir // empty')`,
+      );
+      // The state file's own copy is never read in the executable body — that key exists only
+      // there, and every legitimate mention of it in this runbook is a comment.
+      const bodyNoComments = dedented
+        .split("\n")
+        .filter((l) => !l.trimStart().startsWith("#"))
+        .join("\n");
+      expect(bodyNoComments, "no executable line may read the run state's resolved_config").not.toContain(
+        "resolved_config",
+      );
+      for (const call of calls) {
+        expect(call).toContain(`--project-dir "$PROJECT_DIR"`);
+        expect(call).not.toContain("jq");
+      }
+    }
+    // Completeness: no invocation may sit outside a bash fence, free-hand, with the flags left
+    // to an unattended agent to invent.
+    expect(
+      seen,
+      `every assert-chain invocation must live inside a bash fence — ${allCalls.length} found in the doc, ${seen} inside fences`,
+    ).toBe(allCalls.length);
+  });
+
+  // The fence Crash recovery gained, extracted on its own so the pins below are about IT and not
+  // about §4's.
+  function crashFence(): string {
+    const txt = shipRaw();
+    const start = txt.indexOf("## Crash recovery");
+    const end = txt.indexOf("## Finishing the run", start);
+    const fences = [...txt.slice(start, end).matchAll(/[ \t]*```bash\n([\s\S]*?)[ \t]*```/g)].map((m) => m[1]!);
+    expect(fences.length, "Crash recovery must carry exactly one bash fence").toBe(1);
+    return dedent(fences[0]!);
+  }
+
+  // The fence with COMMENT lines removed — every "must NOT contain" assertion runs against this,
+  // for the reason §4's `code()` helper spells out: the comments legitimately name the forbidden
+  // constructs (`.detail`, `jq '.resolved_config' "$STATE"`) in order to forbid them, so an
+  // absence check over the raw text would be satisfiable only by deleting the explanation.
+  function crashCode(): string {
+    return crashFence()
+      .split("\n")
+      .filter((l) => !l.trimStart().startsWith("#"))
+      .join("\n");
+  }
+
+  test("Crash recovery's fence re-runs BOTH of Preflight's $CONFIG guards, byte-identically", () => {
+    const f = crashFence();
+    const txt = shipRaw();
+    const pfStart = txt.indexOf("## Preflight (halt on any failure)");
+    const fenceStart = txt.indexOf("```bash", pfStart);
+    const pf = txt.slice(fenceStart + 7, txt.indexOf("```", fenceStart + 7));
+    const one = (block: string, prefix: string, label: string): string => {
+      const hits = block.split("\n").filter((l) => l.startsWith(prefix));
+      expect(hits.length, `${label}: expected exactly one line starting with ${JSON.stringify(prefix)}, found ${hits.length}`).toBe(1);
+      return hits[0]!;
+    };
+    for (const prefix of ['CONFIG="${DRAWBAR_SHIP_CONFIG', '[ -f "$CONFIG" ]', "CONFIG_REAL="]) {
+      expect(one(f, prefix, `Crash recovery's ${prefix}`)).toBe(one(pf, prefix, `Preflight's ${prefix}`));
+    }
+    const trackedPrefix = 'git -C "$(dirname "$CONFIG_REAL")" ls-files --error-unmatch';
+    const guard = (block: string, label: string): string => {
+      const lines = block.split("\n");
+      const s = lines.findIndex((l) => l.startsWith(trackedPrefix));
+      expect(s, `${label}: tracked-config guard not found`).toBeGreaterThan(-1);
+      const e = lines.findIndex((l, i) => i >= s && l.trim() === "|| true");
+      expect(e, `${label}: tracked-config guard's '|| true' not found`).toBeGreaterThan(s);
+      return lines.slice(s, e + 1).join("\n");
+    };
+    expect(guard(f, "Crash recovery")).toBe(guard(pf, "Preflight"));
+    // The guards must precede the validate they protect, and the validate must precede the
+    // assert-chain that consumes its output. Order is the whole point.
+    expect(f.indexOf("CONFIG_REAL=")).toBeLessThan(f.indexOf(trackedPrefix));
+    expect(f.indexOf(trackedPrefix)).toBeLessThan(f.indexOf(VALIDATE_LINE));
+    expect(f.indexOf(VALIDATE_LINE)).toBeLessThan(f.indexOf('stack.ts" assert-chain'));
+    // $STATE is built from the VALIDATED envDir, never from a path already in context.
+    expect(f).toContain('STATE="$ENV_DIR/.drawbar/runs/$ARG.json"');
+  });
+
+  // The prose half: the reason the fence exists at all has to be readable, and the forbidden
+  // shortcut has to be named. Proven against a hedging rephrase ("prefer the fresh validate",
+  // "the run state is usually fine") as well as deletion.
+  test("Crash recovery names the fresh validate as --project-dir's only trust root, and forbids the run-state copy", () => {
+    const body = crashRecovery();
+    expect(body).toContain(
+      "**`--project-dir` is a trust root, and this fence is the only sanctioned way to produce " +
+        "one.** MUST-CHECK `r3-must-not-source-project-dir-from-pasted-run-state`: the value " +
+        "handed to `--project-dir` comes from the fresh `ship-config.ts validate` inside this " +
+        "block and from nowhere else — never `jq '.resolved_config' \"$STATE\"`, and never the " +
+        "`resolved_config` that step 1 has already read into context.",
+    );
+    expect(body).toContain(
+      "The state file is agent-writable, so a `--project-dir` taken from it turns `stack.ts`'s " +
+        "equality guard into a tautology about whatever directory that file names, and hands " +
+        "`git -C` a repository an attacker chose.",
+    );
+    expect(body).toContain(
+      "Both of Preflight's guards therefore run again here, verbatim.",
+    );
+    expect(body).not.toMatch(/prefer the fresh validate|usually fine|where convenient|if convenient/i);
+  });
+
+  // --- Fix pass: the paraphrase rule is a Hard rule, and covers stack.ts too -----------------
+  //
+  // §4's fence comment claims "the Hard rules require refusal text be paraphrased rather than
+  // pasted into `parked_reason`, the §5 comment, or a KB entry" — but the only paraphrase rule in
+  // the file was an OPERATOR NOTE scoped to ship-config. Crash recovery's step 4 adds a third
+  // refusal-producing call path, and `assert-chain`'s `detail` names both an absolute
+  // `projectDir` and a branch. Public repo: MUST-CHECK drawbar-repo-is-public-scrub-before-porting.
+  test("Hard rules carry the paraphrase-never-paste rule, scoped to every guard and every sink", () => {
+    const rules = hardRules();
+    expect(rules).toContain(
+      "- **Any guard refusal text — `ship-config.ts`, `stack.ts`, `kb-sync.ts` alike — must be " +
+        "paraphrased, never pasted**, into `parked_reason`, a Linear comment, or a KB entry. Echo " +
+        "the verdict's `.reason` and nothing else: a `detail` carries absolute paths and the real " +
+        "repo slug, and this repo is public.",
+    );
+    // The hedges that would leave the bullet recognisable while removing the rule.
+    expect(rules).not.toMatch(/where possible|try not to paste|generally paraphrase/i);
+  });
+
+  test("the Operator notes paraphrase rule is not scoped to ship-config alone", () => {
+    const notes = operatorNotesR6();
+    expect(notes).toContain(
+      "- **Any guard refusal text must be paraphrased, never pasted**, into a KB entry or a " +
+        "Linear comment — `stack.ts`'s verdicts exactly as much as `ship-config.ts`'s, and a " +
+        "`parked_reason` exactly as much as a comment.",
+    );
+    expect(notes).toContain(
+      "Refusal `detail` strings echo absolute paths and the real repo slug (`assert-chain`'s name " +
+        "a predecessor branch and the `projectDir` it was asked about)",
+    );
+    // The pre-fix wording, which left stack.ts verdicts and `parked_reason` uncovered.
+    expect(notes).not.toContain("**Ship-config refusal text must be paraphrased");
+  });
+
+  // Every refusal echo in Crash recovery's fence extracts `.reason` and nothing else — the same
+  // structural protection §4 has. A `.detail` reaching stdout is what gets pasted.
+  test("Crash recovery's fence echoes .reason only, never .detail", () => {
+    const f = crashFence();
+    expect(crashCode(), "no executable line may read a verdict's `.detail`").not.toContain(".detail");
+    const echoes = f.split("\n").filter((l) => l.includes("PARK:") || l.includes("ALREADY_STACKED:"));
+    expect(echoes.length, "Crash recovery's refusal echoes not found").toBeGreaterThan(2);
+    for (const e of echoes) {
+      expect(e, `refusal echo must not interpolate a detail: ${e.slice(0, 120)}`).not.toContain("_DETAIL");
+    }
+    for (const verb of ["CHAIN", "BASE"]) {
+      expect(f).toContain(
+        `${verb}_REASON=$(printf '%s' "\${${verb}_JSON:-null}" | jq -r '.reason // "unreadable-verdict"' 2>/dev/null)`,
+      );
+    }
+  });
+
+  // Renumbering guard for this very edit: the section gained a step, so the list must still run
+  // 1..7 with no repeat or gap, and the two steps that cross-reference step 2 must still say 2.
+  test("Crash recovery's numbered steps run in sequence with no gap or repeat", () => {
+    const raw = (() => {
+      const txt = shipRaw();
+      const start = txt.indexOf("## Crash recovery");
+      return txt.slice(start, txt.indexOf("## Finishing the run", start));
+    })();
+    const steps = [...raw.matchAll(/^(\d+)\. /gm)].map((m) => Number(m[1]));
+    expect(steps.length, "crash-recovery steps not found").toBeGreaterThan(5);
+    expect(steps).toEqual(steps.map((_, i) => i + 1));
+    // The resume step must point at the base the new step established, not re-derive one.
+    expect(crashRecovery()).toContain("re-dispatch the story-lead pointing at that branch and at the base step 4 re-established");
+  });
+
+  // --- Hard rules and Operator notes, in a world with no merge -------------------------------
+
+  function hardRules(): string {
+    for (const m of ["## Hard rules", "## Operator notes"]) assertOccursOnce(m);
+    const txt = shipRaw();
+    const start = txt.indexOf("## Hard rules");
+    const end = txt.indexOf("## Operator notes", start);
+    expect(end, "'## Operator notes' not found after '## Hard rules'").toBeGreaterThan(start);
+    return txt.slice(start, end).replace(/\s+/g, " ");
+  }
+
+  function operatorNotesR6(): string {
+    assertOccursOnce("## Operator notes");
+    const txt = shipRaw();
+    return txt.slice(txt.indexOf("## Operator notes")).replace(/\s+/g, " ");
+  }
+
+  test("Hard rules state Locked F as a rule, not only as narrative", () => {
+    expect(hardRules()).toContain(
+      "**Locked F: never merge, never verify a merge, and never inspect whether one happened.** " +
+        "There is no merge step, no merge check, and no out-of-order-merge detection or repair " +
+        "anywhere in this command, and none is planned. The operator merges, bottom-up and in " +
+        "order.",
+    );
+  });
+
+  test("Hard rules pin the base rule on resolve-base and forbid re-deriving or omitting it", () => {
+    expect(hardRules()).toContain(
+      "`--base` comes from `scripts/lib/stack.ts`'s `resolveBase`, invoked as `stack.ts " +
+        "resolve-base`: the configured `baseBranch` for the first story of a run, the previous " +
+        "story's recorded branch for every story after that (Locked A). Never re-derive it in " +
+        "bash, never read it out of the run-state file by hand, and never omit `--base`.",
+    );
+  });
+
+  test("Hard rules keep flagged and no-PR distinct in kind", () => {
+    expect(hardRules()).toContain(
+      "A `flagged` story still gets its PR and the stack still continues on top of it; a story " +
+        "with **no** PR parks and halts the run, because the chain has no anchor.",
+    );
+  });
+
+  test("Operator notes state the morning contract: review bottom-up and merge bottom-up, in order", () => {
+    expect(operatorNotesR6()).toContain(
+      "**In the morning: review bottom-up and merge bottom-up, in order.**",
+    );
+    expect(operatorNotesR6()).toContain(
+      "Only the bottom PR's diff is meaningful against the configured base; every PR above it " +
+        "becomes meaningful as the one below it lands.",
+    );
+  });
+
+  test("Operator notes tell the operator the stack's mergeability is theirs and nothing here checks it", () => {
+    expect(operatorNotesR6()).toContain(
+      "**Keeping the stack mergeable is yours, and nothing here checks it.** Per Locked F this " +
+        "command never merges, never verifies a merge, and never inspects whether one happened " +
+        "— there is no detection or repair of an out-of-order merge, and none is planned.",
+    );
+    // The sentence that stops a reader filing the "gap" as a bug. Pinned separately because it
+    // is the end of the bullet, which is exactly where an escape hatch gets appended.
+    expect(operatorNotesR6()).toContain(
+      "This is a contract rather than a missing feature, so it is not something to file.",
+    );
+  });
+
+  test("Operator notes explain a flagged PR is one to review, and that a parked story ends the stack", () => {
+    expect(operatorNotesR6()).toContain(
+      "**A `flagged` PR is a PR to review, not a failure.** Its `## Unresolved findings` section " +
+        "names each surviving finding by sub-issue id and title; the write-ups are in those " +
+        "Linear sub-issues, deliberately not in the public PR body.",
+    );
+    // MUST-CHECK pco352-fixpass-satisfies-the-gate-header-must-not-cover-a-repick-clause: the
+    // bolded header above must NOT stand in for the clause that follows it. The operator-facing
+    // half of the flagged-vs-no-PR distinction is this sentence, and it was the one place the two
+    // outcomes could still be collapsed with the whole suite green — rewriting the tail to "the
+    // same case, one notch further along" left every other flagged/no-PR pin (stack model, Hard
+    // rules) untouched, because each reads a different slice of the file. Pinned in kind, and
+    // the "same scale / same case / degrees" collapse refused by name.
+    expect(operatorNotesR6()).toContain(
+      "A story that could not open a PR at all is the other case entirely: the run parked and " +
+        "stopped there, so the stack ends at the story below it.",
+    );
+    const notes = operatorNotesR6();
+    expect(notes, "flagged and no-PR must never be presented as degrees of one outcome").not.toMatch(
+      /(?:same (?:scale|case|outcome)|one notch|degrees of the same|both degraded)/i,
+    );
+  });
+
+  // --- The two §1 Recall pins deferred from R4 -----------------------------------------------
+
+  // R4's mutation gate found both of these and deliberately left them for R6. Both are in the
+  // story-lead's §1, and both were entirely unpinned: the suite stayed green with the rule
+  // weakened to "Prefer `$KB` as given where convenient", and green again with the MUST-CHECK
+  // recall line deleted from the fence outright.
+  function agentSectionOne(raw = false): string {
+    const txt = agentRaw();
+    for (const m of ["## 1. Recall", "## 2. Branch and implement"]) {
+      const count = txt.split(m).length - 1;
+      expect(count, `'${m}' must occur exactly once in ${AGENT}, found ${count}`).toBe(1);
+    }
+    const start = txt.indexOf("## 1. Recall");
+    const end = txt.indexOf("## 2. Branch and implement", start);
+    expect(end, "'## 2.' not found after '## 1. Recall'").toBeGreaterThan(start);
+    const slice = txt.slice(start, end);
+    return raw ? slice : slice.replace(/\s+/g, " ");
+  }
+
+  test("§1 pins the absolute-$KB rule, including the relative path it forbids and why", () => {
+    expect(agentSectionOne()).toContain(
+      "Use `$KB` exactly as given — it is absolute. Never `$PWD/.drawbar/memory`: you may be " +
+        "running from a directory that has no `.drawbar`, and the path would silently point " +
+        "nowhere.",
+    );
+  });
+
+  // The weakening this pin exists to catch, asserted directly: a "prefer / where convenient"
+  // rephrase leaves the imperative recognisable to a human skimming the diff while removing the
+  // rule, and a relative KB path points nowhere silently rather than failing.
+  test("§1's $KB rule is an imperative, never softened to a preference", () => {
+    const body = agentSectionOne();
+    expect(body).not.toMatch(/prefer\s+`?\$KB/i);
+    expect(body).not.toMatch(/where convenient|if convenient|where possible/i);
+    expect(body).toContain("Never `$PWD/.drawbar/memory`");
+  });
+
+  // Pinned on the LITERAL invocation line extracted from §1's raw fence, not on prose beside it
+  // (MUST-CHECK prose-pins-dont-cover-the-bash-fence-they-describe): the claim names a query, a
+  // flag and an output format, and deleting the line is exactly the mutation that stayed green.
+  test("§1's fence carries BOTH recall invocations, literally, including the MUST-CHECK one", () => {
+    const raw = agentSectionOne(true);
+    const fences = [...raw.matchAll(/```bash\n([\s\S]*?)```/g)].map((m) => m[1]!);
+    expect(fences.length, "§1 must carry exactly one bash fence").toBe(1);
+    const lines = fences[0]!.split("\n").filter((l) => l.trim().length > 0);
+    expect(lines).toEqual([
+      'drawbar-kb recall "<story title and files>" --dir "$KB" --json',
+      'drawbar-kb recall "MUST-CHECK <stack>" --dir "$KB" --json',
+    ]);
+  });
+
+  // Why the pin above matters more than a missing step usually does. MUST-CHECK
+  // lead-brief-that-drops-a-recalled-must-check-manufactures-the-violation: the implementer
+  // builds what the brief says, so a MUST-CHECK recalled and then omitted from the brief is not
+  // merely unenforced — the brief instructs the violation. That has already shipped an ACE sink
+  // in this repo (PCO-365).
+  test("§1 states that every recalled MUST-CHECK goes into the implementer's brief, and why omitting one manufactures the violation", () => {
+    const body = agentSectionOne();
+    expect(body).toContain(
+      "**Both recalls are mandatory, and every MUST-CHECK the second one returns goes into the " +
+        "implementer's brief in §2 verbatim.**",
+    );
+    expect(body).toContain(
+      "A MUST-CHECK you recalled and then left out of the brief is worse than one you never " +
+        "recalled at all: the implementer builds what the brief says, so the brief actively " +
+        "manufactures the violation rather than merely failing to prevent it.",
+    );
+    // Fix pass: the incident citation has to be TRUE, because a lead obeying a false one draws
+    // the wrong lesson. On PCO-365 the entry was in the KB and the recall's query terms never
+    // surfaced it — the brief instructed the sink, but not by dropping something it had seen. The
+    // earlier wording ("an arbitrary-code-execution sink that the recalled entry named exactly")
+    // told a lead that transcription is the whole risk and query shape is not.
+    expect(body).toContain(
+      "A brief that instructed exactly this has already shipped an arbitrary-code-execution sink " +
+        "in this repo; the entry forbidding it was in the knowledge base but the recall's query " +
+        "terms never surfaced it, so a recall that misses an entry and a brief that drops one " +
+        "fail in the same direction.",
+    );
+    expect(body, "the entry was never surfaced by that recall — claiming otherwise is false").not.toContain(
+      "that the recalled entry named exactly",
+    );
+  });
+
+  // --- The story-lead's own no-merge statement -----------------------------------------------
+
+  test("the story-lead states that nothing in the pipeline merges, and that the operator merges bottom-up", () => {
+    const txt = agent();
+    expect(txt).toContain(
+      "**Nothing in this pipeline merges anything.** Your caller never merges, never verifies a " +
+        "merge, and never inspects whether one happened; the operator reviews the stack in the " +
+        "morning and merges it bottom-up by hand.",
+    );
+    // The consequence for the agent itself — the reason this paragraph is in the agent file and
+    // not only in the runbook.
+    expect(txt).toContain(
+      "So there is no merge for you to prepare for, wait on, or leave room for: your work ends " +
+        "at a pushed branch.",
+    );
+  });
+
+  test("the story-lead no longer says its caller owns the merge", () => {
+    expect(agent()).not.toContain("owns the merge");
   });
 });

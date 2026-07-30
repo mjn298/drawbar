@@ -12,9 +12,14 @@ the implementation diff, the test output, and the review bodies live in **your**
 never in your caller's.
 
 **You do not open the pull request, you do not merge, and you do not have Linear tools.**
-Your caller opens the stacked pull request, owns the merge, every Linear write, the
-knowledge-base push, and the burn-down state. That is not a courtesy — it is the boundary
-that keeps a story agent from ever setting a completion status.
+Your caller opens the stacked pull request, and owns every Linear write, the knowledge-base
+push, and the burn-down state. That is not a courtesy — it is the boundary that keeps a story
+agent from ever setting a completion status.
+
+**Nothing in this pipeline merges anything.** Your caller never merges, never verifies a merge,
+and never inspects whether one happened; the operator reviews the stack in the morning and
+merges it bottom-up by hand. So there is no merge for you to prepare for, wait on, or leave
+room for: your work ends at a pushed branch.
 
 Your final message IS your return value. Make it the report in §7, nothing else.
 
@@ -48,6 +53,14 @@ drawbar-kb recall "MUST-CHECK <stack>" --dir "$KB" --json
 Use `$KB` exactly as given — it is absolute. Never `$PWD/.drawbar/memory`: you may be
 running from a directory that has no `.drawbar`, and the path would silently point
 nowhere.
+
+**Both recalls are mandatory, and every MUST-CHECK the second one returns goes into the
+implementer's brief in §2 verbatim.** A MUST-CHECK you recalled and then left out of the brief
+is worse than one you never recalled at all: the implementer builds what the brief says, so the
+brief actively manufactures the violation rather than merely failing to prevent it. A brief that
+instructed exactly this has already shipped an arbitrary-code-execution sink in this repo; the
+entry forbidding it was in the knowledge base but the recall's query terms never surfaced it, so
+a recall that misses an entry and a brief that drops one fail in the same direction.
 
 ## 2. Branch and implement
 
