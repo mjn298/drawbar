@@ -1,5 +1,5 @@
 import { test, expect, describe } from "bun:test";
-import { readFileSync, mkdtempSync, writeFileSync, existsSync, mkdirSync, symlinkSync } from "node:fs";
+import { readFileSync, mkdtempSync, writeFileSync, existsSync, mkdirSync, symlinkSync, rmSync, realpathSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -767,6 +767,45 @@ describe("scaffolding", () => {
     // non-empty/existence check while letting run-state JSON get committed.
     expect(txt).toMatch(/^\*$/m);
     expect(txt).toMatch(/^!\.gitignore$/m);
+  });
+
+  // PCO-371: §4's four inputs are written by the agent into the working tree (a deterministic
+  // path, because the agent has to know where to write before the fence runs) instead of a
+  // `mktemp -d`. The fence sweeps them with an EXIT trap on every path, but a run killed between
+  // the Write calls and the fence leaves a PR body on disk — so the directory carries the same
+  // self-ignoring `.gitignore` `.drawbar/runs/` does.
+  test(".drawbar/tmp/.gitignore actually ignores everything but itself", () => {
+    const txt = readNonEmpty(join(root, ".drawbar/tmp/.gitignore"));
+    expect(txt).toMatch(/^\*$/m);
+    expect(txt).toMatch(/^!\.gitignore$/m);
+  });
+
+  // Verified for real against git, not just by reading the pattern: the four paths §4 names are
+  // the four that must never be stageable.
+  test("git check-ignore really ignores each of §4's four written inputs", () => {
+    for (const leaf of ["inputs.json", "branch", "title", "body"]) {
+      const res = Bun.spawnSync(["git", "check-ignore", "-q", `.drawbar/tmp/ship/${leaf}`], { cwd: root });
+      expect(res.exitCode, `.drawbar/tmp/ship/${leaf} is not ignored — a PR body could be committed`).toBe(0);
+    }
+    // The ignore file itself must stay tracked, or the protection travels with nobody.
+    const self = Bun.spawnSync(["git", "check-ignore", "-q", ".drawbar/tmp/.gitignore"], { cwd: root });
+    expect(self.exitCode, "the .gitignore must NOT ignore itself").not.toBe(0);
+  });
+
+  // PCO-371 fix pass, IMPORTANT: "exists on disk" is not "ships". The file was UNTRACKED when it
+  // was first written, so the two tests above — which read it off the working tree — were green
+  // whether or not it was ever committed, and the change under review would have landed without
+  // it. `--error-unmatch` asks the INDEX, which is the only thing that travels.
+  test(".drawbar/tmp/.gitignore is tracked by git, not merely present in the working tree", () => {
+    const res = Bun.spawnSync(["git", "ls-files", "--error-unmatch", ".drawbar/tmp/.gitignore"], { cwd: root });
+    expect(res.exitCode, ".drawbar/tmp/.gitignore is not tracked — it would not ship with the plugin").toBe(0);
+    // The sibling it mirrors, asserted alongside so a passing run proves the check can distinguish
+    // the two states rather than that `ls-files` happens to succeed for everything.
+    expect(Bun.spawnSync(["git", "ls-files", "--error-unmatch", ".drawbar/runs/.gitignore"], { cwd: root }).exitCode).toBe(0);
+    expect(
+      Bun.spawnSync(["git", "ls-files", "--error-unmatch", ".drawbar/tmp/ship/body"], { cwd: root }).exitCode,
+      "a §4 input is tracked — the ignore file is not doing its job",
+    ).not.toBe(0);
   });
 
   // PCO-348 (S3): the committed example config must be structurally acceptable to
@@ -1775,6 +1814,16 @@ describe("PCO-370 R3b: §4's executable stacked-PR fence", () => {
     return fences[0]!;
   }
 
+  // The ONE ```json block in §4 — the inputs document the agent fills in and writes with the
+  // Write tool. Raw, so a pin on it is a pin on the literal text the agent reads. It is data, not
+  // shell: nothing about it is ever parsed by a shell, which is the whole point of PCO-371.
+  function inputsTemplate(): string {
+    const blocks = [...rawSection("## 4.", "## 5.").matchAll(/```json\n([\s\S]*?)```/g)].map((m) => m[1]!);
+    expect(blocks.length, "§4 must carry exactly one ```json inputs template").toBe(1);
+    expect(blocks[0]!.length, "§4's inputs template is suspiciously short — did it get gutted?").toBeGreaterThan(80);
+    return blocks[0]!;
+  }
+
   // The fence with COMMENT lines removed. Every "must NOT contain" assertion runs against
   // this: §4's comments legitimately name the forbidden constructs in order to forbid them
   // (`never `jq '.resolved_config' "$STATE"``), so an absence check over the raw text would be
@@ -1827,23 +1876,30 @@ describe("PCO-370 R3b: §4's executable stacked-PR fence", () => {
     return f.slice(start, end);
   }
 
-  // The CONTENT of one quoted heredoc in §4's fence — i.e. the instruction the agent actually
-  // fills in. This text is not a comment, so `code()` keeps it, but nothing pinned it: the
-  // `## Unresolved findings` rendering rule could be rewritten to emit `file:line` and the whole
-  // suite stayed green, because the only pin on that rule lived in §4's PROSE (MUST-CHECK
-  // prose-pins-dont-cover-the-bash-fence-they-describe, applied to a heredoc rather than a
-  // command line).
-  function heredocBody(sentinel: string): string {
-    const f = fence();
-    const opener = `<<'${sentinel}'\n`;
-    const open = f.indexOf(opener);
-    expect(open, `heredoc ${sentinel} is not opened in quoted form`).toBeGreaterThan(-1);
-    const start = open + opener.length;
-    const end = f.indexOf(`\n${sentinel}\n`, start);
-    expect(end, `heredoc ${sentinel} is never terminated`).toBeGreaterThan(start);
-    const body = f.slice(start, end);
-    expect(body.length, `heredoc ${sentinel} is suspiciously empty`).toBeGreaterThan(30);
-    return body;
+  // §4's prose, split into logical units — the module-level `docUnits`/`docSection` pair the
+  // PCO-374 describe uses, reached from here so both sites read ONE representation of the doc.
+  //
+  // This replaces `heredocBody()`, which returned the CONTENT of a quoted heredoc in the fence —
+  // i.e. the instruction the agent filled in. PCO-371 deleted every one of those heredocs, so the
+  // instructions moved into §4's prose: the four write targets as a list, and the inputs document
+  // as a ```json block. The pin discipline is unchanged and the reason for it is unchanged — the
+  // `## Unresolved findings` rendering rule could be rewritten to emit `file:line` with §4's
+  // descriptive PARAGRAPH about it still green, so the thing the agent actually renders from is
+  // what gets pinned (MUST-CHECK prose-pins-dont-cover-the-bash-fence-they-describe, applied to an
+  // instruction rather than a command line).
+  function proseUnits(): string[] {
+    const units = docUnits(docSection(SHIP, "## 4. Open the stacked PR"));
+    expect(units.length, "§4's prose did not split into units — the extractor is broken").toBeGreaterThan(8);
+    return units;
+  }
+
+  // Exactly one prose unit starting with `prefix`, returned verbatim. Same "exactly one" reasoning
+  // as `oneLine`: a second write instruction for the same file would silently contradict the
+  // pinned one.
+  function oneUnit(prefix: string, label: string): string {
+    const hits = proseUnits().filter((u) => u.startsWith(prefix));
+    expect(hits.length, `${label}: expected exactly one §4 prose unit starting with ${JSON.stringify(prefix)}, found ${hits.length}`).toBe(1);
+    return hits[0]!;
   }
 
   async function runScript(script: string, env: Record<string, string> = {}): Promise<{ exitCode: number; output: string }> {
@@ -1855,6 +1911,31 @@ describe("PCO-370 R3b: §4's executable stacked-PR fence", () => {
     const out = await new Response(proc.stdout).text();
     const err = await new Response(proc.stderr).text();
     return { exitCode: await proc.exited, output: out + err };
+  }
+
+  // --- §4's inputs directory, for real ---------------------------------------------------------
+  // PCO-371's fix pass made both gates `$PWD`-relative: the directory gate compares
+  // `readlink -f "$IN_DIR"` against `$PWD_REAL/.drawbar/tmp/ship`. A harness that set
+  // `IN_DIR=<some mkdtemp>` would therefore be refused before reaching anything it meant to test,
+  // and every "…was accepted" assertion below it would pass vacuously. So the fixtures build the
+  // real tree and `cd` into it, and the shipped `IN_DIR=` line is used verbatim.
+  const INPUT_LEAVES = ["inputs.json", "branch", "title", "body"] as const;
+  function shipTree(): { cwd: string; dir: string } {
+    const cwd = mkdtempSync(join(tmpdir(), "drawbar-cwd-"));
+    const dir = join(cwd, ".drawbar", "tmp", "ship");
+    mkdirSync(dir, { recursive: true });
+    for (const leaf of INPUT_LEAVES) writeFileSync(join(dir, leaf), "x\n");
+    return { cwd, dir };
+  }
+  function gateScript(cwd: string, tail: string[]): string {
+    const dirGate = markedBlock("# --- inputs directory gate", "# --- end inputs directory gate");
+    return [`cd '${cwd}'`, oneLine(code(), "IN_DIR=", "§4's inputs directory"), dirGate, ...tail].join("\n");
+  }
+  function gitInit(cwd: string): void {
+    expect(
+      Bun.spawnSync(["git", "init", "-q"], { cwd }).exitCode,
+      "could not init a repository — the tracked-input case would be vacuous",
+    ).toBe(0);
   }
 
   // Carries an arbitrary literal into a bash variable without this test file itself becoming
@@ -1930,10 +2011,13 @@ describe("PCO-370 R3b: §4's executable stacked-PR fence", () => {
     expect(oneLine(f, "CONFIG_REAL=", "§4's config path resolution")).toBe(
       `CONFIG_REAL=$(readlink -f "$CONFIG") || { echo "FATAL: cannot resolve $CONFIG to a real path — refusing."; exit 1; }`,
     );
-    // …and it runs BEFORE the guard that consumes it.
-    expect(f.indexOf("CONFIG_REAL=")).toBeLessThan(f.indexOf("ls-files --error-unmatch"));
     // The tracked-config refusal spans three lines (continuation, refusal, `|| true`).
     const trackedPrefix = 'git -C "$(dirname "$CONFIG_REAL")" ls-files --error-unmatch';
+    // …and the resolution runs BEFORE the guard that consumes it. Anchored on the CONFIG guard's
+    // own line rather than on a bare `ls-files --error-unmatch`: PCO-371's fix pass added a second
+    // tracked-file refusal (the four §4 inputs) that sits ABOVE this one, and a substring search
+    // would find that one and compare the ordering of two unrelated guards.
+    expect(f.indexOf("CONFIG_REAL=")).toBeLessThan(f.indexOf(trackedPrefix));
     function trackedGuard(block: string, label: string): string {
       const lines = block.split("\n");
       const start = lines.findIndex((l) => l.startsWith(trackedPrefix));
@@ -2045,10 +2129,10 @@ describe("PCO-370 R3b: §4's executable stacked-PR fence", () => {
     expect(output).toContain("REPO is empty or null");
   });
 
-  test("CRITICAL 3: the inputs assert loop covers every value read out of the inputs heredoc", () => {
+  test("CRITICAL 3: the inputs assert loop covers every value read out of the inputs document", () => {
     const c = code();
     const read = [...c.matchAll(/^([A-Z][A-Z0-9_]*)=\$\(jq -[rc] .*"\$INPUTS"\)$/gm)].map((m) => m[1]!);
-    expect(read.length, "no values read out of the inputs heredoc").toBeGreaterThan(3);
+    expect(read.length, "no values read out of the inputs document").toBeGreaterThan(3);
     const loop = c.match(/^for v in ([A-Z0-9_ ]+); do$/m);
     expect(loop, "the inputs assert loop is missing").not.toBeNull();
     expect([...loop![1]!.trim().split(/\s+/)].sort()).toEqual([...read].sort());
@@ -2082,9 +2166,10 @@ describe("PCO-370 R3b: §4's executable stacked-PR fence", () => {
     expect(c).toContain(
       `LINEAR_FACTS_JSON=$(jq -c 'if (.teams|type)=="array" then {teams:.teams} else empty end' "$INPUTS")`,
     );
-    // …and the heredoc that supplies them says so, so the agent filling it in cannot satisfy the
-    // placeholder with a quoted string and be refused only at runtime.
-    expect(heredocBody("DRAWBAR_INPUTS_SENTINEL")).toContain(
+    // …and the inputs-document template the agent fills in says so, so it cannot satisfy the
+    // placeholder with a quoted string and be refused only at runtime. Pinned on the template, not
+    // on the paragraph beside it.
+    expect(inputsTemplate()).toContain(
       '"flagged": <the report `status`: flagged -> true, ok -> false; a JSON boolean, never a string>',
     );
   });
@@ -2092,11 +2177,11 @@ describe("PCO-370 R3b: §4's executable stacked-PR fence", () => {
   // The inputs heredoc is parsed by `jq` before ANY value is read out of it, so a heredoc the
   // agent filled in wrongly halts at one guard instead of yielding five empty reads. Deleting
   // this line, or downgrading its refusal to a warning, both survived before this pin.
-  test("CRITICAL 3: the inputs heredoc is proved to be valid JSON before any value is read out of it", () => {
+  test("CRITICAL 3: the inputs document is proved to be valid JSON before any value is read out of it", () => {
     const c = code();
     const line = oneLine(c, "jq -e . ", "§4's inputs-JSON validity gate");
     expect(line).toBe(
-      `jq -e . "$INPUTS" >/dev/null 2>&1 || { echo "FATAL: the inputs heredoc is not valid JSON — refusing."; exit 1; }`,
+      `jq -e . "$INPUTS" >/dev/null 2>&1 || { echo "FATAL: the inputs document is not valid JSON — refusing."; exit 1; }`,
     );
     expect(c.indexOf(line), "the validity gate must precede the first read out of $INPUTS").toBeLessThan(
       c.indexOf(`ARG=$(jq -r '.arg // empty' "$INPUTS")`),
@@ -2117,36 +2202,82 @@ describe("PCO-370 R3b: §4's executable stacked-PR fence", () => {
     expect(c).not.toMatch(/--title "\$[A-Z]/);
   });
 
-  test("CRITICAL 2: every agent-substituted value arrives through a QUOTED heredoc with a unique sentinel", () => {
+  // --- CRITICAL 2, re-derived for PCO-371 -----------------------------------------------------
+  //
+  // R3b routed all four agent-substituted values through QUOTED heredocs and pinned that shape:
+  // four sentinel pins, a quoted-form-only assertion, and a prose pin on an instruction telling
+  // the agent to check each value for a line equal to the terminator and halt. The shape was
+  // unsound. A quoted heredoc neutralises `"`, `$(...)` and backticks but still ends at the first
+  // line EQUAL TO ITS TERMINATOR, the terminators were fixed literals published in this public
+  // repository, and the value an attacker needed was therefore not secret: a report line reading
+  // exactly the terminator closed the heredoc and every line after it was parsed as shell —
+  // arbitrary command execution under the operator's authenticated `gh`, with the written file
+  // left looking entirely correct. The halt instruction was the only thing standing in front of
+  // that, and a pin on an instruction proves it is present, never that it was obeyed.
+  //
+  // PCO-371 removes the shell from the path entirely: the agent WRITES the four values as files
+  // with the Write tool and the fence only ever reads files it did not author. The pins below are
+  // the R3b set re-derived against that shape — each one asks what the retired pin protected and
+  // states the same property structurally:
+  //
+  //   R3b pin                                  property                    re-derived as
+  //   four `<<'SENTINEL'` openers          ->  untrusted text is not    -> the fence carries NO
+  //   `not.toContain("<<SENTINEL")`            parsed by the shell         heredoc and no fill-in
+  //   `not.toContain('<<"SENTINEL"')`                                      slot AT ALL
+  //   `branch` absent from the inputs      ->  no untrusted value in    -> the inputs document is a
+  //   heredoc body                             a hand-assembled JSON       ```json file the agent
+  //                                            document                    writes; the fence never
+  //                                                                        builds or writes it
+  //   `IN_DIR=$(mktemp -d)`                ->  the four `cat >` writes  -> the fence writes NONE of
+  //                                            cannot be aimed at a       the four; each is gated
+  //                                            pre-planted symlink        regular-file + non-symlink
+  //                                                                        under a non-world-writable
+  //                                                                        directory, and an EXIT
+  //                                                                        trap removes all four
+  //   terminator-halt prose                ->  (interim mitigation)     -> RETIRED; the vector is
+  //                                                                        structurally gone, and the
+  //                                                                        doc says why, so the
+  //                                                                        heredocs cannot come back
+  test("CRITICAL 2: the fence carries no heredoc, no here-string, and no fill-in slot at all", () => {
     const c = code();
-    const sentinels = [
+    // `<<` covers `<<TERM`, `<<'TERM'`, `<<"TERM"`, `<<-TERM` and the `<<<` here-string in one
+    // assertion, rather than a list of spellings the next one evades.
+    expect(c, "a heredoc or here-string is back in §4's fence").not.toContain("<<");
+    // And nothing weaker either. `<` cannot appear in the executable body at all: not as a
+    // redirection IN (which would read a file this block did not choose), and not as the `<...>`
+    // placeholder that marks a slot the agent fills in. Every retired heredoc opened with one and
+    // every retired heredoc BODY was made of them, so this single character is the load-bearing
+    // one — an agent-substituted value has nowhere to land without it. §4's comments explain the
+    // retired constructs by name and are stripped by `code()` before this runs.
+    expect(c, "§4's fence carries a `<` — a redirection in, or an agent fill-in slot").not.toContain("<");
+    // The four retired sentinels are gone from the WHOLE doc, comments included: a fence comment
+    // still naming one is the first step of putting it back.
+    for (const s of [
       "DRAWBAR_INPUTS_SENTINEL",
       "DRAWBAR_BRANCH_SENTINEL",
       "DRAWBAR_PR_TITLE_SENTINEL",
       "DRAWBAR_PR_BODY_SENTINEL",
-    ];
-    expect(new Set(sentinels).size, "sentinels must be distinct").toBe(sentinels.length);
-    for (const s of sentinels) {
-      // Quoted form only — `<<SENTINEL` and `<<"SENTINEL"` both EXPAND, which is the whole bug.
-      expect(c, `${s} must be opened as a quoted heredoc`).toContain(`<<'${s}'`);
-      expect(c).not.toContain(`<<${s}`);
-      expect(c).not.toContain(`<<"${s}"`);
-      // Exactly two occurrences: the opener and the terminator. A third means the sentinel is
-      // no longer unique to its own block.
-      expect(c.split(s).length - 1, `${s} must occur exactly twice (open + terminate)`).toBe(2);
+    ]) {
+      expect(shipDoc(), `retired sentinel ${s} is back in the runbook`).not.toContain(s);
     }
-    expect(c).toMatch(/^cat > "\$INPUTS" <<'DRAWBAR_INPUTS_SENTINEL'$/m);
-    expect(c).toMatch(/^cat > "\$BRANCH_FILE" <<'DRAWBAR_BRANCH_SENTINEL'$/m);
-    expect(c).toMatch(/^cat > "\$PR_TITLE_FILE" <<'DRAWBAR_PR_TITLE_SENTINEL'$/m);
-    expect(c).toMatch(/^cat > "\$PR_BODY_FILE" <<'DRAWBAR_PR_BODY_SENTINEL'$/m);
-    // Every one of those files lives under the `mktemp -d` directory, pinned as its own literal
-    // line: a fixed, world-guessable path lets a local user pre-plant a symlink at it, and each
-    // `cat >` redirect FOLLOWS symlinks — truncating an arbitrary file the operator can write, and
-    // substituting the very body the fence then hands to `gh --body-file`. Only the `||` guard's
-    // shape was pinned before, so swapping `mktemp -d` for `/tmp/<fixed>` survived.
-    expect(oneLine(c, "IN_DIR=", "§4's temp-dir creation")).toBe(
-      'IN_DIR=$(mktemp -d) || { echo "FATAL: mktemp -d failed — refusing."; exit 1; }',
-    );
+  });
+
+  // The whole fence, parsed by bash. Only possible BECAUSE §4 no longer carries a fill-in slot:
+  // with the heredocs gone there is no `<...>` placeholder left, so what the doc ships is what the
+  // operator's shell runs, and a syntax error in it — an unbalanced quote in the cleanup trap, a
+  // `case` missing its `esac` — is now catchable here instead of at 3am with a PR half-opened.
+  test("CRITICAL 2: §4's fence is complete, substitution-free bash — it parses as-is", async () => {
+    const path = join(mkdtempSync(join(tmpdir(), "drawbar-parse-")), "section4.sh");
+    writeFileSync(path, fence());
+    const proc = Bun.spawn(["bash", "-n", path], { stdout: "pipe", stderr: "pipe" });
+    const err = await new Response(proc.stderr).text();
+    expect(await proc.exited, `§4's fence does not parse as bash:\n${err}`).toBe(0);
+  });
+
+  test("CRITICAL 2: the four inputs are files the agent WRITES; the fence only ever reads them", () => {
+    const c = code();
+    // The four paths, each pinned as its own literal line, under one deterministic directory.
+    expect(oneLine(c, "IN_DIR=", "§4's inputs directory")).toBe('IN_DIR="$PWD/.drawbar/tmp/ship"');
     for (const [name, leaf] of [
       ["INPUTS", "inputs.json"],
       ["BRANCH_FILE", "branch"],
@@ -2155,78 +2286,375 @@ describe("PCO-370 R3b: §4's executable stacked-PR fence", () => {
     ] as [string, string][]) {
       expect(oneLine(c, `${name}=`, `§4's ${name} path`)).toBe(`${name}="\${IN_DIR}/${leaf}"`);
     }
-    // Nothing is assigned by interpolating a placeholder: no `<...>` on the right of an `=`.
-    for (const line of c.split("\n")) {
-      expect(line, `placeholder interpolated into an assignment: ${line}`).not.toMatch(/^[A-Z][A-Z0-9_]*=["']?</);
+    // `mktemp -d` is retired and must not come back — the agent has to know where to write before
+    // this block runs, so the path is deterministic. What `mktemp` bought (an unguessable
+    // directory no local user can pre-plant a symlink into) is re-derived two ways: the directory
+    // is under the operator's own working tree rather than a world-writable temp directory, and
+    // the fence writes nothing there at all. A `/tmp/…`-style path would give both away.
+    expect(c).not.toContain("mktemp");
+    expect(c, "§4's inputs directory is back in a world-writable temp directory").not.toMatch(/(^|[^.\w])\/tmp\//);
+    expect(c).not.toMatch(/\$\{?TMPDIR/);
+    // NOTHING in the fence writes to any of the four. This is the assertion that fails if the
+    // inputs document is hand-assembled again — `cat > "$INPUTS" <<…`, `printf … > "$INPUTS"`,
+    // `jq -n … > "$INPUTS"`, `echo "{\"arg\":\"$X\"}" > "$INPUTS"` and `tee "$INPUTS"` all land
+    // here — and the reason the deterministic path is safe.
+    for (const name of ["INPUTS", "BRANCH_FILE", "PR_TITLE_FILE", "PR_BODY_FILE"]) {
+      expect(c, `§4's fence writes to $${name} — the agent is the only author of these files`).not.toMatch(
+        new RegExp(`>\\s*"?\\$\\{?${name}\\b`),
+      );
+      expect(c).not.toMatch(new RegExp(`\\btee\\b[^\\n]*\\$\\{?${name}\\b`));
+    }
+    // Per-variable containment, in the shape the verdict-JSON pin below uses: every reference to
+    // each of the four paths, anywhere in the executable body, is either its own assignment, the
+    // cleanup trap, the existence gate, or ONE named read. Nothing else may touch them, so
+    // "read the branch from somewhere other than $BRANCH_FILE" cannot be added quietly.
+    const ALLOWED: Record<string, RegExp[]> = {
+      INPUTS: [
+        /^INPUTS="\$\{IN_DIR\}\/inputs\.json"$/,
+        /^jq -e \. "\$INPUTS" >\/dev\/null 2>&1 \|\|/,
+        /^[A-Z][A-Z0-9_]*=\$\(jq -[rc] '[^']*' "\$INPUTS"\)$/,
+      ],
+      BRANCH_FILE: [/^BRANCH_FILE="\$\{IN_DIR\}\/branch"$/, /^BRANCH=\$\(cat "\$BRANCH_FILE"\)$/],
+      PR_TITLE_FILE: [/^PR_TITLE_FILE="\$\{IN_DIR\}\/title"$/, /--title "\$\(cat "\$PR_TITLE_FILE"\)"/],
+      PR_BODY_FILE: [/^PR_BODY_FILE="\$\{IN_DIR\}\/body"$/, /--body-file "\$PR_BODY_FILE"/],
+    };
+    const trapLine = oneLine(c, "trap ", "§4's inputs cleanup trap");
+    const gate = markedBlock("# --- inputs file gate", "# --- end inputs file gate");
+    for (const [name, allowed] of Object.entries(ALLOWED)) {
+      let sites = 0;
+      for (const line of c.split("\n")) {
+        if (!line.includes(name)) continue;
+        if (line === trapLine || gate.includes(line)) continue;
+        sites++;
+        expect(
+          allowed.some((re) => re.test(line)),
+          `$${name} reaches something other than its assignment, the trap, the gate, or its one named read: ${line}`,
+        ).toBe(true);
+      }
+      expect(sites, `no references to $${name} found — the scan is broken`).toBeGreaterThan(1);
     }
   });
 
-  // CRITICAL: a quoted heredoc stops at the first line EQUAL TO ITS TERMINATOR, and the three
-  // terminators are fixed literals published in this public repository. A report line reading
-  // exactly `DRAWBAR_PR_BODY_SENTINEL` therefore closes the heredoc and everything after it is
-  // parsed as shell — arbitrary command execution in an unattended session holding an
-  // authenticated `gh`, with the written file left looking correct. §4's safety argument used to
-  // be stated unconditionally ("inside a QUOTED heredoc nothing expands and no command runs"),
-  // and nothing anywhere required the substituted value to be free of the terminator. A check
-  // inside the fence is not a fix: by the time it runs, the injected commands have already run —
-  // so the requirement is a HALT the agent performs before substituting, pinned here as one
-  // contiguous phrase, and the fence's own comment must not restate the claim unconditionally.
-  test("CRITICAL 2: §4 halts on a substituted value that contains a line equal to a heredoc terminator", () => {
-    const flat = section("## 4.", "## 5.");
-    expect(flat).toContain(
-      "**Before you substitute anything, check every value for a line equal to the terminator " +
-        "you are pasting it under, and halt the run if you find one** — park the story with that " +
-        "as the reason, and never rewrite, escape, or truncate the value to make it fit.",
+  // The instruction the agent follows. R3b put it inside the heredocs themselves; with those gone
+  // it is §4's prose list, and it is pinned there for the same reason IMPORTANT 9 gives — a rule
+  // that lives only in a descriptive paragraph gets rewritten with the paragraph still green.
+  // Pinned as whole logical UNITS with `toBe`, so a clause appended to one fails as a deletion
+  // does, and §4's prose region is separately closed with `toEqual` in the PCO-374 describe.
+  test("CRITICAL 2: §4 tells the agent to WRITE all four inputs, and names all four paths", () => {
+    const units = proseUnits();
+    const lead = oneUnit("**Every value that came out of the repository under review", "§4's write-the-inputs rule");
+    expect(lead).toContain("reaches the fence as a FILE you write, never as text substituted into the fence.**");
+    expect(lead).toContain("**Write all four with the Write tool before you run the fence**");
+    for (const [leaf, tail] of [
+      ["inputs.json", "the inputs document below, filled in."],
+      ["branch", "the story-lead report's `branch` field, verbatim, one line and nothing else."],
+      ["title", "the PR title, one line and nothing else."],
+    ] as [string, string][]) {
+      expect(oneUnit(`- \`<cwd>/.drawbar/tmp/ship/${leaf}\``, `§4's ${leaf} write instruction`)).toBe(
+        `- \`<cwd>/.drawbar/tmp/ship/${leaf}\` — ${tail}`,
+      );
+    }
+    expect(oneUnit("- `<cwd>/.drawbar/tmp/ship/body`", "§4's body write instruction")).toBe(SH4_BODY_FILE_UNIT);
+    // …and the four paths the prose names are the four the fence reads. Derived from the fence's
+    // own lines rather than transcribed, so prose and code cannot drift apart.
+    const c = code();
+    for (const leaf of ["inputs.json", "branch", "title", "body"]) {
+      expect(c, `the fence does not read \${IN_DIR}/${leaf}`).toContain(`"\${IN_DIR}/${leaf}"`);
+    }
+    // The fence's own half of the claim, so the executable block is not read as promising
+    // something its comments alone assert.
+    expect(units.some((u) => u.startsWith("**The fence authors none of those four files"))).toBe(true);
+    expect(oneUnit("**The fence authors none of those four files", "§4's no-substitution claim")).toContain(
+      "It carries no fill-in slot at all: every value it consumes it reads back out of a file it " +
+        "did not write, with `jq -r`, `cat` or `--body-file`, so no text from the repository " +
+        "under review is ever parsed by a shell.",
     );
-    expect(flat).toContain(
-      "A quoted heredoc protects the value's `\"`, `$` and backticks, but it still ends at the " +
-        "first line equal to its terminator, and these terminators are fixed literals published " +
-        "in this repository",
-    );
-    expect(flat).toContain(
-      "A check inside the fence cannot save you here: by the time any line of it runs, the " +
-        "injected commands have already run.",
-    );
-    // The fence's own comment carries the same qualification, so the executable block cannot be
-    // read as promising unconditional safety on its own.
-    expect(fence().replace(/\s+/g, " ")).toContain(
-      "The one thing a quoted heredoc does # NOT protect against is a substituted line equal " +
-        "to the terminator itself — that closes the # heredoc and the rest is parsed as shell, so " +
-        "the halt instruction above this fence is part of # the guarantee, not an aside, and no " +
-        "check placed here could replace it.",
+    // PCO-371 fix pass, IMPORTANT: `<cwd>` used to be described as "the same `$PWD` Preflight
+    // resolves `$CONFIG` against" — which §6's own fence comment contradicts ("this fence's $PWD
+    // need not be Preflight's") — while `pwd` appeared nowhere in the runbook, so the agent had to
+    // GUESS an absolute path for the Write tool and every unattended run halted if it guessed
+    // wrong. Preflight prints it now, and the prose names that print as the source.
+    expect(lead).toContain("`<cwd>` is the absolute path Preflight printed as `SHIP_CWD:`, never a path you infer");
+    // …and the freshness limit the fence comment states is repeated in the instruction the agent
+    // actually follows, because the gate cannot enforce it.
+    expect(lead).toContain(
+      "**Rewrite all four every time**: the fence deletes them on every path it reaches, but a " +
+        "run that dies before it leaves them on disk, and no gate can tell a stale input from a fresh one.",
     );
   });
 
-  // CRITICAL: JSON KEY injection. `branch` used to be pasted between two `"` inside the
+  // PCO-371 fix pass. Two findings meet here. (1) The agent must know an ABSOLUTE path before §4's
+  // fence runs and no shell state crosses two Bash tool calls, so Preflight prints it rather than
+  // leaving it to be inferred. (2) The four inputs now live inside a git working tree that
+  // `drawbar-story-lead` stages with `git add -A`, so a run that dies between the Write calls and
+  // §4 leaves a PR body — carrying issue ids and team prefixes — stageable into the NEXT story's
+  // commit and pushed to a public PR. The ignore file must therefore exist in whatever repository
+  // the operator runs from, created BEFORE anything is written there: §4 is too late, because §4
+  // is exactly what a killed run never reaches.
+  test("CRITICAL 2: Preflight creates §4's inputs directory with its ignore file, and prints the path", async () => {
+    const pf = preflightFence();
+    const mk = oneLine(pf, "mkdir -p ", "Preflight's inputs-directory creation");
+    const ign = oneLine(pf, "printf '%s\\n' '*' '!.gitignore'", "Preflight's inputs-directory ignore file");
+    const say = oneLine(pf, 'echo "SHIP_CWD:', "Preflight's cwd announcement");
+    expect(mk).toBe(
+      `mkdir -p "$PWD/.drawbar/tmp/" || { echo "FATAL: cannot create $PWD/.drawbar/tmp/ — refusing."; exit 1; }`,
+    );
+    expect(ign).toBe(
+      `printf '%s\\n' '*' '!.gitignore' > "$PWD/.drawbar/tmp/.gitignore" || ` +
+        `{ echo "FATAL: cannot write $PWD/.drawbar/tmp/.gitignore — refusing."; exit 1; }`,
+    );
+    // The path the agent is told to Write under, printed from `$PWD` and not from anything the
+    // repository under review can influence.
+    expect(say).toBe('echo "SHIP_CWD: $PWD"');
+    const lines = pf.split("\n");
+    expect(lines.indexOf(mk), "the ignore file is written before its directory exists").toBeLessThan(lines.indexOf(ign));
+    // Executed, against real git rather than by reading the pattern: what Preflight WRITES must
+    // actually ignore all four inputs, and must not ignore itself.
+    const cwd = mkdtempSync(join(tmpdir(), "drawbar-pf-"));
+    gitInit(cwd);
+    const { exitCode, output } = await runScript([`cd '${cwd}'`, mk, ign, say].join("\n"));
+    expect(exitCode, `Preflight's scaffolding did not run: ${output}`).toBe(0);
+    expect(output.trim(), "SHIP_CWD did not print the working directory").toBe(`SHIP_CWD: ${realpathSync(cwd)}`);
+    for (const leaf of INPUT_LEAVES) {
+      expect(
+        Bun.spawnSync(["git", "check-ignore", "-q", `.drawbar/tmp/ship/${leaf}`], { cwd }).exitCode,
+        `${leaf} is not ignored by the file Preflight writes — a killed run leaves it stageable`,
+      ).toBe(0);
+    }
+    expect(
+      Bun.spawnSync(["git", "check-ignore", "-q", ".drawbar/tmp/.gitignore"], { cwd }).exitCode,
+      "the ignore file Preflight writes ignores itself",
+    ).not.toBe(0);
+  });
+
+  // The retirement itself, pinned so it cannot be quietly undone. The interim mitigation was
+  // R3b's terminator-halt instruction; it is deleted here because the terminators are gone, and
+  // §4 has to say WHY, or the next editor re-adds the heredocs as a tidy-up.
+  test("CRITICAL 2: the interim terminator-halt mitigation is retired, and §4 says why the heredocs stay gone", () => {
+    const flat = section("## 4.", "## 5.");
+    // The retired instruction, in the shape R3b pinned it. Its presence now would mean the
+    // heredocs are back — nothing else in §4 has a terminator to collide with.
+    expect(flat, "R3b's interim terminator-halt mitigation is back").not.toContain(
+      "**Before you substitute anything, check every value for a line equal to the terminator " +
+        "you are pasting it under, and halt the run if you find one**",
+    );
+    expect(flat, "R3b's quoted-heredoc rule is back").not.toContain(
+      "**Every value you substitute goes into a quoted heredoc, never into an assignment.**",
+    );
+    // And the replacement: one whole unit, so a softening rephrase fails exactly as a deletion
+    // does. It carries the vector, the reason the mitigation was never sufficient, and the ban.
+    expect(oneUnit("**The four quoted heredocs this step used to carry are retired", "§4's retirement note")).toBe(
+      SH4_HEREDOCS_RETIRED_UNIT,
+    );
+  });
+
+  // Executed. The gate is what makes a deterministic, reusable path safe: it refuses unless all
+  // four inputs are there as regular files, so a story whose inputs were not all rewritten is
+  // refused instead of silently inheriting the PREVIOUS story's branch, title or body — and it
+  // refuses a symlink, so a pre-planted one cannot redirect the read.
+  test("CRITICAL 2: the shipped inputs-file gate refuses a missing input and a symlinked one (run for real)", async () => {
+    const gate = markedBlock("# --- inputs file gate", "# --- end inputs file gate");
+    const paths = ["INPUTS", "BRANCH_FILE", "PR_TITLE_FILE", "PR_BODY_FILE"].map((n) =>
+      oneLine(code(), `${n}=`, `§4's ${n} path`),
+    );
+    async function runGate(prepare: (dir: string, cwd: string) => void): Promise<number> {
+      const { cwd, dir } = shipTree();
+      prepare(dir, cwd);
+      const { exitCode } = await runScript(gateScript(cwd, [...paths, gate, "echo GATE_OK"]));
+      return exitCode;
+    }
+    // All four present as regular files — the accept path, so the refusals below are not vacuous.
+    expect(await runGate(() => {})).toBe(0);
+    for (const leaf of INPUT_LEAVES) {
+      expect(await runGate((dir) => rmSync(join(dir, leaf))), `a missing ${leaf} was accepted`).not.toBe(0);
+      // The symlink TARGET is a real regular file, so `-f` alone is satisfied and only the
+      // `! -L` conjunct can refuse. A dangling symlink would fail `-f` too and prove nothing —
+      // dropping `! -L` would survive that (MUST-CHECK vacuous-assertion-needs-preseed-state).
+      expect(
+        await runGate((dir) => {
+          writeFileSync(join(dir, "decoy"), "planted\n");
+          rmSync(join(dir, leaf));
+          symlinkSync(join(dir, "decoy"), join(dir, leaf));
+        }),
+        `a symlinked ${leaf} was accepted`,
+      ).not.toBe(0);
+      // PCO-371 fix pass, CRITICAL: a ZERO-BYTE input passed every conjunct of the original gate.
+      // An empty `body` opens a PR with no review-provenance line and no `## Unresolved findings`
+      // section at all, on the unattended path, with `PR_OPENED:` still printed and the stack
+      // entry still recorded — the disclosure IMPORTANT 9 and PCO-375 exist to guarantee gone
+      // silently. Asserted per input, so `-s` on `body` alone is not enough.
+      expect(await runGate((dir) => writeFileSync(join(dir, leaf), "")), `an empty ${leaf} was accepted`).not.toBe(0);
+      // PCO-371 fix pass, IMPORTANT: file-NESS is not provenance. A branch under review can COMMIT
+      // four ordinary regular files at these names; they satisfy `-f`, `-s` and `! -L` on the very
+      // first run, before any EXIT trap has ever fired, and the fence would then consume
+      // attacker-authored `arg`/`story`/`teams` — which name the state file, pick the base, and
+      // reach `ship-config.ts validate` on stdin. Refused exactly as a tracked `$CONFIG` is.
+      expect(
+        await runGate((dir, cwd) => {
+          gitInit(cwd);
+          expect(
+            Bun.spawnSync(["git", "add", "-f", join(dir, leaf)], { cwd }).exitCode,
+            `could not stage ${leaf} — the tracked-input case would be vacuous`,
+          ).toBe(0);
+        }),
+        `a git-tracked ${leaf} was accepted`,
+      ).not.toBe(0);
+    }
+    // A directory in place of a file is refused too — `-f` is doing that work, not `-e`.
+    expect(
+      await runGate((dir) => {
+        rmSync(join(dir, "body"));
+        mkdirSync(join(dir, "body"));
+      }),
+    ).not.toBe(0);
+    // …and the untracked accept path is re-proved INSIDE a real repository, so the tracked
+    // refusals above are the tracking and not merely the presence of a `.git` directory.
+    expect(await runGate((_dir, cwd) => gitInit(cwd)), "an untracked input inside a repo was refused").toBe(0);
+  });
+
+  // Executed. PCO-371 fix pass, CRITICAL: `-L` on the four LEAF paths cannot see a symlink on an
+  // intermediate component. `IN_DIR` is entirely predictable, so a branch under review can commit
+  // `.drawbar/tmp/ship` as a DIRECTORY SYMLINK (git stores mode 120000 and it survives checkout),
+  // and both the agent's Write step and the EXIT trap's `rm -f` follow it: four fixed-name files
+  // truncated, then unlinked, at any absolute path, under the operator's identity, every run.
+  test("CRITICAL 2: the shipped directory gate refuses a symlinked path component, before the trap is armed", async () => {
+    const dirGate = markedBlock("# --- inputs directory gate", "# --- end inputs directory gate");
+    const c = code();
+    const paths = ["INPUTS", "BRANCH_FILE", "PR_TITLE_FILE", "PR_BODY_FILE"].map((n) =>
+      oneLine(c, `${n}=`, `§4's ${n} path`),
+    );
+    const trapLine = oneLine(c, "trap ", "§4's inputs cleanup trap");
+    const gate = markedBlock("# --- inputs file gate", "# --- end inputs file gate");
+    // The whole prelude, in shipped order: directory gate, paths, trap, file gate.
+    const tail = [...paths, trapLine, gate, "echo GATE_OK"];
+    // Accept path: a real directory, so every refusal below is not vacuous.
+    {
+      const { cwd } = shipTree();
+      expect((await runScript(gateScript(cwd, tail))).exitCode, "a genuine inputs directory was refused").toBe(0);
+    }
+    // Refusal path: `ship` is a symlink to a directory of the attacker's choosing, holding four
+    // real regular files. Every conjunct of the FILE gate is satisfied — only the directory gate
+    // can refuse this — and the victim's files must still be there afterwards, which is what
+    // proves the gate runs before the trap that would have swept them.
+    {
+      const { cwd, dir } = shipTree();
+      const victim = join(cwd, "victim");
+      mkdirSync(victim);
+      for (const leaf of INPUT_LEAVES) writeFileSync(join(victim, leaf), "operator's own file\n");
+      rmSync(dir, { recursive: true });
+      symlinkSync(victim, dir);
+      const { exitCode } = await runScript(gateScript(cwd, tail));
+      expect(exitCode, "a symlinked inputs DIRECTORY was accepted").not.toBe(0);
+      for (const leaf of INPUT_LEAVES) {
+        expect(existsSync(join(victim, leaf)), `the cleanup trap unlinked ${leaf} through the symlink`).toBe(true);
+      }
+    }
+    // …and the same for a symlink one level up, which `readlink -f` on the leaf directory alone
+    // would resolve past.
+    {
+      const { cwd } = shipTree();
+      const victim = join(cwd, "elsewhere");
+      mkdirSync(join(victim, "ship"), { recursive: true });
+      for (const leaf of INPUT_LEAVES) writeFileSync(join(victim, "ship", leaf), "operator's own file\n");
+      rmSync(join(cwd, ".drawbar", "tmp"), { recursive: true });
+      symlinkSync(victim, join(cwd, ".drawbar", "tmp"));
+      expect((await runScript(gateScript(cwd, tail))).exitCode, "a symlinked `tmp` component was accepted").not.toBe(0);
+      for (const leaf of INPUT_LEAVES) {
+        expect(existsSync(join(victim, "ship", leaf)), `the cleanup trap unlinked ${leaf}`).toBe(true);
+      }
+    }
+    // A checkout REACHED through a symlink is not refused — both sides are `readlink -f`-resolved,
+    // so the gate rejects a redirected component, not an operator whose home is a symlink.
+    {
+      const { cwd } = shipTree();
+      const alias = join(mkdtempSync(join(tmpdir(), "drawbar-alias-")), "link");
+      symlinkSync(cwd, alias);
+      expect((await runScript(gateScript(alias, tail))).exitCode, "a symlink-reached checkout was refused").toBe(0);
+    }
+    // The gate is armed BEFORE the trap in the shipped fence, by LINE index — a comment naming
+    // the trap sits above it, so a substring search would report the wrong order.
+    const fenceLines = fence().split("\n");
+    const dirGateAt = fenceLines.findIndex((l) => l.startsWith("# --- inputs directory gate"));
+    expect(dirGateAt, "the inputs directory gate marker is not in the fence").toBeGreaterThan(-1);
+    expect(dirGateAt, "the directory gate runs after the trap that would delete through the symlink").toBeLessThan(
+      fenceLines.indexOf(trapLine),
+    );
+    // …and it is the equality against the recomputed path doing the work, not a bare `-d`.
+    expect(dirGate).toContain('[ "$IN_REAL" = "$PWD_REAL/.drawbar/tmp/ship" ] ||');
+  });
+
+  // Executed. The EXIT trap is the other half of what `mktemp -d` used to give for free: a fresh
+  // directory per story. With a fixed path, staleness is the new failure mode — story N+1 opening
+  // a PR with story N's title because one Write was skipped — so the four files are removed
+  // however the block ends, and the gate above then refuses the next story outright.
+  test("CRITICAL 2: the shipped EXIT trap removes all four inputs on both the success and the refusal path", async () => {
+    const c = code();
+    const trapLine = oneLine(c, "trap ", "§4's inputs cleanup trap");
+    expect(trapLine).toBe(`trap 'rm -f "$INPUTS" "$BRANCH_FILE" "$PR_TITLE_FILE" "$PR_BODY_FILE"' EXIT`);
+    // It is armed BEFORE the gate that can exit, or a refusal leaves the inputs behind for the
+    // next story to inherit. Compared by LINE index over the fence, not by `indexOf("trap ")` over
+    // its text: the comment above the trap explains it by name, so a substring search finds the
+    // explanation and reports the right order however the code is actually arranged.
+    const fenceLines = fence().split("\n");
+    const trapAt = fenceLines.indexOf(trapLine);
+    const gateAt = fenceLines.findIndex((l) => l.startsWith("# --- inputs file gate"));
+    expect(trapAt, "the cleanup trap line is not in the fence").toBeGreaterThan(-1);
+    expect(gateAt, "the inputs file gate marker is not in the fence").toBeGreaterThan(-1);
+    expect(trapAt, "the cleanup trap is armed after the gate that can exit").toBeLessThan(gateAt);
+    const paths = ["INPUTS", "BRANCH_FILE", "PR_TITLE_FILE", "PR_BODY_FILE"].map((n) =>
+      oneLine(c, `${n}=`, `§4's ${n} path`),
+    );
+    const gate = markedBlock("# --- inputs file gate", "# --- end inputs file gate");
+    async function survivors(tail: string, missing?: string): Promise<string[]> {
+      const { cwd, dir } = shipTree();
+      if (missing) rmSync(join(dir, missing));
+      await runScript(gateScript(cwd, [...paths, trapLine, gate, tail]));
+      return INPUT_LEAVES.filter((leaf) => existsSync(join(dir, leaf)));
+    }
+    expect(await survivors("exit 0"), "an input survived the success path").toEqual([]);
+    // The refusal path: `title` was never written, the gate exits 1, and the three that WERE
+    // written must still be swept — otherwise the next story inherits them.
+    expect(await survivors("exit 0", "title"), "an input survived the gate's refusal").toEqual([]);
+  });
+
+  // CRITICAL: JSON KEY injection, re-derived. `branch` used to be pasted between two `"` inside a
   // hand-assembled inputs document. A `"` in it does not produce invalid JSON that `jq -e .`
   // refuses — it APPENDS keys, and jq resolves duplicate keys last-wins, so any key declared
   // above it (`arg`, which names the state file; `story`, which picks the base) is silently
-  // overridden while both shape gates still pass, because they see only the laundered values.
-  // A key whitelist is no defence: the injected document has exactly the same key set. So the
-  // untrusted value never enters a JSON document at all.
-  test("CRITICAL 2: the branch name never enters the inputs JSON document — it has its own heredoc file", () => {
+  // overridden while both shape gates still pass, because they see only the laundered values. A
+  // key whitelist is no defence: the injected document has exactly the same key set. R3b closed it
+  // by giving `branch` its own heredoc; PCO-371 closes it one level further out — the document is
+  // a file the agent writes, so nothing concatenates a string into it at all.
+  test("CRITICAL 2: the branch name never enters the inputs document, and the document is never assembled by the fence", () => {
     const c = code();
-    const inputs = heredocBody("DRAWBAR_INPUTS_SENTINEL");
-    expect(inputs, "`branch` is a key in the hand-assembled JSON document again").not.toContain("branch");
+    const tpl = inputsTemplate();
+    expect(tpl, "`branch` is a key in the inputs document again").not.toContain("branch");
+    expect(new Set([...tpl.matchAll(/^\s*"(\w+)":/gm)].map((m) => m[1]!))).toEqual(
+      new Set(["arg", "story", "teams", "flagged"]),
+    );
     expect(c).not.toContain(`jq -r '.branch`);
     expect(oneLine(c, "BRANCH=", "§4's BRANCH read")).toBe('BRANCH=$(cat "$BRANCH_FILE")');
-    // Every value still inside the document is one the repository under review cannot author, and
-    // the comment above the heredoc says so — pinned as one contiguous phrase.
-    expect(fence().replace(/\s+/g, " ")).toContain(
-      "# `branch` is NOT a key in this document: it derives from the repository under review, " +
-        "and a `\"` # in a value pasted between two `\"` here appends keys rather than breaking " +
-        "the parse — jq takes # the LAST of a duplicate key, so an injected `\"arg\"`/`\"story\"` " +
-        "silently wins and aims $STATE, # assert-chain and resolve-base at a different run. Only " +
-        "values the repository under review # cannot author live in here.",
+    // The document is JSON the agent writes, never JSON the fence builds: no `jq -n`/`jq --null-input`
+    // producing it, and no `{`-shaped literal assembled anywhere in the executable body except the
+    // ONE `jq -nc` that builds the stack ENTRY, which is fed exclusively by `--arg`/`--argjson`.
+    const jqN = c.split("\n").filter((l) => /\bjq\s+(-[a-zA-Z]*n[a-zA-Z]*|--null-input)\b/.test(l));
+    expect(jqN.length, "the only `jq -n` in §4 is the stack-entry builder").toBe(1);
+    expect(jqN[0]).toContain("ENTRY=$(jq -nc --arg story");
+    // …and the prose says the same thing at the one place the key set is declared.
+    expect(oneUnit("**The inputs document is a file you write", "§4's inputs-document rule")).toContain(
+      "`branch` is not a key in it: a `\"` in a value placed between two `\"` inside a " +
+        "hand-assembled JSON document does not produce invalid JSON that `jq -e .` would refuse — " +
+        "it appends keys, and `jq` resolves duplicate keys last-wins, so it silently overrides any " +
+        "key declared above it (`arg` names the state file, `story` picks the base).",
     );
   });
 
   // Executed, against the doc's OWN read lines: a hostile branch value cannot reach `arg` or
-  // `story` any more. The test writes the two files exactly as the agent's heredocs do (a quoted
-  // heredoc, so this test file is not itself the injection vector) and then runs the shipped
-  // read block verbatim.
+  // `story`. The test writes the two files the way the agent's Write calls do (through a quoted
+  // heredoc HERE, so this test file is not itself the injection vector — the shipped doc has
+  // none) and then runs the shipped read block verbatim.
   test("CRITICAL 2: a branch value carrying JSON syntax cannot override arg or story (run for real)", async () => {
-    const read = markedBlock("# --- read the substituted inputs", "# --- end read the substituted inputs");
+    const read = markedBlock("# --- read the written inputs", "# --- end read the written inputs");
     const hostile = 'feature/x", "story": "PCO-111", "arg": "PCO-111';
     const dir = mkdtempSync(join(tmpdir(), "drawbar-inputs-"));
     const script = [
@@ -2378,13 +2806,16 @@ describe("PCO-370 R3b: §4's executable stacked-PR fence", () => {
 
   // --- IMPORTANT 9: the PR body's own rendering instruction ----------------------------------
   //
-  // §4's prose restricting `## Unresolved findings` to sub-issue id + title was pinned; the
-  // heredoc that actually TELLS the agent what to write was not. Rewriting it to render
-  // `file:line` and the finding body left the suite green — the finding-9 disclosure with the
-  // prose pin still passing.
-  test("IMPORTANT 9: the PR-body heredoc itself restricts '## Unresolved findings' to sub-issue id + title", () => {
-    const body = heredocBody("DRAWBAR_PR_BODY_SENTINEL");
-    expect(body.replace(/\s+/g, " ")).toContain(
+  // §4's prose restricting `## Unresolved findings` to sub-issue id + title was pinned; the thing
+  // that actually TELLS the agent what to write was not. Rewriting it to render `file:line` and
+  // the finding body left the suite green — the finding-9 disclosure with the prose pin still
+  // passing. PCO-371 moved that instruction from the retired `DRAWBAR_PR_BODY_SENTINEL` heredoc
+  // into §4's `body` write instruction; it is pinned as one whole UNIT with `toBe`, so a clause
+  // appended to it now fails here as a deletion does.
+  test("IMPORTANT 9: the §4 write instruction itself restricts '## Unresolved findings' to sub-issue id + title", () => {
+    const body = oneUnit("- `<cwd>/.drawbar/tmp/ship/body`", "§4's body write instruction");
+    expect(body).toBe(SH4_BODY_FILE_UNIT);
+    expect(body).toContain(
       "On a flagged story it is written out here with its `## Unresolved findings` section " +
         "already in it, listing each surviving finding as `<SUB-ISSUE-ID> — <sub-issue title>` " +
         "and nothing else: never the finding body, never a `file:line`, never a `dedup_key` or " +
@@ -2731,38 +3162,48 @@ describe("PCO-370 R3b: §4's executable stacked-PR fence", () => {
   });
 
   // --- Bash discipline ----------------------------------------------------------------------
-  test("guards are `positive || { … exit 1; }`, with the ONE verbatim-from-Preflight exception", () => {
-    // The tracked-config refusal is `negative && { … } || true` in Preflight and is copied
+  test("guards are `positive || { … exit 1; }`, with the tracked-file `&& { … } || true` exceptions", () => {
+    // The tracked-CONFIG refusal is `negative && { … } || true` in Preflight and is copied
     // BYTE-IDENTICALLY (asserted above) — rewording it would defeat the point of reusing it.
-    // Everything else in the fence must use the positive form.
+    // PCO-371's fix pass adds a SECOND refusal of the same shape and for the same reason: the
+    // four §4 inputs must not be tracked either, because a branch under review can commit four
+    // ordinary regular files at those names and satisfy every other conjunct of the file gate on
+    // the very first run. Both are `git … ls-files --error-unmatch … && { … } || true`, and a
+    // `git` failure (the directory is not a repository at all) must NOT be the refusal, which is
+    // exactly what the negative form buys. Everything else in the fence uses the positive form.
     const lines = fence().split("\n");
-    const start = lines.findIndex((l) => l.startsWith('git -C "$(dirname "$CONFIG_REAL")" ls-files --error-unmatch'));
-    expect(start).toBeGreaterThan(-1);
-    const end = lines.findIndex((l, i) => i >= start && l.trim() === "|| true");
+    const trackedStarts = lines
+      .map((l, i) => [l, i] as [string, number])
+      .filter(([l]) => l.trimStart().startsWith("git -C ") && l.includes("ls-files --error-unmatch"))
+      .map(([, i]) => i);
+    expect(trackedStarts.length, "§4's two tracked-file refusals are not both present").toBe(2);
+    const cut = new Set<number>();
+    for (const start of trackedStarts) {
+      const end = lines.findIndex((l, i) => i >= start && l.trim() === "|| true");
+      // …and each exception really was sliced out, rather than the slice silently covering the
+      // whole fence because a marker moved. Asserted on the SIZE of the removal, not only on what
+      // survives it: each guard is exactly three lines (continuation, refusal, `|| true`), so a
+      // marker that moved and swallowed the rest of the fence fails here rather than quietly
+      // shrinking the text the `&&` check runs over.
+      expect(end - start, "a sliced-out exception is not a three-line tracked-file guard").toBe(2);
+      for (let i = start; i <= end; i++) cut.add(i);
+    }
+    expect(cut.size, "the two sliced-out exceptions are not six distinct lines").toBe(6);
     // Comment lines are dropped before the check: bash discipline governs CODE, and the prose
     // beside this very guard quotes the `&& { … } || true` shape it is explaining. Matching the
     // explanation instead of the code is MUST-CHECK
     // doc-fence-slice-marker-must-not-appear-in-comments in its other direction.
-    const rest = [...lines.slice(0, start), ...lines.slice(end + 1)]
-      .filter((l) => !l.trimStart().startsWith("#"))
-      .join("\n");
+    const kept = lines.filter((_, i) => !cut.has(i));
+    const rest = kept.filter((l) => !l.trimStart().startsWith("#")).join("\n");
     expect(rest).not.toMatch(/&&\s*\{/);
-    // …and the exception really was sliced out, rather than the slice silently covering the
-    // whole fence because a marker moved. Asserted on the SIZE of the removal, not only on what
-    // survives it: the guard is exactly three lines (continuation, refusal, `|| true`), so a
-    // marker that moved and swallowed the rest of the fence fails here rather than quietly
-    // shrinking the text the `&&` check runs over.
-    expect(end - start, "the sliced-out exception is not the three-line tracked-config guard").toBe(2);
     expect(rest.length, "the slice removed too much — nothing left to check").toBeGreaterThan(2000);
     expect(rest).toContain("|| { echo");
     // EVERY `||` is a refusal that EXITS. `|| { echo` as a substring is satisfied by one
     // conforming guard anywhere in the fence, so downgrading a specific guard to
     // `|| echo "WARN…"` survived it — and a warning that does not exit lets the fence continue
     // with the very value the guard exists to reject (an unvalidated $BRANCH straight into
-    // `--head`, or an unmade $IN_DIR into four `cat >` redirects).
-    const refusals = [...lines.slice(0, start), ...lines.slice(end + 1)].filter(
-      (l) => !l.trimStart().startsWith("#") && l.includes("||"),
-    );
+    // `--head`, or a redirected $IN_DIR straight into the trap's `rm -f`).
+    const refusals = kept.filter((l) => !l.trimStart().startsWith("#") && l.includes("||"));
     expect(refusals.length, "no `||` guards found — the extraction is broken").toBeGreaterThan(10);
     for (const line of refusals) {
       expect(line.slice(line.indexOf("||")), `a '||' guard that does not refuse-and-exit: ${line}`).toMatch(
@@ -3785,10 +4226,16 @@ describe("PCO-369 R6: cross-references reconciled, the stack model documented, L
       anchor: "the full write-up already lives in the sub-issue §3 filed for it",
       ns: [{ n: 3, title: "File out-of-scope findings as sub-issues" }],
     },
+    // PCO-371 retired the entry that used to sit here: §4's fence comment cross-referencing
+    // "the explicit-assignment convention §6 uses for $LESSONS_JSON". §4 no longer assigns any
+    // agent-substituted value at all — the four untrusted inputs arrive as files — so the
+    // comparison it drew no longer describes anything in §4.
+    // PCO-371 fix pass: Preflight creates §4's inputs directory (and its `.gitignore`) and prints
+    // the absolute path §4 recomputes, because the agent must Write there before §4's fence runs.
     {
       doc: "ship",
-      anchor: "the explicit-assignment convention §6 uses for $LESSONS_JSON",
-      ns: [{ n: 6, title: "Capture and sync knowledge" }],
+      anchor: "know their ABSOLUTE path before §4's fence runs",
+      ns: [{ n: 4, title: "Open the stacked PR" }],
     },
     { doc: "ship", anchor: "# --- derive from the resolved config (§4)", ns: [{ n: 4, title: "Open the stacked PR" }] },
     {
@@ -3828,6 +4275,14 @@ describe("PCO-369 R6: cross-references reconciled, the stack model documented, L
       doc: "ship",
       anchor: "resolve **no** new base for it, and resume at §5 (post the summary comment)",
       ns: [{ n: 5, title: "Post the summary comment" }],
+    },
+    // PCO-371: the operator note about §4's four input FILES. The note exists because those
+    // files land in the operator's own working directory rather than a `mktemp -d`, so keeping
+    // them out of version control is now an operator-visible concern.
+    {
+      doc: "ship",
+      anchor: "**§4's four inputs are files, not text pasted into a shell.**",
+      ns: [{ n: 4, title: "Open the stacked PR" }],
     },
     // --- agents/drawbar-story-lead.md, referring to itself -----------------------------------
     { doc: "agent", anchor: "Make it the report in §7, nothing else.", ns: [{ n: 7, title: "Report" }] },
@@ -5613,25 +6068,32 @@ describe("PCO-375: reviewed_sha pins the commit each review actually read", () =
     expect(txt).toContain("Where the two reviewers read different shas, name both, one line each.");
   });
 
-  // The prose above tells the agent what to do; the heredoc is what it actually fills in. Pinning
-  // only the prose is the exact vacuous shape IMPORTANT 9 caught for `## Unresolved findings` —
-  // the rendering instruction was rewritten with the prose pin still green.
-  test("the PR-body heredoc itself carries the review-provenance line as its first line", () => {
-    const raw = readNonEmpty(join(root, SHIP_375));
-    const open = raw.indexOf("cat > \"$PR_BODY_FILE\" <<'DRAWBAR_PR_BODY_SENTINEL'\n");
-    expect(open, "the PR-body heredoc is missing").toBeGreaterThan(-1);
-    const bodyStart = open + "cat > \"$PR_BODY_FILE\" <<'DRAWBAR_PR_BODY_SENTINEL'\n".length;
-    const close = raw.indexOf("\nDRAWBAR_PR_BODY_SENTINEL", bodyStart);
-    expect(close, "the PR-body heredoc is unterminated").toBeGreaterThan(bodyStart);
-    const body = raw.slice(bodyStart, close).replace(/\s+/g, " ");
-    expect(body.length, "the PR-body heredoc is empty").toBeGreaterThan(80);
-    expect(body).toContain(
+  // The prose above tells the agent what the provenance line IS; this pins the instruction it
+  // actually renders from. Pinning only the descriptive paragraph is the exact vacuous shape
+  // IMPORTANT 9 caught for `## Unresolved findings` — the rendering instruction was rewritten with
+  // the prose pin still green.
+  //
+  // PCO-371 moved that instruction out of the `DRAWBAR_PR_BODY_SENTINEL` heredoc (retired with the
+  // rest of them) and into the `body` bullet of §4's Write-the-inputs list, which is now what tells
+  // the agent what to put in the file. Same instruction, same pin, new home — asserted as one
+  // whole logical UNIT with `toEqual`, so a clause appended to it fails here exactly as a deletion
+  // does; a `toContain` on a heredoc body could not say that.
+  test("the §4 instruction that renders the PR body carries the review-provenance line as its first line", () => {
+    const units = docUnits(docSection(SHIP_375, "## 4. Open the stacked PR"));
+    const body = units.filter((u) => u.startsWith("- `<cwd>/.drawbar/tmp/ship/body`"));
+    expect(body.length, "§4 must carry exactly one `body` write instruction").toBe(1);
+    expect(body[0]).toBe(SH4_BODY_FILE_UNIT);
+    // Not a tautology against the constant alone: the two clauses this story and IMPORTANT 9 each
+    // exist for are named here explicitly, so a future edit to SH4_BODY_FILE_UNIT that drops one
+    // of them still fails.
+    expect(body[0]).toContain(
       "Its first line is the review-provenance line `reviewed at <reviewed_sha> from " +
         "<spec_source>; N commits since`, with both shas already shape-checked and resolved per " +
         "the prose above.",
     );
-    // And the finding-9 disclosure rule it sits next to is untouched by this addition.
-    expect(body).toContain("On a flagged story it is written out here with its `## Unresolved findings` section");
+    expect(body[0]).toContain("On a flagged story it is written out here with its `## Unresolved findings` section");
+    // The retired heredoc must not come back carrying it.
+    expect(readNonEmpty(join(root, SHIP_375))).not.toContain("DRAWBAR_PR_BODY_SENTINEL");
   });
 
   const SHA_HATCHES: readonly Shape[] = [
@@ -6230,6 +6692,49 @@ const WK6 = "## 6. Review and fix loop";
 // end of §4's prose, which names no field of the contract, so neither the run nor the token scan
 // below could see it. Closing the whole prose region is what catches a carve-out that refers to the
 // rule without naming it.
+// PCO-371: three §4 prose units the fence-level describe above ALSO pins, exported here so both
+// sites read the same string. §4's prose region is closed with `toEqual` (below), which is what
+// makes an ADDED carve-out fail; these three carry the rules whose deletion or rewrite is the
+// interesting mutation, so they are named and reused rather than transcribed twice.
+//
+// The `body` bullet is the instruction that actually TELLS the agent what to render — the same
+// role the retired `DRAWBAR_PR_BODY_SENTINEL` heredoc body played, and the reason IMPORTANT 9 and
+// PCO-375 pin the instruction rather than only the paragraph describing it.
+const SH4_BODY_FILE_UNIT =
+  "- `<cwd>/.drawbar/tmp/ship/body` — the PR body, verbatim. Its first line is the " +
+  "review-provenance line `reviewed at <reviewed_sha> from <spec_source>; N commits since`, with " +
+  "both shas already shape-checked and resolved per the prose above. On a flagged story it is " +
+  "written out here with its `## Unresolved findings` section already in it, listing each " +
+  "surviving finding as `<SUB-ISSUE-ID> — <sub-issue title>` and nothing else: never the finding " +
+  "body, never a `file:line`, never a `dedup_key` or any of its fields, never a quoted source " +
+  "excerpt.";
+
+// The inputs document the agent fills in. A ```json block, NOT a heredoc: it is data the agent
+// writes to a file with the Write tool, and nothing about it is ever parsed by a shell. `branch`
+// is deliberately absent — that is the PCO-370 key-injection closure, restated at the one place
+// the document's key set is declared.
+const SH4_INPUTS_TEMPLATE_UNIT =
+  "```json { \"arg\": \"<the id THIS RUN was invoked with — it names the state file>\", " +
+  "\"story\": \"<TEAM>-####\", \"teams\": <the list_teams result for this session, as a JSON " +
+  "array>, \"flagged\": <the report `status`: flagged -> true, ok -> false; a JSON boolean, " +
+  "never a string> } ```";
+
+// The retirement note. R3b's interim mitigation was an instruction to the agent to scan each value
+// for a line equal to the heredoc terminator and halt; a pin on it proved only that it was written
+// down. This paragraph is what stops the heredocs coming back now that the instruction is gone.
+const SH4_HEREDOCS_RETIRED_UNIT =
+  "**The four quoted heredocs this step used to carry are retired, and must never come back.** " +
+  "They passed the branch, the title, the body and the inputs document through the shell parser. " +
+  "Quoting neutralised `\"`, `$(...)` and backticks — but not a substituted line equal to the " +
+  "terminator itself, which closed the heredoc and left every line after it parsed as shell: " +
+  "arbitrary command execution under the operator's authenticated `gh`, with the written file " +
+  "left looking entirely correct, and the terminators were fixed literals published in this " +
+  "public repository, so the value an attacker needed was never secret. The interim mitigation " +
+  "was an instruction above the fence to check each value for such a line and halt; it is deleted " +
+  "here because it is now inert — there is no terminator left to collide with, and an instruction " +
+  "of that kind only ever proved it had been written down, never that it was obeyed. Re-adding a " +
+  "heredoc that carries substituted text reopens the vector in full.";
+
 const SH4_PROSE: readonly string[] = [
     "## 4. Open the stacked PR",
     "**This step is the only thing in the whole run that opens a pull request.** The " +
@@ -6286,30 +6791,36 @@ const SH4_PROSE: readonly string[] = [
       "one. An ambient exported `REPO` would otherwise win and aim every `gh` call at an " +
       "unvalidated repository, and an empty `$BASE` yields `--base \"\"`, which is Locked A's " +
       "exact failure mode.",
-    "**Every value you substitute goes into a quoted heredoc, never into an assignment.** The " +
-      "branch name, the PR title and the PR body all originate in text produced from the " +
-      "repository under review, and you paste them in literally — so a single `\"` would close a " +
-      "double-quoted assignment and the `$(...)` after it would run. Inside `<<'SENTINEL'` " +
-      "nothing expands and nothing executes; the fence reads the values back out with `jq -r` " +
-      "and `cat`.",
-    "**Before you substitute anything, check every value for a line equal to the terminator " +
-      "you are pasting it under, and halt the run if you find one** — park the story with that " +
-      "as the reason, and never rewrite, escape, or truncate the value to make it fit. A quoted " +
-      "heredoc protects the value's `\"`, `$` and backticks, but it still ends at the first line " +
-      "equal to its terminator, and these terminators are fixed literals published in this " +
-      "repository: a report line reading exactly `DRAWBAR_PR_BODY_SENTINEL` closes the body " +
-      "heredoc early and every line after it is parsed as shell — arbitrary command execution " +
-      "under the operator's authenticated `gh`, with the written file left looking entirely " +
-      "correct. A check inside the fence cannot save you here: by the time any line of it runs, " +
-      "the injected commands have already run.",
-    "**No value that came out of the repository under review is ever pasted into a JSON " +
-      "document.** The branch name gets its own heredoc file and is read back with `cat`, " +
-      "because a `\"` in a value pasted between two `\"` inside the inputs document does not " +
-      "produce invalid JSON that `jq -e .` would refuse — it appends keys, and `jq` resolves " +
-      "duplicate keys last-wins, so it silently overrides any key declared above it (`arg` " +
-      "names the state file, `story` picks the base). Both shape gates then pass, because they " +
-      "see only the laundered values. A key whitelist is not a defence: the injected document " +
-      "has exactly the same key set.",
+    "**Every value that came out of the repository under review reaches the fence as a FILE you " +
+      "write, never as text substituted into the fence.** The branch name, the PR title and the " +
+      "PR body all originate in text produced from the repository under review, and the inputs " +
+      "document is the only other thing you fill in. **Write all four with the Write tool before " +
+      "you run the fence**, at exactly these four paths — `<cwd>` is the absolute path Preflight " +
+      "printed as `SHIP_CWD:`, never a path you infer; the fence recomputes the same four from " +
+      "its own `$PWD` and refuses outright if the two differ, rather than reading a file it did " +
+      "not expect. **Rewrite all four every time**: the fence deletes them on every path it " +
+      "reaches, but a run that dies before it leaves them on disk, and no gate can tell a stale " +
+      "input from a fresh one.",
+    "- `<cwd>/.drawbar/tmp/ship/inputs.json` — the inputs document below, filled in.",
+    "- `<cwd>/.drawbar/tmp/ship/branch` — the story-lead report's `branch` field, verbatim, one " +
+      "line and nothing else.",
+    "- `<cwd>/.drawbar/tmp/ship/title` — the PR title, one line and nothing else.",
+    SH4_BODY_FILE_UNIT,
+    "**The fence authors none of those four files and substitutes nothing into itself.** It " +
+      "carries no fill-in slot at all: every value it consumes it reads back out of a file it did " +
+      "not write, with `jq -r`, `cat` or `--body-file`, so no text from the repository under " +
+      "review is ever parsed by a shell. That is the whole guarantee, and it holds structurally — " +
+      "there is no instruction here for an agent to follow correctly or to skip.",
+    "**The inputs document is a file you write, never a string the fence assembles.** `branch` is " +
+      "not a key in it: a `\"` in a value placed between two `\"` inside a hand-assembled JSON " +
+      "document does not produce invalid JSON that `jq -e .` would refuse — it appends keys, and " +
+      "`jq` resolves duplicate keys last-wins, so it silently overrides any key declared above it " +
+      "(`arg` names the state file, `story` picks the base). Both shape gates then pass, because " +
+      "they see only the laundered values. A key whitelist is not a defence: the injected " +
+      "document has exactly the same key set. Only values the repository under review cannot " +
+      "author live in here at all.",
+    SH4_INPUTS_TEMPLATE_UNIT,
+    SH4_HEREDOCS_RETIRED_UNIT,
 ];
 
 // drawbar-work §6 is closed whole. A run over the three new rules plus their successor left the
@@ -6863,6 +7374,257 @@ describe("PCO-374/375/376 fix pass: the new rules are closed in place, and nothi
           `the survivor class this scan exists to close — put the sentence in the governing section, ` +
           `or pin the region it lives in.`,
       ).toEqual([]);
+    });
+  }
+});
+
+// =================================================================================================
+// PCO-371 fix pass: §4's FENCE COMMENTS are instructions too, and they were pinned by nothing.
+//
+// R3b pinned the fence's own safety comment directly —
+//   expect(fence().replace(/\s+/g, " ")).toContain(
+//     "The one thing a quoted heredoc does # NOT protect against is a substituted line equal to
+//      the terminator itself …")
+// — under the reasoning that "the executable block must not be read as promising unconditional
+// safety on its own". PCO-371 retired that pin and replaced it with a pin on §4's PROSE unit
+// (`**The fence authors none of those four files and substitutes nothing into itself.**`). Prose is
+// not the fence: `docSectionProse` strips fences before `toEqual(SH4_PROSE)` runs, and `code()`
+// strips comments before every assertion in the CRITICAL 2 describe. So the property survived the
+// rewrite in name only, and half of §4's fence — 75 of its 151 lines — became unreachable by any
+// test. Mutation testing found all of these alive:
+//
+//   - DELETE the entire `# NOTHING in this fence is substituted …` block, including
+//     "Do not reintroduce a heredoc, a here-string, or any other fill-in slot here".
+//   - REPHRASE that ban into permission: "Reintroducing a heredoc here is acceptable where the
+//     value is a simple one-liner and you have checked it — use your judgement."
+//   - ADD a comment reasserting the exact claim PCO-371 refuted: "A quoted heredoc is always safe:
+//     quoting neutralises every metacharacter, so substituting a value under one cannot be
+//     exploited."
+//   - ADD "Substituting a value into this fence directly is fine where, in your judgement, it is a
+//     simple single-line token."
+//   - REPHRASE "Read from its OWN file, never out of the inputs document" into "…where practical,
+//     though the inputs document is acceptable too".
+//   - ADD "Where Preflight already ran in this same session, re-running these guards is optional."
+//     above the $CONFIG guards.
+//   - ADD, inside PREFLIGHT's fence: "These checks may be skipped when, in your judgement, the
+//     environment is already known good."
+//
+// An agent reads the comments; they are the same kind of instruction the prose is. §4's are closed
+// here with `toEqual`, which fails on deletion, rephrase AND addition without needing a synonym
+// list. The other fences are not closed (their comments are not PCO-371's contract), so they get
+// the escape-hatch shape scan instead — which also covers §4, so a hatch cannot arrive by editing
+// the pinned array and the shape list in one pass without noticing.
+// =================================================================================================
+
+// A bash fence's comment lines, folded into logical units the way `docUnits` folds hard-wrapped
+// prose: consecutive `#` lines become one unit, a `# --- marker ---` stands alone, and any
+// non-comment line ends the current unit. Leading `#` and surrounding whitespace are stripped, so a
+// rewrap is not a mutation but a reword is.
+function fenceCommentUnits(fenceBody: string): string[] {
+  const out: string[] = [];
+  let open = false;
+  for (const raw of fenceBody.split("\n")) {
+    const t = raw.trim();
+    if (!t.startsWith("#")) {
+      open = false;
+      continue;
+    }
+    const body = t.slice(1).trim();
+    if (body === "" || body.startsWith("---") || body.endsWith("---")) {
+      out.push(body === "" ? "#" : body);
+      open = false;
+      continue;
+    }
+    if (open) out[out.length - 1] += " " + body;
+    else {
+      out.push(body);
+      open = true;
+    }
+  }
+  return out;
+}
+
+// Every ```bash fence in a doc, in order. Line-based rather than `indexOf("\n```")`, so the last
+// fence in the file is found whether or not anything follows its closing marker — an
+// off-by-the-last-fence extractor would silently stop scanning §6.
+function bashFences(relPath: string): string[] {
+  const lines = readNonEmpty(join(root, relPath)).split("\n");
+  const out: string[] = [];
+  let cur: string[] | null = null;
+  for (const line of lines) {
+    if (cur === null) {
+      if (line.trim() === "```bash") cur = [];
+      continue;
+    }
+    if (line.trim() === "```") {
+      out.push(cur.join("\n"));
+      cur = null;
+      continue;
+    }
+    cur.push(line);
+  }
+  expect(cur, `an unterminated \`\`\`bash fence in ${relPath}`).toBeNull();
+  expect(out.length, `no \`\`\`bash fences found in ${relPath} — the extractor is broken`).toBeGreaterThan(2);
+  return out;
+}
+
+// §4's fence comments, complete and in order. This is the region the retired R3b pin covered,
+// re-derived for the shape PCO-371 shipped: the ban on reintroducing a heredoc, the reason the
+// deterministic path is safe, the reason `branch` is read from its own file, and the reason both
+// $CONFIG guards run again all live here and nowhere else in the fence.
+const SH4_FENCE_COMMENTS: readonly string[] = [
+    "NOTHING in this fence is substituted, and it authors none of the four files it reads. The four values that come out of the repository under review — the inputs document, the branch name, the PR title, the PR body — were written by the agent with the Write tool before this block ran, and this block only ever reads them back with `jq -r`, `cat` and `--body-file`, so untrusted text is never parsed by a shell at all. The four QUOTED heredocs that used to carry them are gone for good: a substituted line equal to a heredoc terminator closes it early and the rest is parsed as shell, and those terminators are fixed literals published in this public repository. Do not reintroduce a heredoc, a here-string, or any other fill-in slot here. The path is DETERMINISTIC rather than `mktemp -d`, because the agent has to know where to write before this block runs; Preflight prints it, so it is never guessed. That gives up everything `mktemp -d` provided for free, and each half is bought back explicitly below. Unguessability is replaced by the directory gate: this path is entirely predictable, so a branch under review can commit `.drawbar/`, `.drawbar/tmp/` or `ship` itself as a DIRECTORY SYMLINK (git stores mode 120000 and it survives checkout), and `-L` on the four LEAF paths cannot see a symlinked component above them — the agent's writes and this block's `rm -f` would both follow it and truncate, then unlink, four arbitrary files under the operator's identity. The gate therefore refuses unless $IN_DIR resolves to exactly itself. Freshness is replaced only PARTLY, and the limit is stated rather than papered over. The EXIT trap removes all four however this block ends, so a run that REACHES it leaves nothing behind; but a run that dies before it — session killed, agent errored, story parked in an earlier section — leaves all four on disk, and the file gate cannot tell a stale file from a fresh one. Rewrite ALL FOUR immediately before running this block. That is the one thing here no gate can check for you, and it is why the gate refuses an EMPTY file too: a zero-byte `body` would otherwise open a PR with no review provenance and no `## Unresolved findings` section at all. What the gate CAN tell is authorship: a branch under review can also just COMMIT four ordinary regular files at these names, and they would satisfy every other check on the very first run, so a tracked input is refused exactly as a tracked `$CONFIG` is.",
+    "--- inputs directory gate ----------------------------------------------------------------",
+    "BEFORE the trap is armed: `rm -f` follows a symlinked path component exactly as the agent's writes do, so a redirected $IN_DIR has to be refused while there is still nothing armed to delete through it. Both sides are symlink-resolved, so an operator whose checkout is reached through a symlink is not refused, while a symlink at any component under it is.",
+    "--- end inputs directory gate --------------------------------------------------------------",
+    "--- inputs file gate -------------------------------------------------------------------------",
+    "--- end inputs file gate ---------------------------------------------------------------------",
+    "--- read the written inputs ------------------------------------------------------------",
+    "Read from its OWN file, never out of the inputs document: `branch` derives from the repository under review, and a `\"` in a value placed between two `\"` in that document would append keys rather than break the parse — jq takes the LAST of a duplicate key, so an injected `\"arg\"`/`\"story\"` silently wins and aims $STATE, assert-chain and resolve-base at a different run. Nothing about this value's text can reach a JSON key, and its emptiness is refused by the ref-name shape gate below.",
+    "`flagged` and `teams` are TYPE-checked at the source, not merely non-empty: `flagged` reaches `jq --argjson` below, where the string \"true\" would produce the string \"true\" in the stack entry and `isValidStackEntry` demands a strict boolean.",
+    "--- end read the written inputs ------------------------------------------------------------",
+    "$ARG is interpolated into the state-file path, so it must be a single safe path segment — the same shape run-state.ts's `isSafePathSegment` enforces on the value it round-trips.",
+    "--- branch ref-name shape gate ------------------------------------------------------------",
+    "$BRANCH comes from an agent report and reaches `--head` and the stack entry. Gated HERE, at the top, before it can reach either. Mirrors ship-config.ts's REF_NAME_SHAPE plus its `.lock` refusal — i.e. exactly what run-state.ts's `isValidStackEntry` re-applies to the entry written below, so a branch that would brick the state file is refused before a PR is ever opened for it. `[[ =~ ]]` and not a `grep` pipeline: grep matches LINE by line, so a BRANCH carrying an embedded newline would satisfy it twice over while `isValidRefName` refuses that same value. `LC_ALL=C` inside the subshell keeps `A-Za-z0-9` byte ranges rather than locale collation ranges. (The `/` is written FIRST inside the bracket expression on purpose: this file is scanned for concrete GitHub org-and-repo slugs, and a slash between two word characters reads as one.)",
+    "--- end branch ref-name shape gate ---------------------------------------------------------",
+    "$CONFIG is re-resolved from $PWD here, so BOTH of Preflight's guards run again, verbatim. Dropping them lets a branch under review plant `.drawbar/ship.config.json` and feed its own `projectDir` into `--project-dir` and `git -C`; an equality guard does not help, because both sides then agree — on the attacker's directory. (The tracked-config refusal keeps Preflight's `&& { ... } || true` shape deliberately: it is the same guard, not a reworded copy of it, and it is asked about the symlink-resolved path for the reason Preflight's copy spells out.)",
+    "MUST-CHECK r3-must-not-source-project-dir-from-pasted-run-state: the trust root is this FRESH validate, run in this block. Never `jq '.resolved_config' \"$STATE\"` and never anything else read out of `runs/` — the state file is agent-writable, and a `--project-dir` taken from it turns stack.ts's equality guard into a tautology about the attacker's own directory.",
+    "--- derive from the resolved config (§4) --------------------------------------------------",
+    "--- end derive from the resolved config (§4) ----------------------------------------------",
+    "Check 1 of 3 — chain integrity. `--project-dir` is the operator-authored trust root, taken from the fresh validate above, never from the state file's own `resolved_config` copy.",
+    "Echo the verdict's `.reason` and NOTHING else. `.detail` carries absolute paths and the real repo slug, this repo is public, and the Hard rules require refusal text be paraphrased rather than pasted into `parked_reason`, the §5 comment, or a KB entry.",
+    "Check 2 of 3 — the base. Locked A: `resolve-base` is the only producer of this value.",
+    "Check 3 of 3 — open it. `--title` reads the file at RUNTIME as one quoted argument and `--body-file` reads it inside `gh`, so no report text is ever part of this command line.",
+    "--- pr number shape gate --------------------------------------------------------------------",
+    "Never `basename \"$PR_URL\"`: unvalidated, and `isValidStackEntry` requires a positive INTEGER.",
+    "--- end pr number shape gate -----------------------------------------------------------------",
+    "--- stack entry -------------------------------------------------------------------------------",
+    "run-state.ts's `isValidStackEntry` requires `pr` to be a positive integer and `flagged` a strict boolean. Bash produces strings, and a string in either field makes `parseRunState` reject the WHOLE file on the next read — stack.ts then writes its usage error to stderr with EMPTY stdout, so the operator sees a bare `refused ()` and the state file is permanently unreadable by its own tooling. Hence `--argjson` for those two, never `--arg`.",
+    "--- end stack entry ----------------------------------------------------------------------------",
+    "Round-trip what was just written through `parseRunState` — `assert-chain` parses the state with it and re-verifies the chain including the entry appended above. A wrong JSON type is caught HERE, in the step that wrote it, instead of bricking every later read.",
+];
+
+describe("PCO-371 fix pass: §4's fence comments are closed, and no fence comment hands back an escape hatch", () => {
+  function section4Fence(): string {
+    const fences = bashFences(SH_374).filter((f) => f.includes('IN_DIR="$PWD/.drawbar/tmp/ship"'));
+    expect(fences.length, "§4's fence is not identifiable by its IN_DIR line").toBe(1);
+    return fences[0]!;
+  }
+
+  // The extractor itself, proved on a fixture rather than trusted: a folding bug that dropped
+  // comments would make the `toEqual` below pass against a doc with none.
+  test("fenceCommentUnits folds wrapped comments, keeps markers separate, and drops code", () => {
+    expect(
+      fenceCommentUnits(["# one line", "# wrapped", "# continues", "CODE=1", "# --- marker ---", "# after"].join("\n")),
+    ).toEqual(["one line wrapped continues", "--- marker ---", "after"]);
+    // A non-comment line breaks the fold, so two separate comments never merge into one unit.
+    expect(fenceCommentUnits(["# a", "X=1", "# b"].join("\n"))).toEqual(["a", "b"]);
+  });
+
+  test("§4's fence carries exactly these comment units and nothing else", () => {
+    const units = fenceCommentUnits(section4Fence());
+    expect(units.length, "§4's fence comments did not extract — the pin would be vacuous").toBeGreaterThan(20);
+    expect(units).toEqual(SH4_FENCE_COMMENTS);
+  });
+
+  // The two claims in that block that are the whole of PCO-371, named explicitly so a future edit
+  // to SH4_FENCE_COMMENTS that drops one has to delete a test rather than a line from an array.
+  test("§4's fence comment states the no-substitution guarantee and bans the retired constructs", () => {
+    const lead = SH4_FENCE_COMMENTS.find((u) => u.startsWith("NOTHING in this fence is substituted"));
+    expect(lead, "§4's fence no longer opens with the no-substitution guarantee").toBeDefined();
+    expect(lead!).toContain(
+      "this block only ever reads them back with `jq -r`, `cat` and `--body-file`, so untrusted " +
+        "text is never parsed by a shell at all",
+    );
+    expect(lead!).toContain("Do not reintroduce a heredoc, a here-string, or any other fill-in slot here.");
+    // The safety claim is stated with its LIMIT attached — the retired pin's actual property. A
+    // comment asserting that quoting alone is sufficient is the claim PCO-371 refuted.
+    expect(lead!).toContain(
+      "a substituted line equal to a heredoc terminator closes it early and the rest is parsed as shell",
+    );
+  });
+
+  // PCO-371 fix pass, CRITICAL. The comment this replaces claimed the fixed path was safe because
+  // it "sits under the operator's own working directory … so no local user can pre-plant a symlink
+  // at it", and that the EXIT trap made staleness impossible. Both were false, and both were
+  // frozen here with `toEqual` — a wrong claim pinned as fact is worse than an unpinned one,
+  // because the next editor reads it as reviewed. Each correction is named, so restoring either
+  // false claim has to delete a test rather than edit a line in an array.
+  test("§4's fence comment states the two limits of a fixed path, and neither overclaims", () => {
+    const lead = SH4_FENCE_COMMENTS.find((u) => u.startsWith("NOTHING in this fence is substituted"))!;
+    // The retired overclaims, in the exact shapes they shipped in.
+    expect(lead, "the refuted pre-planted-symlink claim is back").not.toContain("no local user can pre-plant");
+    expect(lead, "the refuted staleness claim is back").not.toContain("is refused outright instead of silently");
+    // 1. Unguessability. `-L` on a leaf cannot see a symlinked component above it, and the trap's
+    //    `rm -f` follows one exactly as the agent's Write step does.
+    expect(lead).toContain("`-L` on the four LEAF paths cannot see a symlinked component above them");
+    expect(lead).toContain("The gate therefore refuses unless $IN_DIR resolves to exactly itself.");
+    // 2. Freshness. The trap only fires when the fence RUNS, so it is cleanup, not a guarantee —
+    //    and the comment says so rather than asserting the stronger thing.
+    expect(lead).toContain(
+      "but a run that dies before it — session killed, agent errored, story parked in an earlier " +
+        "section — leaves all four on disk, and the file gate cannot tell a stale file from a fresh one",
+    );
+    expect(lead).toContain("Rewrite ALL FOUR immediately before running this block.");
+    // …and the two conjuncts the gate DID gain, each with the reason it exists.
+    expect(lead).toContain("it is why the gate refuses an EMPTY file too");
+    expect(lead).toContain("a tracked input is refused exactly as a tracked `$CONFIG` is");
+  });
+
+  // Shapes, over every fence in the runbook rather than §4's alone: Preflight's and §6's comments
+  // carry guards too, and "these checks may be skipped when, in your judgement, the environment is
+  // already known good" was green in Preflight's fence.
+  const FENCE_COMMENT_HATCHES: readonly Shape[] = [
+    {
+      // `in|on|per` are in the alternation on purpose, and the reviewer-doc family that only
+      // carries `use|using|at|to|exercise|apply` would have missed the mutation that was actually
+      // found alive here: "Substituting a value into this fence directly is fine where, IN your
+      // judgement, it is a simple single-line token." Both spellings, for the reason PCO-372's
+      // gate records — a hatch was once reinstated via the American `judgment` alone.
+      re: /\b(?:use|using|at|in|on|per|to|exercise|apply)\s+your\s+(?:own\s+|best\s+)?(?:judgement|judgment|discretion)\b/i,
+      why: "a fence comment handing a guard back to the agent's discretion (both spellings, and the `in your …` form)",
+      hatch: "# Substituting here is fine where, in your judgement, the value is a simple token.",
+    },
+    {
+      re: /\bis\s+(?:a|the)\s+(?:judgement|judgment)\s+call\b/i,
+      why: "a discretion clause reinstated affirmatively in a fence comment, in either spelling",
+      hatch: "# Whether to re-run these guards is a judgment call.",
+    },
+    {
+      // The refuted claim itself: quoting stated as sufficient. PCO-371 exists because it is not.
+      re: /\b(?:heredoc|here-string|here string|quoting|quoted)\b[^.]{0,140}\b(?:is|are)\s+(?:perfectly\s+|entirely\s+|always\s+|completely\s+)?(?:safe|fine|ok|okay|acceptable|sufficient)\b/i,
+      why: "a fence comment restating the refuted claim that a quoted heredoc is safe by itself",
+      hatch: "# A heredoc here is perfectly safe as long as it is quoted; quoting stops all expansion.",
+    },
+    {
+      re: /\b(?:you\s+may|it\s+is\s+(?:fine|ok|okay|acceptable)\s+to|feel\s+free\s+to|acceptable\s+to|fine\s+to)\b[^.]{0,140}\b(?:reintroduce|re-introduce|substitut\w*|interpolat\w*|paste)\b/i,
+      why: "a fence comment granting permission to substitute untrusted text back into the fence",
+      hatch: "# It is acceptable to substitute the branch name here when it is a simple ref.",
+    },
+    {
+      re: /\b(?:reintroducing|re-introducing|substituting|interpolating|pasting)\b[^.]{0,140}\b(?:is|are)\s+(?:perfectly\s+|entirely\s+|always\s+)?(?:safe|fine|ok|okay|acceptable)\b/i,
+      why: "a fence comment grading substitution acceptable in the gerund form the family above misses",
+      hatch: "# Reintroducing a heredoc here is acceptable where the value is a simple one-liner.",
+    },
+    {
+      re: /\b(?:guard|guards|check|checks|gate|gates|re-running\s+\w+)\b[^.]{0,100}\b(?:is|are)\s+optional\b/i,
+      why: "a fence comment grading a guard optional",
+      hatch: "# Where Preflight already ran in this session, re-running these guards is optional.",
+    },
+    {
+      re: /\b(?:may|can|could)\s+(?:safely\s+|simply\s+)?be\s+(?:skipped|omitted|dropped)\b/i,
+      why: "a fence comment excusing a guard from running",
+      hatch: "# These checks may be skipped when the environment is already known good.",
+    },
+  ];
+
+  for (const relPath of [SH_374]) {
+    test(`${relPath}: no bash fence comment carries an escape hatch`, () => {
+      const comments = bashFences(relPath).flatMap(fenceCommentUnits).join(" ");
+      expect(comments.length, `${relPath}: no fence comments extracted — the scan would be vacuous`).toBeGreaterThan(
+        2000,
+      );
+      assertShapesAbsent(`${relPath} fence comments`, comments.replace(/\s+/g, " "), FENCE_COMMENT_HATCHES);
     });
   }
 });
