@@ -79,6 +79,12 @@ the recovery is a human rebase, and this command has no opinion about it.
 command -v drawbar-kb >/dev/null || { echo "no drawbar-kb — run /drawbar-setup"; exit 1; }
 command -v gh        >/dev/null && gh auth status >/dev/null 2>&1 || { echo "gh not authed"; exit 1; }
 
+# A WARNING, never an exit: a brief-sourced review is degraded but honest, and it is reported as such.
+# Unattended, the operator's only signal is this line — without it "every story is flagged because
+# this machine has no CLI" and "every story is flagged because every story has caveats" print the
+# same run output, and the first is a machine problem nobody will look for.
+command -v linear >/dev/null 2>&1 || echo "WARNING: no \`linear\` CLI — every review will report spec_source: \"brief\" and no story can come back clean"
+
 # MUST-CHECK repo-anchor-guard-is-what-gates-an-unfixed-vulnerability: fail closed if the
 # plugin root isn't set — nothing below can find ship-config.ts without it. Every later fence
 # in THIS file (§4 and §6) re-declares this same guard, because no shell state survives across
@@ -360,14 +366,37 @@ Then dispatch **one** `drawbar-story-lead` agent (Opus). The brief must carry:
   Linear's `gitBranchName` from `get_issue`, which guarantees the PR auto-links
 - that it must **not** merge and has no Linear authority
 
-It returns the JSON report in its §7: `{status, branch, base, findings, mutation_pairs,
-out_of_scope, lessons, summary}`. It carries no `pr` — it opens none; §4 below is what opens
+It returns the JSON report in its §7: `{status, branch, base, spec_source, reviewed_sha, head_sha,
+findings, dedup, mutation_pairs, out_of_scope, lessons, summary}`. It carries no `pr` — it opens none; §4 below is what opens
 the PR and learns its number. **Do not ask it for the diff.** If you find yourself wanting
 one, the split is not working.
 
 `status: parked` → skip to *Parking a story*.
 
 ## 3. File out-of-scope findings as sub-issues
+
+**Search the parent's existing children before you file anything.** `list_issues` with the story's
+parent as `parentId`, then match every `out_of_scope` and every `findings[]` entry against those
+children on `dedup_key`: a child whose body carries the same `claim_hash` is the same defect already
+filed from an earlier story's review, and so is a child carrying the same `file` and the same `line`
+under a claim that restates it. A defect re-found by a later story is not new work — one story
+re-found a defect an earlier story had already filed, and it was filed a second time.
+
+- **On a match, `save_comment` on the existing sub-issue and file nothing new.** The comment names
+  the story that re-found it, which reviewer reported it, and this story's branch — that naming is
+  the point, because an uncommented match leaves the earlier sub-issue looking stale rather than
+  re-confirmed. A second sub-issue for one defect splits the discussion across two ids and gets
+  triaged as new work.
+- **On no match, file it** under the rules below, and put the finding's `dedup_key` in the body.
+  That key is what the next run matches against; a body without one is unmatchable forever after,
+  and the search above degrades to nothing for every story that follows.
+
+**Print every match and every suppression in the run output**, one line each: the `dedup_key`, the
+sub-issue id it resolved to, and whether you commented or filed. The story-lead's own `dedup` array
+is printed here too, so a finding the two reviewers both raised and the story-lead collapsed into
+one is visible as a collapse rather than as a finding that went missing. **Nothing is dropped
+silently** — a suppression nobody can see is indistinguishable from a finding that was never
+reported.
 
 **Mandatory, not discretionary.** For each entry in `out_of_scope`, `save_issue` a new
 sub-issue under the same parent: title naming the bug not the symptom; description with
@@ -421,10 +450,37 @@ contract: `flagged` becomes the JSON boolean `true`, `ok` becomes `false` — a 
 never reaches this step at all, because §2 routes it straight to *Parking a story*. On a
 **flagged** story, the PR body carries an `## Unresolved findings` section, built before
 `gh pr create` runs, never appended after. That section names each surviving finding by
-its filed sub-issue id and title only — never the finding body, `file:line`, or a quoted
-source excerpt; the full write-up already lives in the sub-issue §3 filed for it, and
-republishing it in a public PR body announces an unpatched detail to every repo watcher
-before the operator's morning review.
+its filed sub-issue id and title only — never the finding body, `file:line`, a finding's
+`dedup_key` or any of its `file` / `line` / `claim_hash` fields, or a quoted source excerpt;
+the full write-up already lives in the sub-issue §3 filed for it, and republishing it in a
+public PR body announces an unpatched detail to every repo watcher before the operator's
+morning review. The `dedup_key` is named here beside `file:line` because it is the same
+location in structured form: a serializer that drops `detail` and emits the key has published
+the location anyway, and a ban worded against one spelling is not a ban on the field.
+
+**Every PR body opens with a review-provenance line, on a flagged story and a clean one alike**,
+built before `gh pr create` runs: `reviewed at <reviewed_sha> from <spec_source>; N commits since`,
+where `<reviewed_sha>` is what the reviewers read, `<spec_source>` is `cli` or `brief` — the source
+that review actually read the spec from — and `N` is the commit count between the sha and the
+story-lead's `head_sha`, all three taken from that report. The fix pass commits after the reviewers
+read the diff, so every review is stale by construction and `N` is normally non-zero; stating it is
+the whole point, and no second review round closes it. **State `N` even when it is zero** — an
+omitted line reads exactly like a review that was never stale, which is the claim this line exists
+to stop anyone making. **State `<spec_source>` even when it is `cli`** — a review that never reached
+Linear is blind to an AMENDED banner, a superseded section and a struck decision, and on this
+unattended path the PR body is the only place a reader can find that out; printing it only when it
+is `brief` makes its absence the signal, and an absence is what nobody notices at 3am.
+
+**Shape-check both shas before you build that line, and park the story if either refuses.**
+`reviewed_sha` and `head_sha` reach you as free text from a subagent that read a branch under
+review, and the story-lead's contract copies them through verbatim — nothing between there and here
+has looked at them. Each must match `^[0-9a-f]{40}$`, and each must resolve in the repository this PR opens
+against: `git -C "$PROJECT_DIR" cat-file -e "<sha>^{commit}"`. `N` is then
+`git -C "$PROJECT_DIR" rev-list --count "<reviewed_sha>..<head_sha>"`, anchored the same way and
+never derived from whatever branch happens to be checked out. A sha that is malformed, or that does
+not resolve here, parks the story with that as the reason — it attests to a tree this repository
+does not have, and a foreign 40-hex sha is shape-identical to a real one once it is in the PR body.
+Where the two reviewers read different shas, name both, one line each.
 
 **Nothing carries over into the fence below.** No shell state survives across two Bash tool
 calls, so every value it consumes is re-derived inside it from one source of truth — a fresh
@@ -504,10 +560,12 @@ cat > "$PR_TITLE_FILE" <<'DRAWBAR_PR_TITLE_SENTINEL'
 DRAWBAR_PR_TITLE_SENTINEL
 
 cat > "$PR_BODY_FILE" <<'DRAWBAR_PR_BODY_SENTINEL'
-<the PR body, verbatim — nothing here expands. On a flagged story it is written out here with
+<the PR body, verbatim — nothing here expands. Its first line is the review-provenance line
+`reviewed at <reviewed_sha> from <spec_source>; N commits since`, with both shas already
+shape-checked and resolved per the prose above. On a flagged story it is written out here with
 its `## Unresolved findings` section already in it, listing each surviving finding as
 `<SUB-ISSUE-ID> — <sub-issue title>` and nothing else: never the finding body, never a
-`file:line`, never a quoted source excerpt.>
+`file:line`, never a `dedup_key` or any of its fields, never a quoted source excerpt.>
 DRAWBAR_PR_BODY_SENTINEL
 
 # --- read the substituted inputs ------------------------------------------------------------

@@ -127,7 +127,37 @@ If a mutation produces no failure, that is a missing test. Send it back before r
 ## 5. Review, and exactly one fix pass
 
 Dispatch **`code-reviewer`** and **`security-reviewer`** in parallel, in one message.
-Give the code reviewer the acceptance criteria; give the security reviewer `$KB`.
+Give the code reviewer the acceptance criteria; give the security reviewer `$KB`. Give both the
+story's Linear issue id — each reads the spec from Linear itself, because the brief you wrote is a
+summary and a summary cannot carry what the spec struck — and give both `$PROJECT_DIR`, because each
+reads its own `reviewed_sha` off the tree with `git -C` and a subagent's working directory is not
+guaranteed to be the project's.
+
+**A malformed reviewer report is not an approval — it is a failed review, and it parks the story.**
+A report is malformed when it omits `spec_source`, omits `reviewed_sha`, carries a finding without a
+`dedup_key`, or — from the security-reviewer alone, whose contract is the only one that defines the
+field — returns an empty `findings` list alongside an empty or absent `checked`. Each of
+those leaves the review unable to account for what it did, so there is nothing to grade: an empty
+finding list from a reviewer that cannot say what it read is indistinguishable from a reviewer that
+never ran, and the security-reviewer's own contract says its caller must treat that payload as
+malformed. You are that caller. Do not re-dispatch the reviewer, do not repair the report yourself,
+and do not proceed on the other reviewer alone: set `status: parked` with `parked_reason` naming
+which reviewer returned what, and push nothing.
+
+**A reviewer reporting `spec_source: "brief"` never yields `ok`.** It could not reach the story's
+Linear record, so it reviewed a summary written before any amendment — an AMENDED banner, a
+superseded section, a struck decision are all invisible there, and the review may have approved the
+design the amendment replaced. Carry that caveat into your report's `summary` and set
+`status: flagged` at best.
+
+**Collapse the two reviews by `dedup_key`, never by hand.** Two findings whose keys carry the same
+`claim_hash` and the same `file` are one finding: keep the higher severity, record both reporters,
+and send it into the fix pass once. `line` locates a finding, it does not identify one — two
+reviewers who found one defect routinely anchor to different lines, the declaration and the use, and
+a collapse gated on the whole triple would leave that pair uncollapsed with this rule forbidding you
+to correct it. That is the same match your caller makes against the sub-issues already filed.
+Every collapse and every suppression goes into the report's `dedup` array — a duplicate you dropped
+without recording it is a finding your caller cannot tell from one that was never reported.
 
 Fixes are implementation: re-dispatch `story-implementer` in fix mode with the merged
 findings, require a red→green regression test for any real bug or security finding, then
@@ -162,6 +192,12 @@ git -C "$PROJECT_DIR" commit -m "<type>: <summary> (<STORY>)"   # hooks run — 
 git -C "$PROJECT_DIR" push -u origin "$BRANCH"
 ```
 
+**Capture the branch head after the last commit, with `git -C "$PROJECT_DIR" rev-parse HEAD`, and
+report it as `head_sha`.** It sits beside the reviewers' `reviewed_sha` in your report. The fix pass
+commits after the reviewers read the diff, so the two differ by construction and no second review
+closes the gap; your caller publishes the divergence rather than eliminating it, and it can only do
+that if you hand it both ends.
+
 **You open no pull request — pushing the branch is where your work ends.** Your caller's §4
 opens the stacked pull request against the base *it* resolves, and it is the only step that
 may. Were you to open one too, both steps would submit the identical head+base pair on the
@@ -177,13 +213,23 @@ story 1 every night.
   "branch": "<user>/<team>-####-slug",
   "base": "<the $BASE_BRANCH you cut from>",
   "parked_reason": null,
-  "findings": [{"severity": "Critical | Important", "detail": "file:line, what survives the fix pass, why"}],
+  "spec_source": {"code_reviewer": "cli | brief", "security_reviewer": "cli | brief"},
+  "reviewed_sha": {"code_reviewer": "<full sha>", "security_reviewer": "<full sha>"},
+  "head_sha": "<the branch head you pushed>",
+  "findings": [{"severity": "Critical | Important", "detail": "file:line, what survives the fix pass, why", "dedup_key": {"file": "...", "line": 0, "claim_hash": "..."}}],
+  "dedup": [{"dedup_key": {"file": "...", "line": 0, "claim_hash": "..."}, "reported_by": ["code-reviewer", "security-reviewer"], "action": "collapsed | suppressed", "kept": "Critical | Important | Minor"}],
   "mutation_pairs": [{"mutation": "...", "failing_test": "..."}],
   "out_of_scope": [{"title": "...", "detail": "file:line, what is wrong, why out of scope"}],
   "lessons": [{"key": "kebab-key", "type": "learned", "content": "...", "tags": ["..."]}],
   "summary": "two or three sentences"
 }
 ```
+
+**`spec_source`, `reviewed_sha` and `head_sha` are reported per reviewer and are never inferred.**
+Copy each reviewer's own values through verbatim; a value you filled in for a reviewer that did not
+report one is a fabricated attestation, and it is exactly what the malformed-report rule refuses.
+`head_sha` is the branch head you pushed, and `reviewed_sha` is what each reviewer read — state both
+even when they are equal, because an omitted pair reads the same as a review that was never stale.
 
 The three statuses differ in kind, not in degree, and each gets its own header below. Never
 collapse them into one shared "satisfied if any of the following" list: `ok` and `flagged`
@@ -196,15 +242,19 @@ request.
 
 **`flagged` — Important findings survived the one fix pass.** The branch is still pushed and
 your caller still opens the pull request; the surviving findings travel in `findings` so your
-caller can decide how to surface them. **`detail` is for your caller's eyes, not for verbatim
-republication:** it carries `file:line` and the specifics of a defect nobody has patched, the
-pull request is public, and it is opened before any human has reviewed the story. How much of
-that is safe to publish is your caller's call, not something you authorize here. This is not
-a failure to complete the story.
+caller can decide how to surface them. **`detail` and `dedup_key` are both for your caller's eyes,
+not for verbatim republication:** `detail` carries `file:line` and the specifics of a defect nobody
+has patched, and `dedup_key` carries the same `file` and `line` in structured form, so a serializer
+that skips `detail` and emits the key has published the location anyway. The pull request is public,
+and it is opened before any human has reviewed the story. How much of that is safe to publish is
+your caller's call, not something you authorize here. This is not a failure to complete the story.
 
 **`parked` — the story could not be completed at all.** The verify gate (§3) or the mutation
 gate (§4) could not be satisfied, or a Critical finding survived the one fix pass (§5). There
-is no branch to stack the next story on; set `parked_reason` and say which gate refused.
+is no branch to stack the next story on; set `parked_reason` and say which gate refused. **A
+malformed reviewer report parks it too, under the same section's rule** — a review that cannot
+account for what it read is a review that did not happen, and there is nothing for a fix pass to
+act on.
 
 No diffs, no test logs, no review bodies — your caller must not need them. `lessons` are
 written to the KB by your caller; `status: parked` means there is nothing to stack on, and
