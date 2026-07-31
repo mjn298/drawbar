@@ -124,6 +124,21 @@ git -C "$(dirname "$CONFIG_REAL")" ls-files --error-unmatch "$CONFIG_REAL" >/dev
   && { echo "FATAL: $CONFIG is tracked by git — a committed ship config is never trusted. Untrack it (git rm --cached) and keep it out of version control."; exit 1; } \
   || true
 
+# --- ship inputs directory ------------------------------------------------------------------
+# Four files the agent writes with the Write tool are consumed further down, and the agent has to
+# know their ABSOLUTE path before §4's fence runs — no shell state survives between two Bash tool
+# calls, so the path cannot be handed forward in a variable, and `pwd` is printed here rather than
+# guessed. That fence recomputes the same path from its own `$PWD` and refuses outright if the two
+# ever differ. The `.gitignore` is created HERE, before anything is written into that directory,
+# and not in that fence: the fence runs AFTER the writes, and a run killed between them never
+# reaches it at all. `$PWD` is a working tree that `drawbar-story-lead` stages with `git add -A`,
+# so a PR body left behind by a killed run would otherwise be swept into the NEXT story's commit
+# and pushed to a public PR, carrying the issue ids and team prefixes the inputs document holds.
+mkdir -p "$PWD/.drawbar/tmp/" || { echo "FATAL: cannot create $PWD/.drawbar/tmp/ — refusing."; exit 1; }
+printf '%s\n' '*' '!.gitignore' > "$PWD/.drawbar/tmp/.gitignore" || { echo "FATAL: cannot write $PWD/.drawbar/tmp/.gitignore — refusing."; exit 1; }
+echo "SHIP_CWD: $PWD"
+# --- end ship inputs directory ----------------------------------------------------------------
+
 # Fetch the Linear facts THIS AGENT SESSION can see via MCP — ship-config.ts has no Linear
 # tools of its own, only the session driving this command does — and hand them to the
 # validator as JSON on stdin, the same convention `drawbar-kb add` uses:
@@ -489,91 +504,131 @@ calls, so every value it consumes is re-derived inside it from one source of tru
 exported `REPO` would otherwise win and aim every `gh` call at an unvalidated repository, and
 an empty `$BASE` yields `--base ""`, which is Locked A's exact failure mode.
 
-**Every value you substitute goes into a quoted heredoc, never into an assignment.** The
-branch name, the PR title and the PR body all originate in text produced from the repository
-under review, and you paste them in literally — so a single `"` would close a double-quoted
-assignment and the `$(...)` after it would run. Inside `<<'SENTINEL'` nothing expands and
-nothing executes; the fence reads the values back out with `jq -r` and `cat`.
+**Every value that came out of the repository under review reaches the fence as a FILE you
+write, never as text substituted into the fence.** The branch name, the PR title and the PR
+body all originate in text produced from the repository under review, and the inputs document
+is the only other thing you fill in. **Write all four with the Write tool before you run the
+fence**, at exactly these four paths — `<cwd>` is the absolute path Preflight printed as
+`SHIP_CWD:`, never a path you infer; the fence recomputes the same four from its own `$PWD` and
+refuses outright if the two differ, rather than reading a file it did not expect. **Rewrite all
+four every time**: the fence deletes them on every path it reaches, but a run that dies before
+it leaves them on disk, and no gate can tell a stale input from a fresh one.
 
-**Before you substitute anything, check every value for a line equal to the terminator you
-are pasting it under, and halt the run if you find one** — park the story with that as the
-reason, and never rewrite, escape, or truncate the value to make it fit. A quoted heredoc
-protects the value's `"`, `$` and backticks, but it still ends at the first line equal to its
-terminator, and these terminators are fixed literals published in this repository: a report
-line reading exactly `DRAWBAR_PR_BODY_SENTINEL` closes the body heredoc early and every line
-after it is parsed as shell — arbitrary command execution under the operator's authenticated
-`gh`, with the written file left looking entirely correct. A check inside the fence cannot
-save you here: by the time any line of it runs, the injected commands have already run.
+- `<cwd>/.drawbar/tmp/ship/inputs.json` — the inputs document below, filled in.
+- `<cwd>/.drawbar/tmp/ship/branch` — the story-lead report's `branch` field, verbatim,
+  one line and nothing else.
+- `<cwd>/.drawbar/tmp/ship/title` — the PR title, one line and nothing else.
+- `<cwd>/.drawbar/tmp/ship/body` — the PR body, verbatim. Its first line is the
+  review-provenance line `reviewed at <reviewed_sha> from <spec_source>; N commits since`, with
+  both shas already shape-checked and resolved per the prose above. On a flagged story it is
+  written out here with its `## Unresolved findings` section already in it, listing each
+  surviving finding as `<SUB-ISSUE-ID> — <sub-issue title>` and nothing else: never the finding
+  body, never a `file:line`, never a `dedup_key` or any of its fields, never a quoted source
+  excerpt.
 
-**No value that came out of the repository under review is ever pasted into a JSON document.**
-The branch name gets its own heredoc file and is read back with `cat`, because a `"` in a value
-pasted between two `"` inside the inputs document does not produce invalid JSON that `jq -e .`
-would refuse — it appends keys, and `jq` resolves duplicate keys last-wins, so it silently
-overrides any key declared above it (`arg` names the state file, `story` picks the base). Both
-shape gates then pass, because they see only the laundered values. A key whitelist is not a
-defence: the injected document has exactly the same key set.
+**The fence authors none of those four files and substitutes nothing into itself.** It carries
+no fill-in slot at all: every value it consumes it reads back out of a file it did not write,
+with `jq -r`, `cat` or `--body-file`, so no text from the repository under review is ever
+parsed by a shell. That is the whole guarantee, and it holds structurally — there is no
+instruction here for an agent to follow correctly or to skip.
 
-```bash
-: "${CLAUDE_PLUGIN_ROOT:?CLAUDE_PLUGIN_ROOT must be set}"
+**The inputs document is a file you write, never a string the fence assembles.** `branch` is
+not a key in it: a `"` in a value placed between two `"` inside a hand-assembled JSON document
+does not produce invalid JSON that `jq -e .` would refuse — it appends keys, and `jq` resolves
+duplicate keys last-wins, so it silently overrides any key declared above it (`arg` names the
+state file, `story` picks the base). Both shape gates then pass, because they see only the
+laundered values. A key whitelist is not a defence: the injected document has exactly the same
+key set. Only values the repository under review cannot author live in here at all.
 
-# EVERY agent-substituted value enters through the four QUOTED heredocs below and nowhere
-# else — this is the explicit-assignment convention §6 uses for $LESSONS_JSON, hardened.
-# Substituted into an ordinary double-quoted assignment, one `"` in report text closes the
-# string and `$(...)`/backticks then execute; even single quotes only move the problem to `'`.
-# The branch name, the title and the body all derive from the repository under review, so
-# nothing here is assigned by interpolation at all: inside a QUOTED heredoc (`<<'SENTINEL'`)
-# nothing expands and no command runs, and the values are read back out with `jq -r` / `cat`,
-# never eval'd. A value consumed but never bound would merely halt the run every night; a
-# value bound by interpolation is arbitrary code execution. The one thing a quoted heredoc does
-# NOT protect against is a substituted line equal to the terminator itself — that closes the
-# heredoc and the rest is parsed as shell, so the halt instruction above this fence is part of
-# the guarantee, not an aside, and no check placed here could replace it.
-# `mktemp -d` and not a fixed path: the four `cat >` redirects below follow symlinks, so a
-# guessable directory lets a local user pre-plant one and have this fence truncate an arbitrary
-# file — and substitute the body it then hands to `gh --body-file`.
-IN_DIR=$(mktemp -d) || { echo "FATAL: mktemp -d failed — refusing."; exit 1; }
-INPUTS="${IN_DIR}/inputs.json"
-BRANCH_FILE="${IN_DIR}/branch"
-PR_TITLE_FILE="${IN_DIR}/title"
-PR_BODY_FILE="${IN_DIR}/body"
-
-# `branch` is NOT a key in this document: it derives from the repository under review, and a `"`
-# in a value pasted between two `"` here appends keys rather than breaking the parse — jq takes
-# the LAST of a duplicate key, so an injected `"arg"`/`"story"` silently wins and aims $STATE,
-# assert-chain and resolve-base at a different run. Only values the repository under review
-# cannot author live in here.
-cat > "$INPUTS" <<'DRAWBAR_INPUTS_SENTINEL'
+```json
 {
   "arg":     "<the id THIS RUN was invoked with — it names the state file>",
   "story":   "<TEAM>-####",
   "teams":   <the list_teams result for this session, as a JSON array>,
   "flagged": <the report `status`: flagged -> true, ok -> false; a JSON boolean, never a string>
 }
-DRAWBAR_INPUTS_SENTINEL
+```
 
-cat > "$BRANCH_FILE" <<'DRAWBAR_BRANCH_SENTINEL'
-<the story-lead report's `branch` field, verbatim, one line — nothing here expands>
-DRAWBAR_BRANCH_SENTINEL
+**The four quoted heredocs this step used to carry are retired, and must never come back.**
+They passed the branch, the title, the body and the inputs document through the shell parser.
+Quoting neutralised `"`, `$(...)` and backticks — but not a substituted line equal to the
+terminator itself, which closed the heredoc and left every line after it parsed as shell:
+arbitrary command execution under the operator's authenticated `gh`, with the written file left
+looking entirely correct, and the terminators were fixed literals published in this public
+repository, so the value an attacker needed was never secret. The interim mitigation was an
+instruction above the fence to check each value for such a line and halt; it is deleted here
+because it is now inert — there is no terminator left to collide with, and an instruction of
+that kind only ever proved it had been written down, never that it was obeyed. Re-adding a
+heredoc that carries substituted text reopens the vector in full.
 
-cat > "$PR_TITLE_FILE" <<'DRAWBAR_PR_TITLE_SENTINEL'
-<the PR title, one line, verbatim — nothing here expands>
-DRAWBAR_PR_TITLE_SENTINEL
+```bash
+: "${CLAUDE_PLUGIN_ROOT:?CLAUDE_PLUGIN_ROOT must be set}"
 
-cat > "$PR_BODY_FILE" <<'DRAWBAR_PR_BODY_SENTINEL'
-<the PR body, verbatim — nothing here expands. Its first line is the review-provenance line
-`reviewed at <reviewed_sha> from <spec_source>; N commits since`, with both shas already
-shape-checked and resolved per the prose above. On a flagged story it is written out here with
-its `## Unresolved findings` section already in it, listing each surviving finding as
-`<SUB-ISSUE-ID> — <sub-issue title>` and nothing else: never the finding body, never a
-`file:line`, never a `dedup_key` or any of its fields, never a quoted source excerpt.>
-DRAWBAR_PR_BODY_SENTINEL
+# NOTHING in this fence is substituted, and it authors none of the four files it reads. The
+# four values that come out of the repository under review — the inputs document, the branch
+# name, the PR title, the PR body — were written by the agent with the Write tool before this
+# block ran, and this block only ever reads them back with `jq -r`, `cat` and `--body-file`, so
+# untrusted text is never parsed by a shell at all. The four QUOTED heredocs that used to carry
+# them are gone for good: a substituted line equal to a heredoc terminator closes it early and
+# the rest is parsed as shell, and those terminators are fixed literals published in this public
+# repository. Do not reintroduce a heredoc, a here-string, or any other fill-in slot here.
+# The path is DETERMINISTIC rather than `mktemp -d`, because the agent has to know where to
+# write before this block runs; Preflight prints it, so it is never guessed. That gives up
+# everything `mktemp -d` provided for free, and each half is bought back explicitly below.
+# Unguessability is replaced by the directory gate: this path is entirely predictable, so a
+# branch under review can commit `.drawbar/`, `.drawbar/tmp/` or `ship` itself as a DIRECTORY
+# SYMLINK (git stores mode 120000 and it survives checkout), and `-L` on the four LEAF paths
+# cannot see a symlinked component above them — the agent's writes and this block's `rm -f`
+# would both follow it and truncate, then unlink, four arbitrary files under the operator's
+# identity. The gate therefore refuses unless $IN_DIR resolves to exactly itself.
+# Freshness is replaced only PARTLY, and the limit is stated rather than papered over. The EXIT
+# trap removes all four however this block ends, so a run that REACHES it leaves nothing behind;
+# but a run that dies before it — session killed, agent errored, story parked in an earlier
+# section — leaves all four on disk, and the file gate cannot tell a stale file from a fresh one.
+# Rewrite ALL FOUR immediately before running this block. That is the one thing here no gate can
+# check for you, and it is why the gate refuses an EMPTY file too: a zero-byte `body` would
+# otherwise open a PR with no review provenance and no `## Unresolved findings` section at all.
+# What the gate CAN tell is authorship: a branch under review can also just COMMIT four ordinary
+# regular files at these names, and they would satisfy every other check on the very first run,
+# so a tracked input is refused exactly as a tracked `$CONFIG` is.
+IN_DIR="$PWD/.drawbar/tmp/ship"
 
-# --- read the substituted inputs ------------------------------------------------------------
-jq -e . "$INPUTS" >/dev/null 2>&1 || { echo "FATAL: the inputs heredoc is not valid JSON — refusing."; exit 1; }
+# --- inputs directory gate ----------------------------------------------------------------
+# BEFORE the trap is armed: `rm -f` follows a symlinked path component exactly as the agent's
+# writes do, so a redirected $IN_DIR has to be refused while there is still nothing armed to
+# delete through it. Both sides are symlink-resolved, so an operator whose checkout is reached
+# through a symlink is not refused, while a symlink at any component under it is.
+PWD_REAL=$(readlink -f "$PWD") || { echo "FATAL: cannot resolve the working directory to a real path — refusing."; exit 1; }
+IN_REAL=$(readlink -f "$IN_DIR") || { echo "FATAL: cannot resolve $IN_DIR to a real path — write all four inputs with the Write tool first; refusing."; exit 1; }
+[ "$IN_REAL" = "$PWD_REAL/.drawbar/tmp/ship" ] || { echo "FATAL: $IN_DIR does not resolve to itself — a symlinked path component would aim these reads, and the cleanup below, at another directory; refusing."; exit 1; }
+[ -d "$IN_REAL" ] || { echo "FATAL: $IN_DIR is not a directory — write all four inputs with the Write tool first; refusing."; exit 1; }
+# --- end inputs directory gate --------------------------------------------------------------
+
+INPUTS="${IN_DIR}/inputs.json"
+BRANCH_FILE="${IN_DIR}/branch"
+PR_TITLE_FILE="${IN_DIR}/title"
+PR_BODY_FILE="${IN_DIR}/body"
+trap 'rm -f "$INPUTS" "$BRANCH_FILE" "$PR_TITLE_FILE" "$PR_BODY_FILE"' EXIT
+
+# --- inputs file gate -------------------------------------------------------------------------
+for f in "$INPUTS" "$BRANCH_FILE" "$PR_TITLE_FILE" "$PR_BODY_FILE"; do
+  [ -f "$f" ] && [ -s "$f" ] && [ ! -L "$f" ] || { echo "FATAL: $f is missing, empty, is not a regular file, or is a symlink — write all four inputs with the Write tool immediately before running this block; refusing."; exit 1; }
+  git -C "$IN_REAL" ls-files --error-unmatch "$f" >/dev/null 2>&1 \
+    && { echo "FATAL: $f is tracked by git — a committed input is never trusted, whatever it contains. Untrack it (git rm --cached) and keep .drawbar/tmp/ out of version control."; exit 1; } \
+    || true
+done
+# --- end inputs file gate ---------------------------------------------------------------------
+
+# --- read the written inputs ------------------------------------------------------------
+jq -e . "$INPUTS" >/dev/null 2>&1 || { echo "FATAL: the inputs document is not valid JSON — refusing."; exit 1; }
 ARG=$(jq -r '.arg // empty' "$INPUTS")
 STORY=$(jq -r '.story // empty' "$INPUTS")
-# Read from its OWN file, never out of the inputs document: nothing about this value's text can
-# reach a JSON key, and its emptiness is refused by the ref-name shape gate below.
+# Read from its OWN file, never out of the inputs document: `branch` derives from the repository
+# under review, and a `"` in a value placed between two `"` in that document would append keys
+# rather than break the parse — jq takes the LAST of a duplicate key, so an injected
+# `"arg"`/`"story"` silently wins and aims $STATE, assert-chain and resolve-base at a different
+# run. Nothing about this value's text can reach a JSON key, and its emptiness is refused by the
+# ref-name shape gate below.
 BRANCH=$(cat "$BRANCH_FILE")
 # `flagged` and `teams` are TYPE-checked at the source, not merely non-empty: `flagged` reaches
 # `jq --argjson` below, where the string "true" would produce the string "true" in the stack
@@ -582,9 +637,9 @@ FLAGGED=$(jq -r 'if (.flagged|type)=="boolean" then (.flagged|tostring) else emp
 LINEAR_FACTS_JSON=$(jq -c 'if (.teams|type)=="array" then {teams:.teams} else empty end' "$INPUTS")
 for v in ARG STORY FLAGGED LINEAR_FACTS_JSON; do
   val="${!v}"
-  [ -n "$val" ] && [ "$val" != "null" ] || { echo "FATAL: $v is empty, null, or the wrong JSON type in the inputs heredoc — refusing."; exit 1; }
+  [ -n "$val" ] && [ "$val" != "null" ] || { echo "FATAL: $v is empty, null, or the wrong JSON type in the inputs document — refusing."; exit 1; }
 done
-# --- end read the substituted inputs --------------------------------------------------------
+# --- end read the written inputs ------------------------------------------------------------
 
 # $ARG is interpolated into the state-file path, so it must be a single safe path segment —
 # the same shape run-state.ts's `isSafePathSegment` enforces on the value it round-trips.
@@ -1022,6 +1077,14 @@ then `ScheduleWakeup({stop: true})`.
   file inside a working directory rather than exported env vars, and any repository's tree
   (including a contributor PR) can otherwise plant one. Keep it untracked, as `.gitignore`
   already enforces for the default path.
+- **§4's four inputs are files, not text pasted into a shell.** The branch name, the PR title,
+  the PR body and the inputs document are written with the Write tool under
+  `<cwd>/.drawbar/tmp/ship/`, and the fence there only reads them. Preflight creates that
+  directory's self-ignoring `.gitignore` in whatever repository you run from, before anything is
+  written into it, so a body left behind by a killed run is never stageable by the story-lead's
+  `git add -A`. The fence deletes all four files on every exit path it reaches — but that is
+  cleanup, not freshness: a run that dies before the fence leaves them on disk, and the fence's
+  gate cannot tell a stale input from a fresh one. The agent rewrites all four each time.
 - **Any guard refusal text must be paraphrased, never pasted**, into a KB entry or a Linear
   comment — `stack.ts`'s verdicts exactly as much as `ship-config.ts`'s, and a `parked_reason`
   exactly as much as a comment. Refusal `detail` strings echo absolute paths and the real repo
