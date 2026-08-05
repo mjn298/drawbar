@@ -2,9 +2,18 @@ import { test, expect, describe } from "bun:test";
 import { readFileSync, mkdtempSync, writeFileSync, rmSync, existsSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
-import type { ResolvedConfig, Runner } from "./ship-config";
+import { isValidRefName, type ResolvedConfig, type Runner } from "./ship-config";
 import type { RunState, StackEntry } from "./run-state";
-import { resolveBase, assertChainIntact, parseCliArgs, main, type MainDeps } from "./stack";
+import {
+  resolveBase,
+  assertChainIntact,
+  parseCliArgs,
+  main,
+  planCrashCleanup,
+  baseForNextStory,
+  SALVAGE_BRANCH_PREFIX,
+  type MainDeps,
+} from "./stack";
 
 // Placeholder-id scheme (this repo is PUBLIC — see run-state.test.ts's own comment): every
 // story id below is lowercase ("story-a", "story-b"), which cannot trip the leak-regression
@@ -134,11 +143,17 @@ const VALID_CHAIN_STATE: Pick<RunState, "stack" | "resolved_config"> = {
 //   - `merge-base --is-ancestor <base> <branch>` exits 0 when `base` IS an ancestor, exits 1
 //     when it genuinely is NOT (including two unrelated histories), and exits 128 for a
 //     fatal git error (e.g. a bogus ref) — 1 and 128 must route to distinct reasons.
+//   - `rev-list --count <base>..<branch> --` (PCO-381) exits 0 and prints the count on stdout
+//     for BOTH a commitless branch ("0") and a populated one ("1"), and exits 128 for a bogus
+//     ref. Unlike every other check here, the failure it detects is signalled in STDOUT, not
+//     in the exit code — verified against live git 2.50.1, including that two unrelated
+//     histories count as >0 (which is why `branch_moved` must be decided before this).
 function makeGitRunner(
   opts: {
     missingRefs?: Set<string>;
     gitErrorRefs?: Set<string>;
     ancestorExit?: (base: string, branch: string) => number;
+    revListCount?: (base: string, branch: string) => { code: number; stdout: string };
   } = {},
 ): { run: Runner; calls: string[][] } {
   const calls: string[][] = [];
@@ -164,6 +179,23 @@ function makeGitRunner(
       const branch = argv[5]!.slice("refs/heads/".length);
       const code = opts.ancestorExit ? opts.ancestorExit(base, branch) : 0;
       return { code, stdout: "", stderr: code !== 0 && code !== 1 ? "fatal: Not a valid object name" : "" };
+    }
+    if (argv[2] === "rev-list") {
+      // PCO-381, enforced on EVERY call through this one shared fake: the range's two halves
+      // must both be `refs/heads/`-qualified for the same reason merge-base's arguments are
+      // (a same-named tag would otherwise answer a question about a different object), and the
+      // `--` terminator must be present so a branch name can never be re-read as a pathspec.
+      expect(argv.length, `rev-list argv must be exactly 6 elements, got: ${argv.join(" ")}`).toBe(6);
+      expect(argv[3], "rev-list must ask for --count").toBe("--count");
+      expect(argv[4], "rev-list's range must be refs/heads/<base>..refs/heads/<branch>").toMatch(
+        /^refs\/heads\/[^.]\S*\.\.refs\/heads\/\S+$/,
+      );
+      expect(argv[5], "rev-list must terminate its revisions with --").toBe("--");
+      const [baseRef, branchRef] = argv[4]!.split("..");
+      const base = baseRef!.slice("refs/heads/".length);
+      const branch = branchRef!.slice("refs/heads/".length);
+      const res = opts.revListCount ? opts.revListCount(base, branch) : { code: 0, stdout: "1\n" };
+      return { ...res, stderr: res.code === 0 ? "" : "fatal: ambiguous argument" };
     }
     return { code: 1, stdout: "", stderr: `unexpected git invocation: ${argv.join(" ")}` };
   };
@@ -208,7 +240,8 @@ describe("assertChainIntact — refuses when a recorded predecessor branch is mi
     expect(result.reason).toBe("chain_link_mismatch");
     // The first entry is intact, so its git calls DID happen — the spy proves the SECOND
     // entry's defect was caught before ITS git calls, not that git was never called at all.
-    expect(calls.length).toBe(3);
+    // 4 per intact entry since PCO-381 added the commit-count check (was 3).
+    expect(calls.length).toBe(4);
   });
 
   // CRITICAL 1 mutant-kill: a 2-entry chain cannot distinguish `stack[i-1].branch` from
@@ -228,9 +261,11 @@ describe("assertChainIntact — refuses when a recorded predecessor branch is mi
     if (result.ok) return;
     expect(result.reason).toBe("chain_link_mismatch");
     expect(result.detail).toContain("stack[2]");
-    // Entries 0 and 1 are both fully intact — their git calls (3 each) DID happen; the
-    // mismatch at index 2 is caught before ITS git calls.
-    expect(calls.length).toBe(6);
+    // Entries 0 and 1 are both fully intact — their git calls (4 each: two rev-parse, one
+    // merge-base, one rev-list) DID happen; the mismatch at index 2 is caught before ITS git
+    // calls. The count went 3 -> 4 per entry when PCO-381 added the commit-count check.
+    expect(calls.length).toBe(8);
+    expect(calls.filter((c) => c[2] === "rev-list").length).toBe(2);
   });
 
   test("a relative (non-absolute) projectDir is refused before any git call (call-counter spy)", () => {
@@ -326,6 +361,90 @@ describe("assertChainIntact — refuses when a recorded predecessor branch is mi
     expect(result.ok).toBe(false);
     if (result.ok) return;
     expect(result.reason).toBe("git_failed");
+  });
+});
+
+// --- PCO-381 rule 1: never branch off an incomplete base ----------------------------------
+//
+// A branch with zero commits beyond its base is a DISTINCT failure from `branch_moved`: the
+// chain is perfectly intact (the base is still an ancestor — trivially, they are the same
+// commit), and every existing check above passes. It is what a dead implementer leaves behind,
+// and basing the next story on it is what turns one failed story into a stack of garbage PRs.
+describe("assertChainIntact — a commitless branch is its own named refusal (PCO-381)", () => {
+  test("a recorded branch with zero commits beyond its base refuses branch_commitless", () => {
+    const { run } = makeGitRunner({ revListCount: () => ({ code: 0, stdout: "0\n" }) });
+    const result = assertChainIntact({ stack: [STORY_A_ENTRY], resolved_config: VALID_RESOLVED_CONFIG }, PROJECT_DIR, run);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.reason).toBe("branch_commitless");
+  });
+
+  // The whole point of the story: this reason must be distinguishable from `branch_moved`, so a
+  // resume can reset a commitless branch (safe, it holds nothing) without ever resetting a
+  // rebased one (destructive, it holds the story's work).
+  test("branch_commitless is a different reason from branch_moved, on inputs that differ only in commit count", () => {
+    const { run: commitless } = makeGitRunner({ revListCount: () => ({ code: 0, stdout: "0\n" }) });
+    const { run: moved } = makeGitRunner({ ancestorExit: () => 1 });
+    const a = assertChainIntact({ stack: [STORY_A_ENTRY], resolved_config: VALID_RESOLVED_CONFIG }, PROJECT_DIR, commitless);
+    const b = assertChainIntact({ stack: [STORY_A_ENTRY], resolved_config: VALID_RESOLVED_CONFIG }, PROJECT_DIR, moved);
+    expect(a.ok).toBe(false);
+    expect(b.ok).toBe(false);
+    if (a.ok || b.ok) return;
+    expect(a.reason).not.toBe(b.reason);
+    expect(a.reason).toBe("branch_commitless");
+    expect(b.reason).toBe("branch_moved");
+  });
+
+  test("a branch with one commit beyond its base passes — the boundary is 0 vs 1, not 0 vs many", () => {
+    const { run } = makeGitRunner({ revListCount: () => ({ code: 0, stdout: "1\n" }) });
+    const result = assertChainIntact({ stack: [STORY_A_ENTRY], resolved_config: VALID_RESOLVED_CONFIG }, PROJECT_DIR, run);
+    expect(result).toEqual({ ok: true });
+  });
+
+  // Ordering pin: `branch_moved` is decided BEFORE the count. Verified against real git that two
+  // unrelated histories report a count > 0 — so a count-first implementation would pass a chain
+  // whose base is not an ancestor at all, which is the more serious of the two defects.
+  test("a branch that has BOTH moved and commits reports branch_moved, not the count verdict", () => {
+    const { run } = makeGitRunner({ ancestorExit: () => 1, revListCount: () => ({ code: 0, stdout: "3\n" }) });
+    const result = assertChainIntact({ stack: [STORY_A_ENTRY], resolved_config: VALID_RESOLVED_CONFIG }, PROJECT_DIR, run);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.reason).toBe("branch_moved");
+  });
+
+  test("a genuine git error from rev-list (exit 128) is git_failed, never read as a zero count", () => {
+    const { run } = makeGitRunner({ revListCount: () => ({ code: 128, stdout: "" }) });
+    const result = assertChainIntact({ stack: [STORY_A_ENTRY], resolved_config: VALID_RESOLVED_CONFIG }, PROJECT_DIR, run);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.reason).toBe("git_failed");
+  });
+
+  // `Number("")` is 0 and `Number("  ")` is 0 — an empty stdout on a zero exit would silently
+  // become "commitless" under a bare `Number(...)`, diagnosing a broken git as a clean verdict.
+  test.each([["", "empty stdout"], ["not-a-number\n", "non-numeric stdout"], ["1.5\n", "non-integer stdout"]])(
+    "unparseable rev-list stdout (%p, %s) is git_failed, never coerced to a count",
+    (stdout) => {
+      const { run } = makeGitRunner({ revListCount: () => ({ code: 0, stdout: stdout as string }) });
+      const result = assertChainIntact({ stack: [STORY_A_ENTRY], resolved_config: VALID_RESOLVED_CONFIG }, PROJECT_DIR, run);
+      expect(result.ok).toBe(false);
+      if (result.ok) return;
+      expect(result.reason).toBe("git_failed");
+    },
+  );
+
+  // The guard that actually matters for the story: story N+1 is dispatched only after the chain
+  // asserts, so a commitless story N branch must refuse even when it is the LAST entry of a
+  // longer, otherwise-healthy chain — not merely when it is the only one.
+  test("a commitless LAST entry refuses even when every earlier entry is healthy", () => {
+    const { run } = makeGitRunner({
+      revListCount: (_base, branch) => ({ code: 0, stdout: branch === STORY_B_ENTRY.branch ? "0\n" : "2\n" }),
+    });
+    const result = assertChainIntact(VALID_CHAIN_STATE, PROJECT_DIR, run);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.reason).toBe("branch_commitless");
+    expect(result.detail).toContain(STORY_B_ENTRY.story);
   });
 });
 
@@ -484,13 +603,21 @@ describe("main() — CLI entry, fully injectable", () => {
     const code = await main({
       argv: ["assert-chain", "--state", "/tmp/run.json", "--project-dir", flagDir],
       readState: () => JSON.stringify(VALID_RUN_STATE),
-      git: (argv) => { gitCalls.push(argv); return { code: 0, stdout: "", stderr: "" }; },
+      // `rev-list --count` (PCO-381) carries its answer in stdout, not the exit code — a blanket
+      // empty stdout would now be an unparseable count and refuse `git_failed`, which would make
+      // this test pass for the wrong reason on the assertions below.
+      git: (argv) => {
+        gitCalls.push(argv);
+        return { code: 0, stdout: argv[2] === "rev-list" ? "1\n" : "", stderr: "" };
+      },
       writeStdout: (s) => { written += s; },
       writeStderr: () => {},
     });
     expect(code).toBe(0);
     expect(JSON.parse(written)).toEqual({ ok: true });
     expect(gitCalls.length).toBeGreaterThan(0);
+    // The new check really did run through this CLI path, not just through the unit tests.
+    expect(gitCalls.some((argv) => argv[2] === "rev-list")).toBe(true);
     for (const argv of gitCalls) {
       expect(argv[0]).toBe("-C");
       // The FLAG's literal text, not the state file's copy — the two resolve() to the same
@@ -766,5 +893,441 @@ describe("the real CLI entry point wires .catch onto main().then(...) (source-an
     const entry = txt.slice(entryStart);
     expect(entry).toMatch(/main\(\)\s*\.then\(\(code\)\s*=>\s*process\.exit\(code\)\)\s*\.catch\(/);
     expect(entry).toContain("process.exit(1)");
+  });
+});
+
+// --- PCO-381 rule 2: resume must clean up after a dead agent -------------------------------
+//
+// The crash this exists for left a branch with ZERO commits and a 509-line untracked file in
+// the tree. A naive retry runs `git checkout -b <branch>` and dies on "already exists" — so
+// the resume path fails on the wreckage of the first failure instead of recovering from it.
+//
+// `planCrashCleanup` is a read-only observer that returns a NAMED plan; it performs no git
+// write itself (the runbook executes the plan). Every observation is an injected git call, so
+// Locked 5 — "tests pass with `git` absent from PATH" — still holds.
+//
+// Real-git assumptions encoded in this fake, verified against live git 2.50.1:
+//   - `status --porcelain` exits 0 and prints one line per change, INCLUDING untracked files
+//     as `?? <path>` — the crash's 509-line spec file was untracked, so a fake that only
+//     modelled tracked changes would pass a plan that discards exactly the work at issue.
+//   - `branch -d` (which the runbook executes, never `-D`) exits 1 and refuses on a branch
+//     holding unmerged commits — the fail-closed backstop behind this plan.
+function makeCleanupRunner(
+  opts: {
+    existingRefs?: Set<string>;
+    gitErrorRefs?: Set<string>;
+    porcelain?: { code: number; stdout: string };
+    revListCount?: (base: string, branch: string) => { code: number; stdout: string };
+  } = {},
+): { run: Runner; calls: string[][] } {
+  const calls: string[][] = [];
+  const existing = opts.existingRefs ?? new Set([`refs/heads/${STORY_A_ENTRY.base}`, `refs/heads/${STORY_A_ENTRY.branch}`]);
+  const run: Runner = (argv) => {
+    calls.push(argv);
+    if (argv[2] === "rev-parse") {
+      const ref = argv[argv.length - 1]!;
+      if (opts.gitErrorRefs?.has(ref)) return { code: 128, stdout: "", stderr: "fatal: not a git repository" };
+      return existing.has(ref) ? { code: 0, stdout: "deadbeefcafe\n", stderr: "" } : { code: 1, stdout: "", stderr: "" };
+    }
+    if (argv[2] === "status") {
+      expect(argv[3], "dirtiness must be read with --porcelain, whose output is stable across git versions").toBe(
+        "--porcelain",
+      );
+      const res = opts.porcelain ?? { code: 0, stdout: "" };
+      return { ...res, stderr: res.code === 0 ? "" : "fatal: not a git repository" };
+    }
+    if (argv[2] === "rev-list") {
+      const [baseRef, branchRef] = argv[4]!.split("..");
+      const res = opts.revListCount
+        ? opts.revListCount(baseRef!.slice("refs/heads/".length), branchRef!.slice("refs/heads/".length))
+        : { code: 0, stdout: "0\n" };
+      return { ...res, stderr: res.code === 0 ? "" : "fatal: ambiguous argument" };
+    }
+    return { code: 1, stdout: "", stderr: `unexpected git invocation: ${argv.join(" ")}` };
+  };
+  return { run, calls };
+}
+
+const CRASHED_BRANCH = STORY_A_ENTRY.branch;
+const CRASHED_BASE = STORY_A_ENTRY.base;
+const DIRTY_TREE = { code: 0, stdout: "A  tracked.txt\n?? spec.md\n" };
+
+describe("planCrashCleanup — names what the resume must do, and never plans to discard work", () => {
+  test("a commitless branch with a dirty tree plans salvage_and_reset, naming where the work goes", () => {
+    const { run } = makeCleanupRunner({ porcelain: DIRTY_TREE });
+    const plan = planCrashCleanup(PROJECT_DIR, CRASHED_BRANCH, CRASHED_BASE, run);
+    expect(plan.ok).toBe(true);
+    if (!plan.ok) return;
+    expect(plan.action).toBe("salvage_and_reset");
+    expect(plan.salvageBranch).toBe(`${SALVAGE_BRANCH_PREFIX}${CRASHED_BRANCH}`);
+    expect(plan.dirty).toBe(true);
+    expect(plan.commits).toBe(0);
+  });
+
+  // The salvage destination must itself be a legal ref name, or the plan names a command that
+  // cannot run — the failure would surface only at 3am, on the recovery path, in the dark.
+  test("the salvage branch it names is a valid git ref name", () => {
+    const { run } = makeCleanupRunner({ porcelain: DIRTY_TREE });
+    const plan = planCrashCleanup(PROJECT_DIR, CRASHED_BRANCH, CRASHED_BASE, run);
+    if (!plan.ok) throw new Error("expected a plan");
+    expect(isValidRefName(plan.salvageBranch!)).toBe(true);
+  });
+
+  test("a commitless branch with a clean tree plans reset_branch — nothing to preserve, and no salvage ref invented", () => {
+    const { run } = makeCleanupRunner();
+    const plan = planCrashCleanup(PROJECT_DIR, CRASHED_BRANCH, CRASHED_BASE, run);
+    expect(plan.ok).toBe(true);
+    if (!plan.ok) return;
+    expect(plan.action).toBe("reset_branch");
+    expect(plan.salvageBranch).toBeNull();
+    expect(plan.branchExists).toBe(true);
+  });
+
+  // The existing runbook behaviour, preserved deliberately: a branch that HAS commits is the
+  // crashed run's real output. It is resumed on, never reset — resetting it is the destructive
+  // mistake this whole plan exists to keep separate from the safe one.
+  test("a branch with commits plans resume_on_branch, never a reset, even when the tree is dirty", () => {
+    const { run } = makeCleanupRunner({ porcelain: DIRTY_TREE, revListCount: () => ({ code: 0, stdout: "4\n" }) });
+    const plan = planCrashCleanup(PROJECT_DIR, CRASHED_BRANCH, CRASHED_BASE, run);
+    expect(plan.ok).toBe(true);
+    if (!plan.ok) return;
+    expect(plan.action).toBe("resume_on_branch");
+    expect(plan.commits).toBe(4);
+    expect(plan.dirty).toBe(true);
+    expect(plan.salvageBranch).toBeNull();
+  });
+
+  test("no branch and a clean tree plans clean_start — the crash never got as far as cutting a branch", () => {
+    const { run } = makeCleanupRunner({ existingRefs: new Set([`refs/heads/${CRASHED_BASE}`]) });
+    const plan = planCrashCleanup(PROJECT_DIR, CRASHED_BRANCH, CRASHED_BASE, run);
+    expect(plan.ok).toBe(true);
+    if (!plan.ok) return;
+    expect(plan.action).toBe("clean_start");
+    expect(plan.branchExists).toBe(false);
+    expect(plan.commits).toBe(0);
+  });
+
+  test("no branch but a dirty tree still salvages — uncommitted work outlives the branch that was never cut", () => {
+    const { run } = makeCleanupRunner({ existingRefs: new Set([`refs/heads/${CRASHED_BASE}`]), porcelain: DIRTY_TREE });
+    const plan = planCrashCleanup(PROJECT_DIR, CRASHED_BRANCH, CRASHED_BASE, run);
+    expect(plan.ok).toBe(true);
+    if (!plan.ok) return;
+    expect(plan.action).toBe("salvage_and_reset");
+    expect(plan.branchExists).toBe(false);
+    expect(plan.salvageBranch).toBe(`${SALVAGE_BRANCH_PREFIX}${CRASHED_BRANCH}`);
+  });
+
+  // "Never discard it silently" applied to the salvage destination itself: a second crash on
+  // the same story must not overwrite the first crash's preserved work.
+  test("an already-existing salvage ref refuses salvage_ref_exists rather than overwriting the earlier salvage", () => {
+    const { run } = makeCleanupRunner({
+      existingRefs: new Set([
+        `refs/heads/${CRASHED_BASE}`,
+        `refs/heads/${CRASHED_BRANCH}`,
+        `refs/heads/${SALVAGE_BRANCH_PREFIX}${CRASHED_BRANCH}`,
+      ]),
+      porcelain: DIRTY_TREE,
+    });
+    const plan = planCrashCleanup(PROJECT_DIR, CRASHED_BRANCH, CRASHED_BASE, run);
+    expect(plan.ok).toBe(false);
+    if (plan.ok) return;
+    expect(plan.reason).toBe("salvage_ref_exists");
+  });
+
+  test("an existing salvage ref does NOT block a plan that was never going to salvage", () => {
+    const { run } = makeCleanupRunner({
+      existingRefs: new Set([
+        `refs/heads/${CRASHED_BASE}`,
+        `refs/heads/${CRASHED_BRANCH}`,
+        `refs/heads/${SALVAGE_BRANCH_PREFIX}${CRASHED_BRANCH}`,
+      ]),
+      revListCount: () => ({ code: 0, stdout: "2\n" }),
+    });
+    const plan = planCrashCleanup(PROJECT_DIR, CRASHED_BRANCH, CRASHED_BASE, run);
+    expect(plan.ok).toBe(true);
+    if (!plan.ok) return;
+    expect(plan.action).toBe("resume_on_branch");
+  });
+});
+
+describe("planCrashCleanup — refuses before it ever reaches git, on the same trust roots as assertChainIntact", () => {
+  test("a projectDir that is not a clean absolute path refuses, with no git call made", () => {
+    const { run, calls } = makeCleanupRunner();
+    const plan = planCrashCleanup("relative/dir", CRASHED_BRANCH, CRASHED_BASE, run);
+    expect(plan.ok).toBe(false);
+    if (plan.ok) return;
+    expect(plan.reason).toBe("invalid_project_dir");
+    expect(calls).toEqual([]);
+  });
+
+  test.each([
+    ["--upload-pack=x", "a git OPTION, executed by git itself"],
+    ["+refs/heads/x:refs/remotes/origin/main", "a REFSPEC, not a branch name"],
+  ])("a git-argv-injection-shaped branch (%p — %s) refuses invalid_ref_shape with no git call made", (branch) => {
+    const { run, calls } = makeCleanupRunner();
+    const plan = planCrashCleanup(PROJECT_DIR, branch as string, CRASHED_BASE, run);
+    expect(plan.ok).toBe(false);
+    if (plan.ok) return;
+    expect(plan.reason).toBe("invalid_ref_shape");
+    expect(calls).toEqual([]);
+  });
+
+  test("a git-argv-injection-shaped base refuses invalid_ref_shape with no git call made", () => {
+    const { run, calls } = makeCleanupRunner();
+    const plan = planCrashCleanup(PROJECT_DIR, CRASHED_BRANCH, "--upload-pack=x", run);
+    expect(plan.ok).toBe(false);
+    if (plan.ok) return;
+    expect(plan.reason).toBe("invalid_ref_shape");
+    expect(calls).toEqual([]);
+  });
+
+  // Resetting the tree "to the base" is meaningless if the base is gone — and a missing base is
+  // exactly what a mid-run force-push or a manual branch deletion leaves behind.
+  test("a missing base refuses base_missing rather than planning a reset onto a ref that is not there", () => {
+    const { run } = makeCleanupRunner({ existingRefs: new Set([`refs/heads/${CRASHED_BRANCH}`]) });
+    const plan = planCrashCleanup(PROJECT_DIR, CRASHED_BRANCH, CRASHED_BASE, run);
+    expect(plan.ok).toBe(false);
+    if (plan.ok) return;
+    expect(plan.reason).toBe("base_missing");
+  });
+
+  test("a git error on the base probe (exit 128) is git_failed, distinct from base_missing", () => {
+    const { run } = makeCleanupRunner({ gitErrorRefs: new Set([`refs/heads/${CRASHED_BASE}`]) });
+    const plan = planCrashCleanup(PROJECT_DIR, CRASHED_BRANCH, CRASHED_BASE, run);
+    expect(plan.ok).toBe(false);
+    if (plan.ok) return;
+    expect(plan.reason).toBe("git_failed");
+  });
+
+  test("a git error on the branch probe (exit 128) is git_failed, never read as 'no branch'", () => {
+    const { run } = makeCleanupRunner({ gitErrorRefs: new Set([`refs/heads/${CRASHED_BRANCH}`]) });
+    const plan = planCrashCleanup(PROJECT_DIR, CRASHED_BRANCH, CRASHED_BASE, run);
+    expect(plan.ok).toBe(false);
+    if (plan.ok) return;
+    expect(plan.reason).toBe("git_failed");
+  });
+
+  // A failed dirtiness read must never present as "clean". Clean is the one answer that
+  // authorises deleting a branch with no salvage at all.
+  test("a failing status --porcelain is git_failed, never silently treated as a clean tree", () => {
+    const { run } = makeCleanupRunner({ porcelain: { code: 128, stdout: "" } });
+    const plan = planCrashCleanup(PROJECT_DIR, CRASHED_BRANCH, CRASHED_BASE, run);
+    expect(plan.ok).toBe(false);
+    if (plan.ok) return;
+    expect(plan.reason).toBe("git_failed");
+  });
+
+  test("a failing rev-list is git_failed, never read as a zero count that would authorise a reset", () => {
+    const { run } = makeCleanupRunner({ revListCount: () => ({ code: 128, stdout: "" }) });
+    const plan = planCrashCleanup(PROJECT_DIR, CRASHED_BRANCH, CRASHED_BASE, run);
+    expect(plan.ok).toBe(false);
+    if (plan.ok) return;
+    expect(plan.reason).toBe("git_failed");
+  });
+});
+
+describe("baseForNextStory — Locked A's selection rule, with one implementation site (PCO-381)", () => {
+  test("an empty stack selects the configured base branch", () => {
+    expect(baseForNextStory({ stack: [], resolved_config: VALID_RESOLVED_CONFIG })).toBe("trunk");
+  });
+
+  // Same CRITICAL-1 mutant `resolveBase` is pinned against: at length <= 2 the LAST entry and
+  // the FIRST entry coincide, so only a 3-entry stack distinguishes them.
+  test("a 3-entry stack selects the LAST entry's branch, not the first", () => {
+    const selected = baseForNextStory({
+      stack: [STORY_A_ENTRY, STORY_B_ENTRY, STORY_C_ENTRY],
+      resolved_config: VALID_RESOLVED_CONFIG,
+    });
+    expect(selected).toBe(STORY_C_ENTRY.branch);
+    expect(selected).not.toBe(STORY_A_ENTRY.branch);
+  });
+
+  // Single-implementation-site: `resolveBase` must ANSWER with this helper, not carry a second
+  // copy of the same selection rule that can drift from it.
+  test("resolveBase's answer agrees with baseForNextStory on the same state", () => {
+    const state = { ...BASE_RUN_STATE, snapshot: ["story-a", "story-b"], stack: [STORY_A_ENTRY] };
+    const result = resolveBase(state, "story-b", { baseBranch: "trunk" });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.base).toBe(baseForNextStory(state));
+  });
+});
+
+// --- CLI: `plan-cleanup --state <path> --project-dir <dir> --branch <name>` ----------------
+
+describe("parseCliArgs — plan-cleanup's own flag contract (PCO-381)", () => {
+  test("plan-cleanup parses well-formed --state, --project-dir and --branch", () => {
+    const result = parseCliArgs("plan-cleanup", [
+      "--state", "/tmp/run.json",
+      "--project-dir", "/tmp/repo",
+      "--branch", "story-a-branch",
+    ]);
+    expect(result).toEqual({ ok: true, state: "/tmp/run.json", projectDir: "/tmp/repo", branch: "story-a-branch" });
+  });
+
+  test.each([
+    [["--state", "/tmp/run.json", "--project-dir", "/tmp/repo"], "--branch is required"],
+    [["--state", "/tmp/run.json", "--branch", "story-a-branch"], "--project-dir is required"],
+    [["--project-dir", "/tmp/repo", "--branch", "story-a-branch"], "--state is required"],
+  ])("plan-cleanup with %p refuses: %s", (args, expected) => {
+    const result = parseCliArgs("plan-cleanup", args as string[]);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error).toBe(expected);
+  });
+
+  // Same both-directions discipline the other two subcommands get: a flag with no consumable
+  // value binds boolean `true` and must be refused, never silently treated as absent.
+  test("plan-cleanup's --branch with no consumable value is refused, not read as absent", () => {
+    const result = parseCliArgs("plan-cleanup", ["--state", "/tmp/run.json", "--project-dir", "/tmp/repo", "--branch"]);
+    expect(result).toEqual({ ok: false, error: "--branch requires a value" });
+  });
+
+  test("plan-cleanup's --branch repeated is refused", () => {
+    const result = parseCliArgs("plan-cleanup", [
+      "--state", "/tmp/run.json", "--project-dir", "/tmp/repo", "--branch", "a", "--branch", "b",
+    ]);
+    expect(result).toEqual({ ok: false, error: "--branch specified more than once" });
+  });
+
+  test("plan-cleanup rejects --story: the crashed story's branch is named directly, never inferred from an id", () => {
+    const result = parseCliArgs("plan-cleanup", [
+      "--state", "/tmp/run.json", "--project-dir", "/tmp/repo", "--branch", "a", "--story", "story-a",
+    ]);
+    expect(result).toEqual({ ok: false, error: "--story is not valid for plan-cleanup" });
+  });
+
+  // Accepting-but-ignoring a flag invites a caller to believe it does something — the same
+  // reason `--project-dir` is forbidden for resolve-base.
+  test.each([
+    ["resolve-base" as const, ["--state", "/tmp/run.json", "--story", "a", "--branch", "b"], "--branch is not valid for resolve-base"],
+    ["assert-chain" as const, ["--state", "/tmp/run.json", "--project-dir", "/tmp/repo", "--branch", "b"], "--branch is not valid for assert-chain"],
+  ])("%s rejects --branch", (cmd, args, expected) => {
+    const result = parseCliArgs(cmd, args as string[]);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error).toBe(expected);
+  });
+});
+
+describe("main() — plan-cleanup wires the state's own base in, and keeps --project-dir as the trust root", () => {
+  // The base is NOT taken from a flag: it is `baseForNextStory` applied to the run's own stack,
+  // so a resume cannot be pointed at an arbitrary base by whoever types the command.
+  test("plan-cleanup derives the base from the run state's stack, not from an operator-supplied flag", async () => {
+    let written = "";
+    const gitCalls: string[][] = [];
+    const stacked: RunState = { ...VALID_RUN_STATE, stack: [STORY_A_ENTRY] };
+    const code = await main({
+      argv: [
+        "plan-cleanup",
+        "--state", "/tmp/run.json",
+        "--project-dir", VALID_RESOLVED_CONFIG.projectDir,
+        "--branch", "story-b-branch",
+      ],
+      readState: () => JSON.stringify(stacked),
+      git: (argv) => {
+        gitCalls.push(argv);
+        if (argv[2] === "rev-parse") {
+          return { code: argv[argv.length - 1] === `refs/heads/${STORY_A_ENTRY.branch}` ? 0 : 1, stdout: "", stderr: "" };
+        }
+        return { code: 0, stdout: "", stderr: "" };
+      },
+      writeStdout: (s) => { written += s; },
+      writeStderr: () => {},
+    });
+    expect(code).toBe(0);
+    const plan = JSON.parse(written);
+    expect(plan.ok).toBe(true);
+    // Locked A: story B's base is story A's BRANCH, never the configured `trunk`.
+    expect(plan.base).toBe(STORY_A_ENTRY.branch);
+    expect(plan.base).not.toBe(VALID_RESOLVED_CONFIG.baseBranch);
+    expect(plan.action).toBe("clean_start");
+  });
+
+  test("plan-cleanup on an empty stack derives the configured base branch", async () => {
+    let written = "";
+    // The run's FIRST story: nothing stacked yet, so Locked A's base is the configured one.
+    const firstStory: RunState = { ...VALID_RUN_STATE, stack: [] };
+    const code = await main({
+      argv: [
+        "plan-cleanup",
+        "--state", "/tmp/run.json",
+        "--project-dir", VALID_RESOLVED_CONFIG.projectDir,
+        "--branch", "story-a-branch",
+      ],
+      readState: () => JSON.stringify(firstStory),
+      git: (argv) => {
+        if (argv[2] === "rev-parse") {
+          return { code: argv[argv.length - 1] === `refs/heads/${VALID_RESOLVED_CONFIG.baseBranch}` ? 0 : 1, stdout: "", stderr: "" };
+        }
+        return { code: 0, stdout: "", stderr: "" };
+      },
+      writeStdout: (s) => { written += s; },
+      writeStderr: () => {},
+    });
+    expect(code).toBe(0);
+    expect(JSON.parse(written).base).toBe(VALID_RESOLVED_CONFIG.baseBranch);
+  });
+
+  // CRITICAL 3, applied to the new verb: the state file is agent-writable, so its own
+  // projectDir copy must never reach `git -C`. Disagreement refuses before any git call.
+  test("plan-cleanup: --project-dir disagreeing with resolved_config.projectDir refuses with ZERO git calls", async () => {
+    let written = "";
+    const gitCalls: string[][] = [];
+    const code = await main({
+      argv: ["plan-cleanup", "--state", "/tmp/run.json", "--project-dir", "/tmp/decoy-repo", "--branch", "story-a-branch"],
+      readState: () => JSON.stringify(VALID_RUN_STATE),
+      git: (argv) => { gitCalls.push(argv); return { code: 0, stdout: "", stderr: "" }; },
+      writeStdout: (s) => { written += s; },
+      writeStderr: () => {},
+    });
+    expect(code).toBe(1);
+    expect(JSON.parse(written).reason).toBe("project_dir_untrusted");
+    expect(gitCalls).toEqual([]);
+  });
+
+  test("plan-cleanup anchors every git call at the FLAG's literal value, not the state file's copy", async () => {
+    const gitCalls: string[][] = [];
+    const flagDir = `${VALID_RESOLVED_CONFIG.projectDir}/.`;
+    await main({
+      argv: ["plan-cleanup", "--state", "/tmp/run.json", "--project-dir", flagDir, "--branch", "story-a-branch"],
+      readState: () => JSON.stringify(VALID_RUN_STATE),
+      git: (argv) => { gitCalls.push(argv); return { code: 0, stdout: argv[2] === "rev-list" ? "1\n" : "", stderr: "" }; },
+      writeStdout: () => {},
+      writeStderr: () => {},
+    });
+    expect(gitCalls.length).toBeGreaterThan(0);
+    for (const argv of gitCalls) {
+      expect(argv[1]).toBe(flagDir);
+      expect(argv[1]).not.toBe(VALID_RESOLVED_CONFIG.projectDir);
+    }
+  });
+
+  test("plan-cleanup writes a refusal verdict to stdout and exits 1 on a business refusal", async () => {
+    let written = "";
+    const code = await main({
+      argv: [
+        "plan-cleanup",
+        "--state", "/tmp/run.json",
+        "--project-dir", VALID_RESOLVED_CONFIG.projectDir,
+        "--branch", "story-a-branch",
+      ],
+      readState: () => JSON.stringify(VALID_RUN_STATE),
+      // Base missing: every rev-parse reports absent.
+      git: () => ({ code: 1, stdout: "", stderr: "" }),
+      writeStdout: (s) => { written += s; },
+      writeStderr: () => {},
+    });
+    expect(code).toBe(1);
+    expect(JSON.parse(written)).toMatchObject({ ok: false, reason: "base_missing" });
+  });
+
+  test("the usage line names all three subcommands", async () => {
+    let err = "";
+    const code = await main({ argv: ["bogus"], writeStderr: (s) => { err += s; }, writeStdout: () => {} });
+    expect(code).toBe(1);
+    expect(err).toContain("resolve-base");
+    expect(err).toContain("assert-chain");
+    expect(err).toContain("plan-cleanup");
   });
 });

@@ -358,6 +358,61 @@ genuinely outside the snapshot can only ever reach this halt.
 pure function with an injected clock — follow the same boundary and ordering as
 `dispatchVerdict` / `maybeDispatch` here rather than reimplementing the logic ad hoc.
 
+**Then assert the chain before dispatching — never branch off an incomplete base.** Story N+1
+is dispatched onto story N's branch (Locked A), so story N's branch must hold **at least one
+commit beyond its own base**. A branch with zero commits passes every other integrity check
+there is: its base is still an ancestor of it, trivially, because they are the same commit.
+That is exactly what a dead implementer leaves behind, and it is the difference between one
+failed story and three garbage PRs stacked on nothing. `assert-chain` refuses it as
+`branch_commitless` — a reason deliberately distinct from `branch_moved`, because a commitless
+branch is safe to reset and a moved one never is.
+
+This gate is **executable, not advisory**. A rule stated only in prose can be reasoned past;
+this one refuses.
+
+```bash
+# Re-derived here: no shell state survives between tool calls, and nothing already in this
+# session's context is a trust root — least of all the run state, which is agent-writable.
+ARG="<the id THIS RUN was invoked with — it names the state file>"
+LINEAR_FACTS_RAW='{"teams":<the list_teams result for this session, as a JSON array>}'
+LINEAR_FACTS_JSON=$(printf '%s' "$LINEAR_FACTS_RAW" | jq -c 'if (.teams|type)=="array" then {teams:.teams} else empty end' 2>/dev/null)
+: "${CLAUDE_PLUGIN_ROOT:?CLAUDE_PLUGIN_ROOT must be set}"
+for v in ARG LINEAR_FACTS_JSON; do
+  val="${!v}"
+  [ -n "$val" ] && [ "$val" != "null" ] || { echo "FATAL: $v is empty, null, or the wrong JSON type — refusing."; exit 1; }
+done
+case "$ARG" in ''|*/*|*'\'*|*..*) echo "FATAL: ARG is not a safe path segment — refusing."; exit 1;; esac
+
+# MUST-CHECK r3-must-not-source-project-dir-from-pasted-run-state: --project-dir comes from THIS
+# fresh validate and nowhere else. Both of Preflight's config guards run again, verbatim.
+CONFIG="${DRAWBAR_SHIP_CONFIG:-$PWD/.drawbar/ship.config.json}"
+[ -f "$CONFIG" ] || { echo "FATAL: no config at $CONFIG — refusing."; exit 1; }
+CONFIG_REAL=$(readlink -f "$CONFIG") || { echo "FATAL: cannot resolve $CONFIG to a real path — refusing."; exit 1; }
+git -C "$(dirname "$CONFIG_REAL")" ls-files --error-unmatch "$CONFIG_REAL" >/dev/null 2>&1 \
+  && { echo "FATAL: $CONFIG is tracked by git — a committed ship config is never trusted."; exit 1; } \
+  || true
+RESOLVED=$(echo "$LINEAR_FACTS_JSON" | bun run "${CLAUDE_PLUGIN_ROOT}/scripts/lib/ship-config.ts" validate --config "$CONFIG") \
+  || { echo "FATAL: ship-config validation refused — see stderr above."; exit 1; }
+ENV_DIR=$(echo "$RESOLVED" | jq -r '.envDir // empty')
+PROJECT_DIR=$(echo "$RESOLVED" | jq -r '.projectDir // empty')
+for v in ENV_DIR PROJECT_DIR; do
+  val="${!v}"
+  [ -n "$val" ] && [ "$val" != "null" ] || { echo "FATAL: $v is empty or null after validation — refusing."; exit 1; }
+done
+STATE="$ENV_DIR/.drawbar/runs/$ARG.json"
+
+# Echo `.reason` and NOTHING else — `.detail` carries absolute paths and the real repo slug,
+# and this repo is public.
+CHAIN_JSON=$(bun run "${CLAUDE_PLUGIN_ROOT}/scripts/lib/stack.ts" assert-chain --state "$STATE" --project-dir "$PROJECT_DIR")
+CHAIN_OK=$(printf '%s' "${CHAIN_JSON:-null}" | jq -r 'if (type=="object" and .ok==true) then "true" else "false" end' 2>/dev/null)
+[ "$CHAIN_OK" = "true" ] || { CHAIN_REASON=$(printf '%s' "${CHAIN_JSON:-null}" | jq -r '.reason // "unreadable-verdict"' 2>/dev/null); echo "NO_DISPATCH: assert-chain refused ($CHAIN_REASON) — do NOT dispatch; park the story. Paraphrase, never paste, the detail on stderr."; exit 1; }
+echo "CHAIN_OK: every recorded branch exists, still descends from its base, and holds commits"
+```
+
+A refusal here **parks the story and halts the run** — it never skips ahead to a later one.
+`branch_commitless` in particular means a recorded predecessor is empty, so there is nothing to
+stack on; go to *Crash recovery*, which is where an empty branch gets resolved.
+
 **Post a `save_comment` on the story before dispatching** — that implementation is starting,
 with the branch name and timestamp. A crashed run that never commits leaves *no* record of
 intent otherwise; this comment is what makes a crash recoverable. Move the story to
@@ -996,14 +1051,77 @@ anything is re-dispatched, never inferred from the branch that happens to be che
      esac
    fi
    ```
-5. **Resume at the earliest incomplete step.** Uncommitted work is *not* discarded — it is
-   the crashed run's output. Commit it on the story branch first so it is inspectable, then
-   re-dispatch the story-lead pointing at that branch and at the base step 4 re-established,
-   **re-writing `in_flight`** with the new dispatch time exactly as step 2 does for a fresh
-   dispatch.
-6. If the tree is dirty but the state file names **no** in-flight story, halt and notify —
+5. **Clean up the dead agent's wreckage before re-dispatching anything.** The crash that
+   forced this step left **a branch with zero commits and a 509-line untracked file in the
+   tree**. A naive retry runs `git checkout -b <branch>`, dies on *"already exists"*, and the
+   recovery path then fails on the wreckage of the first failure instead of recovering from
+   it. `stack.ts plan-cleanup` decides what to do; it only ever **reads**, and this step
+   executes the plan it names.
+
+   ```bash
+   # $PROJECT_DIR and $STATE come from step 4's fence, in the SAME Bash invocation as this
+   # block — re-run that fence first if this is a separate call. BRANCH is the branch named in
+   # the story's step-2 start comment, which is why that comment is posted before dispatch.
+   BRANCH="<the branch named in the story's step 2 start comment>"
+   ( LC_ALL=C; [[ "$BRANCH" =~ ^[A-Za-z0-9][/A-Za-z0-9._-]*$ ]] ) || { echo "FATAL: BRANCH is not a valid git ref name — refusing."; exit 1; }
+
+   PLAN_JSON=$(bun run "${CLAUDE_PLUGIN_ROOT}/scripts/lib/stack.ts" plan-cleanup --state "$STATE" --project-dir "$PROJECT_DIR" --branch "$BRANCH")
+   PLAN=$(printf '%s' "${PLAN_JSON:-null}" | jq -r 'if (type=="object" and .ok==true) then .action else empty end' 2>/dev/null)
+   [ -n "$PLAN" ] || { PLAN_REASON=$(printf '%s' "${PLAN_JSON:-null}" | jq -r '.reason // "unreadable-verdict"' 2>/dev/null); echo "PARK: plan-cleanup refused ($PLAN_REASON) — park the story; paraphrase, never paste, the detail on stderr."; exit 1; }
+   SALVAGE=$(printf '%s' "$PLAN_JSON" | jq -r '.salvageBranch // empty')
+   # The base comes from the PLAN, not from step 4's `$BASE` — plan-cleanup derives it with the
+   # same `baseForNextStory` rule and has already shape-gated it, and step 4 leaves `$BASE`
+   # empty on its `story_already_stacked` path, where an unset variable here would `checkout ""`.
+   BASE=$(printf '%s' "$PLAN_JSON" | jq -r '.base // empty')
+   [ -n "$BASE" ] || { echo "PARK: the plan named no base — refusing to reset the tree onto nothing."; exit 1; }
+
+   case "$PLAN" in
+     resume_on_branch)
+       # The branch holds real commits — that IS the crashed run's output. Never reset it.
+       # Commit the tree onto it so the work is inspectable, then resume on it.
+       git -C "$PROJECT_DIR" checkout "$BRANCH" || { echo "PARK: cannot check out $BRANCH."; exit 1; }
+       if [ -n "$(git -C "$PROJECT_DIR" status --porcelain)" ]; then
+         git -C "$PROJECT_DIR" add -A && git -C "$PROJECT_DIR" commit -m "wip: uncommitted work recovered from a crashed dispatch" \
+           || { echo "PARK: could not commit the recovered tree."; exit 1; }
+       fi
+       echo "RESUME_ON_BRANCH: $BRANCH"
+       ;;
+     salvage_and_reset)
+       # Nothing is committed on the story branch, but the tree carries work. PRESERVE FIRST,
+       # then reset — in that order, so a failure at any point leaves the work still on disk.
+       [ -n "$SALVAGE" ] || { echo "PARK: plan named no salvage branch."; exit 1; }
+       git -C "$PROJECT_DIR" checkout -b "$SALVAGE" || { echo "PARK: cannot create $SALVAGE."; exit 1; }
+       git -C "$PROJECT_DIR" add -A && git -C "$PROJECT_DIR" commit -m "salvage: partial work from a crashed dispatch" \
+         || { echo "PARK: could not commit the salvage."; exit 1; }
+       git -C "$PROJECT_DIR" checkout "$BASE" || { echo "PARK: cannot return to $BASE."; exit 1; }
+       # `-d`, NEVER `-D`: git itself refuses to delete a branch holding unmerged commits, so
+       # even a wrong plan cannot destroy committed work. A failure here is a real signal.
+       git -C "$PROJECT_DIR" branch -d "$BRANCH" 2>/dev/null || true
+       echo "SALVAGED: partial work preserved on $SALVAGE; tree returned to $BASE"
+       ;;
+     reset_branch)
+       git -C "$PROJECT_DIR" checkout "$BASE" || { echo "PARK: cannot return to $BASE."; exit 1; }
+       git -C "$PROJECT_DIR" branch -d "$BRANCH" || { echo "PARK: refused to delete $BRANCH — it is not empty after all."; exit 1; }
+       echo "RESET: dropped the commitless branch $BRANCH; re-dispatch will cut it again"
+       ;;
+     clean_start)
+       echo "CLEAN_START: no branch and no uncommitted work — the crash never got that far"
+       ;;
+   esac
+   ```
+
+   **`salvage_ref_exists` is not a bug — it is the guard working.** It means an earlier crash
+   on this same story already preserved work there. Resolve that by hand; never overwrite it.
+
+6. **Resume at the earliest incomplete step.** Step 5 has already returned the tree to a state
+   worth resuming from, so re-dispatch the story-lead pointing at that branch and at the base
+   step 4 re-established, **re-writing `in_flight`** with the new dispatch time exactly as step
+   2 does for a fresh dispatch. On a `salvage_and_reset` or `reset_branch` plan the brief must
+   **name the salvage branch** if there is one, so the re-dispatched agent can consult the
+   preserved work rather than rediscovering it.
+7. If the tree is dirty but the state file names **no** in-flight story, halt and notify —
    that is unexplained, and unexplained state is not something to resolve unattended.
-7. If recovery instead determines the story is unrecoverable and must be halted outright,
+8. If recovery instead determines the story is unrecoverable and must be halted outright,
    **clear `in_flight`** (`in_flight: null`) before halting — same as *Parking a story*.
 
 > Discipline that makes this work: commit each verified increment (the story-lead's §2), and
@@ -1024,6 +1142,20 @@ then `ScheduleWakeup({stop: true})`.
   the configured `baseBranch` for the first story of a run, the previous story's recorded branch
   for every story after that (Locked A). Never re-derive it in bash, never read it out of the
   run-state file by hand, and never omit `--base`.
+- **Never dispatch story N+1 onto a branch with no commits.** §2's `assert-chain` gate runs
+  before every dispatch and refuses `branch_commitless`. That reason is distinct from
+  `branch_moved` on purpose: a commitless branch is safe to reset, a moved one never is.
+- **The orchestrator performs no git write against a worktree an agent holds.** A plain
+  `git push` from the orchestrator once ran the pre-push hook against a worktree an implementer
+  was actively editing, and `tsc` failed on a transient mid-edit state — a failure with no cause
+  in either party's work. While `in_flight` is non-null, the orchestrator's git access to
+  `$PROJECT_DIR` is **read-only**. Crash recovery's cleanup writes only because a stale
+  `in_flight` means no agent is live. **Ref manipulation goes through the GitHub API**, which
+  touches neither the working tree nor the hooks:
+
+  ```bash
+  gh api "repos/$REPO/git/refs" -f ref="refs/heads/$BRANCH" -f sha="$SHA"
+  ```
 - **Locked F: never merge, never verify a merge, and never inspect whether one happened.** There
   is no merge step, no merge check, and no out-of-order-merge detection or repair anywhere in
   this command, and none is planned. The operator merges, bottom-up and in order.
@@ -1092,6 +1224,18 @@ then `ScheduleWakeup({stop: true})`.
   slug leak-scan rule is deliberately out of scope for `knowledge.jsonl` (prose there produces
   too many false-positive "word / word" matches to allowlist) — pasting a refusal verbatim
   would leak it unscanned.
+- **Where a crashed agent's partial work goes: `drawbar/salvage/<branch>`, in `$PROJECT_DIR`.**
+  When a dispatch dies leaving a commitless branch and a dirty tree, Crash recovery commits
+  everything — untracked files included — onto that branch before resetting anything. It is
+  never discarded and never force-overwritten: a second crash on the same story refuses
+  `salvage_ref_exists` rather than clobbering the first one's work. List them with:
+
+  ```bash
+  git -C "$PROJECT_DIR" branch --list 'drawbar/salvage/*'
+  ```
+
+  Nothing deletes these; pruning them is the operator's call once the work has been recovered
+  or is confirmed worthless.
 - Session must survive the night: `caffeinate -is`.
 - Permissions must be pre-approved or the loop stalls until morning. Run
   `/fewer-permission-prompts` first.

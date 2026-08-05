@@ -89,14 +89,28 @@ export function resolveBase(
   if (!isValidRefName(config.baseBranch)) {
     return { ok: false, reason: "invalid_base_branch_shape", detail: config.baseBranch };
   }
+  const base = baseForNextStory(runState);
   if (runState.stack.length === 0) {
-    return { ok: true, base: config.baseBranch, rule: "config_base" };
+    return { ok: true, base, rule: "config_base" };
   }
-  const predecessor = runState.stack[runState.stack.length - 1]!;
-  if (!isValidRefName(predecessor.branch)) {
-    return { ok: false, reason: "invalid_predecessor_branch_shape", detail: predecessor.branch };
+  if (!isValidRefName(base)) {
+    return { ok: false, reason: "invalid_predecessor_branch_shape", detail: base };
   }
-  return { ok: true, base: predecessor.branch, rule: "previous_story_branch" };
+  return { ok: true, base, rule: "previous_story_branch" };
+}
+
+// Locked A's SELECTION rule, on its own, with one implementation site (PCO-381). `resolveBase`
+// above answers with it rather than carrying a second copy, and `plan-cleanup`'s CLI needs the
+// same answer for a story that crashed before it was ever stacked — a story with no stack entry
+// of its own, which `resolveBase` cannot be asked about without also supplying a snapshot.
+//
+// Deliberately pure and total: no shape checks and no refusal channel. It SELECTS; the callers
+// above and below own validating what it selected. Splitting it that way is what lets the
+// CRITICAL-1 mutant (LAST entry vs FIRST entry — indistinguishable at a stack length of 2) be
+// pinned in exactly one place instead of two.
+export function baseForNextStory(state: Pick<RunState, "stack" | "resolved_config">): string {
+  if (state.stack.length === 0) return state.resolved_config.baseBranch;
+  return state.stack[state.stack.length - 1]!.branch;
 }
 
 // --- assertChainIntact --------------------------------------------------------------------
@@ -109,6 +123,7 @@ export type ChainReason =
   | "branch_missing"
   | "base_missing"
   | "branch_moved"
+  | "branch_commitless"
   | "git_failed";
 
 export type ChainResult = { ok: true } | { ok: false; reason: ChainReason; detail: string };
@@ -235,8 +250,259 @@ export function assertChainIntact(
         detail: ancestorRes.stderr || `git merge-base --is-ancestor failed with exit code ${ancestorRes.code}`,
       };
     }
+
+    //   6. (git)  `rev-list --count <base>..<branch> --` — PCO-381 rule 1: a recorded branch
+    //             must hold at least one commit beyond its base. Every check above passes for a
+    //             branch with ZERO commits: the chain is intact, and trivially so, because base
+    //             and branch are the same commit. That is precisely what a dead implementer
+    //             leaves behind, and basing the next story on it is the difference between one
+    //             failed story and a stack of garbage PRs — so it gets its own named refusal,
+    //             distinct from `branch_moved`, which a resume must be able to tell apart:
+    //             a commitless branch is safe to reset (it holds nothing), a moved one is not.
+    //
+    //             Decided AFTER `branch_moved` on purpose. Verified against real git 2.50.1
+    //             that two unrelated histories report a count > 0, so a count-first ordering
+    //             would return `ok` for a chain whose base is not an ancestor at all.
+    //
+    //             The range's two halves are `refs/heads/`-qualified for the same reason
+    //             `merge-base`'s arguments are (CRITICAL 2 above). Concatenating them into one
+    //             `A..B` argv element is unambiguous here specifically because `isValidRefName`
+    //             forbids `..` INSIDE a ref name (`REF_NAME_SHAPE`'s `(?!.*\.\.)`), so the
+    //             constructed string contains exactly one `..` and cannot be re-parsed as some
+    //             other range. The trailing `--` terminates the revision list so a branch name
+    //             can never be re-read as a pathspec.
+    //
+    //             Unlike every other check in this function, the condition is carried in
+    //             STDOUT, not the exit code — `rev-list --count` exits 0 for both "0" and "7".
+    //             `Number("")` is 0 and `Number("  ")` is 0, so a bare `Number(...)` would turn
+    //             an empty stdout from a broken git into a confident "commitless" verdict;
+    //             unparseable output routes to `git_failed` instead.
+    const countRes = git([
+      "-C",
+      projectDir,
+      "rev-list",
+      "--count",
+      `refs/heads/${entry.base}..refs/heads/${entry.branch}`,
+      "--",
+    ]);
+    if (countRes.code !== 0) {
+      return {
+        ok: false,
+        reason: "git_failed",
+        detail: countRes.stderr || `git rev-list --count failed with exit code ${countRes.code}`,
+      };
+    }
+    const count = parseCommitCount(countRes.stdout);
+    if (count === null) {
+      return {
+        ok: false,
+        reason: "git_failed",
+        detail: `git rev-list --count returned unparseable output for refs/heads/${entry.base}..refs/heads/${entry.branch}`,
+      };
+    }
+    if (count === 0) {
+      return {
+        ok: false,
+        reason: "branch_commitless",
+        detail: `stack[${i}] (${entry.story}) branch "${entry.branch}" has no commits beyond its base "${entry.base}" — nothing may be based on an empty branch`,
+      };
+    }
   }
   return { ok: true };
+}
+
+// `rev-list --count` output → a non-negative integer, or `null` for anything that is not one.
+// Deliberately strict: an empty string, whitespace, `1.5`, `1e3`, and `0x2` must all be `null`
+// rather than silently coerced, because the ONE value that matters (`0`) is also what every
+// sloppy coercion of a broken read produces.
+function parseCommitCount(stdout: string): number | null {
+  const trimmed = stdout.trim();
+  if (!/^\d+$/.test(trimmed)) return null;
+  const n = Number(trimmed);
+  return Number.isSafeInteger(n) ? n : null;
+}
+
+// --- planCrashCleanup (PCO-381 rule 2) ----------------------------------------------------
+//
+// What a resume must do about the wreckage a dead agent left, as a NAMED plan rather than as
+// prose a model may or may not follow. The crash this exists for left a branch with zero
+// commits and a 509-line untracked file in the tree; a naive retry runs `git checkout -b
+// <branch>`, dies on "already exists", and the recovery path fails on the wreckage of the first
+// failure instead of recovering from it.
+//
+// This function is a READ-ONLY OBSERVER. It performs no git write — the runbook's Crash
+// recovery section executes the plan. That split is not decoration: rule 3 of PCO-381 forbids
+// orchestrator git writes against a worktree an agent holds, and a planner that also acted
+// would have to know whether an agent is live, which is exactly the question `in_flight`
+// (run-state.ts) already owns.
+//
+// The four plans, and why the two destructive-looking ones are safe:
+//
+//   - `resume_on_branch` — the branch holds >= 1 commit. That is the crashed run's real output;
+//     it is resumed on and NEVER reset. `dirty` tells the runbook to commit the tree onto it
+//     first, which is what the runbook already said to do before this function existed.
+//   - `salvage_and_reset` — nothing is committed on the branch, but the tree carries work.
+//     Preserve it on `drawbar/salvage/<branch>` FIRST, then drop the commitless branch.
+//   - `reset_branch` — a commitless branch and a clean tree. There is nothing to preserve;
+//     dropping the branch is what lets the re-dispatch cut it again.
+//   - `clean_start` — no branch, clean tree. The crash never got that far.
+//
+// "Preserve any partial work somewhere retrievable — never discard it silently" is enforced in
+// two independent places, so neither alone is load-bearing: this planner refuses
+// `salvage_ref_exists` rather than overwriting an earlier crash's salvage, and the runbook
+// executes `git branch -d` (never `-D`), which git itself refuses on a branch holding unmerged
+// commits. A wrong plan therefore still cannot destroy committed work.
+//
+// The salvage branch name is DERIVED from the story branch rather than recorded in the run
+// state. That is deliberate: recording it would mean an eleventh key in run-state.ts's pinned
+// schema and a migration for every existing state file, to store a value that is already a pure
+// function of the branch. It stays retrievable by construction — `git branch --list
+// 'drawbar/salvage/*'` enumerates every salvage a run ever made — and that is documented in the
+// runbook's Operator notes, which is the checklist item the story actually asks for.
+
+export const SALVAGE_BRANCH_PREFIX = "drawbar/salvage/";
+
+export type CleanupReason =
+  | "invalid_project_dir"
+  | "invalid_ref_shape"
+  | "base_missing"
+  | "salvage_ref_exists"
+  | "git_failed";
+
+export type CleanupAction = "clean_start" | "reset_branch" | "salvage_and_reset" | "resume_on_branch";
+
+export type CleanupPlan =
+  | {
+      ok: true;
+      action: CleanupAction;
+      branch: string;
+      base: string;
+      branchExists: boolean;
+      commits: number;
+      dirty: boolean;
+      // Non-null for `salvage_and_reset` only. Null everywhere else, rather than absent, so a
+      // caller reading it on the wrong plan gets `null` instead of `undefined` silently
+      // stringifying into a git argv as "undefined".
+      salvageBranch: string | null;
+    }
+  | { ok: false; reason: CleanupReason; detail: string };
+
+// `projectDir` is the operator-authored trust root, validated here independently exactly as
+// `assertChainIntact` validates its own — the CLI below re-checks it against the state file's
+// copy before this is ever reached, but this function is callable directly and must not depend
+// on that (MUST-CHECK r3-must-not-source-project-dir-from-pasted-run-state).
+//
+// `branch` comes from the crashed story's step-2 start comment on Linear, and `base` from
+// `baseForNextStory`; both are shape-gated before any git call, since both reach a git argv.
+export function planCrashCleanup(projectDir: string, branch: string, base: string, git: Runner): CleanupPlan {
+  if (!isCleanAbsolutePath(projectDir)) {
+    return { ok: false, reason: "invalid_project_dir", detail: projectDir };
+  }
+  if (!isValidRefName(branch)) {
+    return { ok: false, reason: "invalid_ref_shape", detail: `branch must be a valid git ref name: ${branch}` };
+  }
+  if (!isValidRefName(base)) {
+    return { ok: false, reason: "invalid_ref_shape", detail: `base must be a valid git ref name: ${base}` };
+  }
+
+  // The base first: "return the tree to the base" and "count commits beyond the base" are both
+  // meaningless if it is gone, and a missing base is what a mid-run force-push or a hand
+  // deletion leaves behind.
+  const baseRes = git(["-C", projectDir, "rev-parse", "--verify", "--quiet", `refs/heads/${base}`]);
+  if (baseRes.code === 1) {
+    return { ok: false, reason: "base_missing", detail: `base "${base}" does not exist at ${projectDir}` };
+  }
+  if (baseRes.code !== 0) {
+    return {
+      ok: false,
+      reason: "git_failed",
+      detail: baseRes.stderr || `git rev-parse failed for refs/heads/${base} with exit code ${baseRes.code}`,
+    };
+  }
+
+  // Exit 1 means genuinely absent; any other non-zero is a git ERROR and must never be read as
+  // "no branch" — that misreading would plan a `clean_start` against a repository that is
+  // simply unreadable, and the re-dispatched agent would start from nothing.
+  const branchRes = git(["-C", projectDir, "rev-parse", "--verify", "--quiet", `refs/heads/${branch}`]);
+  if (branchRes.code !== 0 && branchRes.code !== 1) {
+    return {
+      ok: false,
+      reason: "git_failed",
+      detail: branchRes.stderr || `git rev-parse failed for refs/heads/${branch} with exit code ${branchRes.code}`,
+    };
+  }
+  const branchExists = branchRes.code === 0;
+
+  // `--porcelain` includes untracked files as `?? <path>`: the crash's 509-line spec file was
+  // untracked, so a dirtiness check blind to those would plan to delete exactly the work at
+  // issue. A FAILED read is never "clean" — clean is the one answer that authorises dropping a
+  // branch with no salvage at all.
+  const statusRes = git(["-C", projectDir, "status", "--porcelain"]);
+  if (statusRes.code !== 0) {
+    return {
+      ok: false,
+      reason: "git_failed",
+      detail: statusRes.stderr || `git status --porcelain failed with exit code ${statusRes.code}`,
+    };
+  }
+  const dirty = statusRes.stdout.trim().length > 0;
+
+  let commits = 0;
+  if (branchExists) {
+    const countRes = git(["-C", projectDir, "rev-list", "--count", `refs/heads/${base}..refs/heads/${branch}`, "--"]);
+    if (countRes.code !== 0) {
+      return {
+        ok: false,
+        reason: "git_failed",
+        detail: countRes.stderr || `git rev-list --count failed with exit code ${countRes.code}`,
+      };
+    }
+    const parsed = parseCommitCount(countRes.stdout);
+    if (parsed === null) {
+      return {
+        ok: false,
+        reason: "git_failed",
+        detail: `git rev-list --count returned unparseable output for refs/heads/${base}..refs/heads/${branch}`,
+      };
+    }
+    commits = parsed;
+  }
+
+  const observed = { branch, base, branchExists, commits, dirty };
+
+  if (commits > 0) {
+    return { ok: true, action: "resume_on_branch", ...observed, salvageBranch: null };
+  }
+
+  if (!dirty) {
+    return {
+      ok: true,
+      action: branchExists ? "reset_branch" : "clean_start",
+      ...observed,
+      salvageBranch: null,
+    };
+  }
+
+  // Salvage. The destination is checked for existence LAST, so an already-existing salvage ref
+  // only ever blocks a plan that was actually going to write to it — a `resume_on_branch` for a
+  // story that crashed twice must not be refused by the first crash's leftovers.
+  const salvageBranch = `${SALVAGE_BRANCH_PREFIX}${branch}`;
+  const salvageRes = git(["-C", projectDir, "rev-parse", "--verify", "--quiet", `refs/heads/${salvageBranch}`]);
+  if (salvageRes.code === 0) {
+    return {
+      ok: false,
+      reason: "salvage_ref_exists",
+      detail: `"${salvageBranch}" already exists — an earlier crash's preserved work is there; resolve it by hand rather than overwriting it`,
+    };
+  }
+  if (salvageRes.code !== 1) {
+    return {
+      ok: false,
+      reason: "git_failed",
+      detail: salvageRes.stderr || `git rev-parse failed for refs/heads/${salvageBranch} with exit code ${salvageRes.code}`,
+    };
+  }
+  return { ok: true, action: "salvage_and_reset", ...observed, salvageBranch };
 }
 
 // Sanitizes only a refusal's `detail` before it is ever stringified for stdout (IMPORTANT 3),
@@ -277,8 +543,10 @@ function sanitizeChainOrBaseDetail<R extends { ok: true } | { ok: false; reason:
 // invite a caller to believe it does something.
 
 export type CliParse =
-  | { ok: true; state: string; story?: string; projectDir?: string }
+  | { ok: true; state: string; story?: string; projectDir?: string; branch?: string }
   | { ok: false; error: string };
+
+export type StackCommand = "resolve-base" | "assert-chain" | "plan-cleanup";
 
 // Flag type enforcement in BOTH directions (same discipline as ship-config.ts's
 // `parseCliArgs`): a flag with no consumable value binds boolean `true`, refused rather than
@@ -286,13 +554,15 @@ export type CliParse =
 // refuses outright. `--story` is required for `resolve-base` and forbidden for `assert-chain`;
 // `--project-dir` is required for `assert-chain` and forbidden for `resolve-base` — the two
 // subcommands' contracts differ, so this is checked per-`cmd`, not generically.
-export function parseCliArgs(cmd: "resolve-base" | "assert-chain", args: string[]): CliParse {
+export function parseCliArgs(cmd: StackCommand, args: string[]): CliParse {
   let seenState = false;
   let seenStory = false;
   let seenProjectDir = false;
+  let seenBranch = false;
   let state: string | true | undefined;
   let story: string | true | undefined;
   let projectDir: string | true | undefined;
+  let branch: string | true | undefined;
   for (let i = 0; i < args.length; i++) {
     const a = args[i]!;
     if (a === "--state") {
@@ -325,6 +595,16 @@ export function parseCliArgs(cmd: "resolve-base" | "assert-chain", args: string[
       } else {
         projectDir = true;
       }
+    } else if (a === "--branch") {
+      if (seenBranch) return { ok: false, error: "--branch specified more than once" };
+      seenBranch = true;
+      const next = args[i + 1];
+      if (next !== undefined && !next.startsWith("--")) {
+        branch = next;
+        i++;
+      } else {
+        branch = true;
+      }
     } else {
       return { ok: false, error: `unknown flag: ${a}` };
     }
@@ -332,6 +612,24 @@ export function parseCliArgs(cmd: "resolve-base" | "assert-chain", args: string[
   if (state === true) return { ok: false, error: "--state requires a value" };
   if (state === "") return { ok: false, error: "--state value must not be empty" };
   if (state === undefined) return { ok: false, error: "--state is required" };
+
+  if (cmd === "plan-cleanup") {
+    // `--story` is forbidden here on purpose: the crashed story's branch is named DIRECTLY,
+    // from its step-2 start comment, because a crash before the first commit is exactly the
+    // state in which nothing has recorded a branch for the id to be resolved to.
+    if (story !== undefined) return { ok: false, error: "--story is not valid for plan-cleanup" };
+    if (projectDir === true) return { ok: false, error: "--project-dir requires a value" };
+    if (projectDir === "") return { ok: false, error: "--project-dir value must not be empty" };
+    if (projectDir === undefined) return { ok: false, error: "--project-dir is required" };
+    if (branch === true) return { ok: false, error: "--branch requires a value" };
+    if (branch === "") return { ok: false, error: "--branch value must not be empty" };
+    if (branch === undefined) return { ok: false, error: "--branch is required" };
+    return { ok: true, state, projectDir, branch };
+  }
+
+  // `--branch` is meaningful only to plan-cleanup — accepted-but-ignored elsewhere would invite
+  // a caller to believe it does something, the same reason `--project-dir` is refused below.
+  if (branch !== undefined) return { ok: false, error: `--branch is not valid for ${cmd}` };
 
   if (cmd === "assert-chain") {
     if (story !== undefined) return { ok: false, error: "--story is not valid for assert-chain" };
@@ -384,9 +682,11 @@ export async function main(deps: MainDeps = {}): Promise<number> {
   const writeStderr = deps.writeStderr ?? ((s: string) => { process.stderr.write(s); });
 
   const [cmd, ...rest] = argv;
-  if (cmd !== "resolve-base" && cmd !== "assert-chain") {
+  if (cmd !== "resolve-base" && cmd !== "assert-chain" && cmd !== "plan-cleanup") {
     writeStderr(
-      "usage: stack.ts resolve-base --state <path> --story <id> | assert-chain --state <path> --project-dir <dir>\n",
+      "usage: stack.ts resolve-base --state <path> --story <id>" +
+        " | assert-chain --state <path> --project-dir <dir>" +
+        " | plan-cleanup --state <path> --project-dir <dir> --branch <name>\n",
     );
     return 1;
   }
@@ -417,10 +717,13 @@ export async function main(deps: MainDeps = {}): Promise<number> {
     return result.ok ? 0 : 1;
   }
 
-  // cmd === "assert-chain": CRITICAL 3 — `--project-dir` (operator-supplied, required) is the
-  // trust root; the state file's own `resolved_config.projectDir` copy is agent-writable and
-  // is never itself passed to a git call, only compared against the flag. Both must already
-  // be clean absolute paths and must resolve to the SAME path, checked before any git call.
+  // Both remaining subcommands take git calls, so both go through CRITICAL 3's trust-root check
+  // — one implementation site, shared, rather than a second copy for the newer verb.
+  //
+  // CRITICAL 3: `--project-dir` (operator-supplied, required) is the trust root; the state
+  // file's own `resolved_config.projectDir` copy is agent-writable and is never itself passed to
+  // a git call, only compared against the flag. Both must already be clean absolute paths and
+  // must resolve to the SAME path, checked before any git call.
   const projectDirFlag = parsedArgs.projectDir!;
   const projectDirFromState = parsedState.state.resolved_config.projectDir;
   if (
@@ -428,13 +731,23 @@ export async function main(deps: MainDeps = {}): Promise<number> {
     !isCleanAbsolutePath(projectDirFromState) ||
     resolve(projectDirFlag) !== resolve(projectDirFromState)
   ) {
-    const result: ChainResult = {
-      ok: false,
+    const result = {
+      ok: false as const,
       reason: "project_dir_untrusted",
       detail: `--project-dir (${projectDirFlag}) does not match the run-state's resolved_config.projectDir (${projectDirFromState})`,
     };
     writeStdout(JSON.stringify(sanitizeChainOrBaseDetail(result)) + "\n");
     return 1;
+  }
+
+  if (cmd === "plan-cleanup") {
+    // The base is DERIVED from the run's own stack (Locked A, via `baseForNextStory`), never
+    // taken from a flag: a resume that could be pointed at an arbitrary base is the same
+    // silent re-parenting failure `resolve-base` exists to prevent.
+    const base = baseForNextStory(parsedState.state);
+    const plan = planCrashCleanup(projectDirFlag, parsedArgs.branch!, base, git);
+    writeStdout(JSON.stringify(sanitizeChainOrBaseDetail(plan)) + "\n");
+    return plan.ok ? 0 : 1;
   }
 
   const result = assertChainIntact(parsedState.state, projectDirFlag, git);
