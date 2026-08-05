@@ -4284,6 +4284,13 @@ describe("PCO-369 R6: cross-references reconciled, the stack model documented, L
       anchor: "**§4's four inputs are files, not text pasted into a shell.**",
       ns: [{ n: 4, title: "Open the stacked PR" }],
     },
+    // PCO-381: the Hard rules point at the gate that enforces "never branch off an incomplete
+    // base", so the rule and its implementation cannot drift into separate sections.
+    {
+      doc: "ship",
+      anchor: "§2's `assert-chain` gate runs before every dispatch",
+      ns: [{ n: 2, title: "Delegate the whole story" }],
+    },
     // --- agents/drawbar-story-lead.md, referring to itself -----------------------------------
     { doc: "agent", anchor: "Make it the report in §7, nothing else.", ns: [{ n: 7, title: "Report" }] },
     {
@@ -4781,14 +4788,32 @@ describe("PCO-369 R6: cross-references reconciled, the stack model documented, L
 
   // The fence Crash recovery gained, extracted on its own so the pins below are about IT and not
   // about §4's.
+  //
+  // PCO-381 added a SECOND fence to this section — step 5's cleanup — so the count is pinned at
+  // two and this helper returns the FIRST (step 4's base re-establishment), which is what every
+  // assertion below is about. Pinning the exact count rather than taking `[0]` from however many
+  // exist is deliberate: a third fence appearing here should fail loudly and be classified, not
+  // be silently ignored by a helper that only ever looks at the first.
   function crashFence(): string {
+    return dedent(crashFences()[0]!);
+  }
+
+  function crashFences(): string[] {
     const txt = shipRaw();
     const start = txt.indexOf("## Crash recovery");
     const end = txt.indexOf("## Finishing the run", start);
     const fences = [...txt.slice(start, end).matchAll(/[ \t]*```bash\n([\s\S]*?)[ \t]*```/g)].map((m) => m[1]!);
-    expect(fences.length, "Crash recovery must carry exactly one bash fence").toBe(1);
-    return dedent(fences[0]!);
+    expect(fences.length, "Crash recovery must carry exactly two bash fences: step 4's base re-establishment, then step 5's cleanup").toBe(2);
+    return fences;
   }
+
+  // Step 5's cleanup fence must come AFTER step 4's, or it would run before the base it needs.
+  test("Crash recovery's two fences are step 4's base re-establishment, then step 5's cleanup (PCO-381)", () => {
+    const [first, second] = crashFences();
+    expect(first!).toContain("resolve-base");
+    expect(first!).not.toContain("plan-cleanup");
+    expect(second!).toContain("plan-cleanup");
+  });
 
   // The fence with COMMENT lines removed — every "must NOT contain" assertion runs against this,
   // for the reason §4's `code()` helper spells out: the comments legitimately name the forbidden
@@ -7627,4 +7652,220 @@ describe("PCO-371 fix pass: §4's fence comments are closed, and no fence commen
       assertShapesAbsent(`${relPath} fence comments`, comments.replace(/\s+/g, " "), FENCE_COMMENT_HATCHES);
     });
   }
+});
+
+// PCO-381: crash and worktree discipline. Three rules, and the reason they are pinned HERE and
+// not left to the module tests: the observation the story turns on is that `break` in a script
+// is a guarantee while the same rule stated in prose is advisory. `stack.ts`'s own tests prove
+// the verdicts; these prove the runbook actually CALLS them, at the point where the guarantee
+// has to hold, and that the prohibitions survive an edit.
+//
+// Every prose pin is a CONTIGUOUS, whitespace-normalized phrase (never independent tokens), per
+// MUST-CHECK pco352-fixpass-prose-gate-mutation-must-cover-rephrase-not-only-delete: a phrase
+// demoted to a parenthetical aside, or a qualifier weakened, must fail the same test a deletion
+// does. The fence pins are on literal invocation lines from the RAW slice, per MUST-CHECK
+// prose-pins-dont-cover-the-bash-fence-they-describe.
+describe("PCO-381: crash and worktree discipline", () => {
+  const SHIP = "commands/drawbar-ship.md";
+
+  function rawSection(startMarker: string, endMarker: string): string {
+    assertOccursOnce(startMarker);
+    assertOccursOnce(endMarker);
+    const txt = readNonEmpty(join(root, SHIP));
+    const start = txt.indexOf(startMarker);
+    const end = txt.indexOf(endMarker, start);
+    expect(end, `'${endMarker}' not found after '${startMarker}'`).toBeGreaterThan(start);
+    return txt.slice(start, end);
+  }
+
+  function normalized(startMarker: string, endMarker: string): string {
+    return rawSection(startMarker, endMarker).replace(/\s+/g, " ");
+  }
+
+  describe("rule 1 — story N+1 never dispatches onto an incomplete base", () => {
+    const DISPATCH = () => rawSection("## 2. Delegate the whole story", "## 3. File out-of-scope");
+
+    // The guarantee, not the intention: §2 must actually invoke the checker before dispatch.
+    // The INVOCATION line, not the prose that describes it (MUST-CHECK
+    // prose-pins-dont-cover-the-bash-fence-they-describe): `bun run` is what distinguishes the
+    // executable call from a sentence mentioning the same words.
+    test("§2 invokes stack.ts assert-chain, with both required flags, before dispatching", () => {
+      const line = DISPATCH()
+        .split("\n")
+        .find((l) => l.includes("bun run") && l.includes("stack.ts") && l.includes("assert-chain"));
+      expect(line, "§2 must invoke `stack.ts assert-chain`").toBeDefined();
+      expect(line!).toContain("--state");
+      expect(line!).toContain("--project-dir");
+    });
+
+    // Ordering is the whole point: a chain check that runs AFTER the Task dispatch guarantees
+    // nothing. The assert-chain call must precede the paragraph that dispatches the agent.
+    test("the assert-chain call precedes the dispatch instruction in §2", () => {
+      const fence = DISPATCH();
+      const chainAt = fence.indexOf("assert-chain");
+      const dispatchAt = fence.indexOf("Then dispatch **one** `drawbar-story-lead`");
+      expect(chainAt).toBeGreaterThan(-1);
+      expect(dispatchAt).toBeGreaterThan(-1);
+      expect(chainAt).toBeLessThan(dispatchAt);
+    });
+
+    test("§2 refuses to dispatch on a refusal, rather than continuing", () => {
+      const fence = DISPATCH();
+      expect(fence).toContain("NO_DISPATCH");
+      expect(fence).toContain("exit 1");
+    });
+
+    test("§2 states the commitless rule and names the distinct reason", () => {
+      const prose = normalized("## 2. Delegate the whole story", "## 3. File out-of-scope");
+      expect(prose).toContain("at least one commit beyond its own base");
+      expect(prose).toContain("`branch_commitless` — a reason deliberately distinct from `branch_moved`");
+      expect(prose).toContain("This gate is **executable, not advisory**");
+    });
+
+    test("the Hard rules carry the never-dispatch-onto-a-commitless-branch rule", () => {
+      const rules = normalized("## Hard rules", "## Operator notes");
+      expect(rules).toContain("Never dispatch story N+1 onto a branch with no commits");
+      expect(rules).toContain("a commitless branch is safe to reset, a moved one never is");
+    });
+
+    // The reason string is the contract between the runbook and the module. If `stack.ts`
+    // renames it, this fails rather than the runbook silently matching on a dead reason.
+    test("the reason the runbook names is one stack.ts can actually return", () => {
+      const stackSrc = readNonEmpty(join(root, "scripts/lib/stack.ts"));
+      expect(stackSrc).toContain('"branch_commitless"');
+      expect(stackSrc).toContain('reason: "branch_commitless"');
+    });
+
+    // "A dead story dispatch halts the run; the next story is never dispatched" — the story's
+    // first validation item, and until now carried entirely by unpinned prose. A `break` in a
+    // script is a guarantee; the same rule in prose is advisory, so at minimum the prose must
+    // not be quietly softened into "skip and continue".
+    test("halting rather than skipping is stated in the Hard rules and at the park site", () => {
+      const rules = normalized("## Hard rules", "## Operator notes");
+      expect(rules).toContain("Halt on failure; never skip a story");
+      const parking = normalized("## Parking a story", "## Crash recovery");
+      expect(parking).toContain("**Halt — never skip.**");
+      expect(parking).toContain("building N+1 on a gap produces work that looks like progress and is not");
+      // A park clears the dispatch claim, or the next invocation deadlocks on a stale one.
+      expect(parking).toContain("clear `in_flight` in the state file");
+    });
+
+    // A dead dispatch is detected by staleness, and the verdict for it is crash recovery — not
+    // a no-op that would leave the run wedged forever, and not a dispatch of the next story.
+    test("a stale in_flight routes to Crash recovery, and the module can return that verdict", () => {
+      const dispatch = normalized("## 2. Delegate the whole story", "## 3. File out-of-scope");
+      expect(dispatch).toContain("the prior dispatch is presumed crashed — go to *Crash recovery* instead of no-op'ing forever");
+      expect(dispatch).toContain("do not dispatch a second agent at all, for ANY story, while `in_flight` is non-null");
+      const runState = readNonEmpty(join(root, "scripts/lib/run-state.ts"));
+      expect(runState).toContain('action: "crash_recovery"');
+      expect(runState).toContain('"in_flight_stale"');
+    });
+  });
+
+  describe("rule 2 — resume cleans up, and never discards, a dead agent's work", () => {
+    const RECOVERY = () => rawSection("## Crash recovery", "## Finishing the run");
+
+    test("Crash recovery invokes stack.ts plan-cleanup with all three required flags", () => {
+      const line = RECOVERY()
+        .split("\n")
+        .find((l) => l.includes("bun run") && l.includes("stack.ts") && l.includes("plan-cleanup"));
+      expect(line, "Crash recovery must invoke `stack.ts plan-cleanup`").toBeDefined();
+      expect(line!).toContain("--state");
+      expect(line!).toContain("--project-dir");
+      expect(line!).toContain("--branch");
+    });
+
+    test("every plan the module can return is handled by the recovery block", () => {
+      const fence = RECOVERY();
+      for (const action of ["clean_start", "reset_branch", "salvage_and_reset", "resume_on_branch"]) {
+        expect(fence, `plan '${action}' must be handled`).toContain(`${action})`);
+      }
+    });
+
+    // The single most destructive mistake available here. `-D` would delete a branch holding
+    // the crashed run's only copy of its work; `-d` makes git itself refuse that.
+    test("branch deletion uses -d and never -D, so git refuses to drop unmerged commits", () => {
+      const fence = RECOVERY();
+      expect(fence).toContain("branch -d");
+      expect(fence).not.toContain("branch -D");
+      expect(fence).toContain("`-d`, NEVER `-D`");
+    });
+
+    test("the salvage is committed BEFORE the branch is reset, not after", () => {
+      const fence = RECOVERY();
+      const salvageCommit = fence.indexOf('commit -m "salvage: partial work from a crashed dispatch"');
+      const branchDelete = fence.indexOf('branch -d "$BRANCH"');
+      expect(salvageCommit).toBeGreaterThan(-1);
+      expect(branchDelete).toBeGreaterThan(-1);
+      expect(salvageCommit).toBeLessThan(branchDelete);
+    });
+
+    // A branch with real commits must never be reset — that is the case where reset destroys
+    // the story's work rather than clearing wreckage.
+    test("resume_on_branch commits the tree onto the branch and never resets it", () => {
+      const prose = normalized("## Crash recovery", "## Finishing the run");
+      expect(prose).toContain("that IS the crashed run's output. Never reset it");
+    });
+
+    test("an existing salvage is a refusal to honour, not an obstacle to work around", () => {
+      const prose = normalized("## Crash recovery", "## Finishing the run");
+      expect(prose).toContain("**`salvage_ref_exists` is not a bug — it is the guard working.**");
+      expect(prose).toContain("Resolve that by hand; never overwrite it");
+    });
+
+    test("the re-dispatch brief names the salvage branch so preserved work is not rediscovered", () => {
+      const prose = normalized("## Crash recovery", "## Finishing the run");
+      expect(prose).toContain("the brief must **name the salvage branch**");
+    });
+
+    // The story's own checklist item: "where is documented".
+    test("Operator notes document where salvaged work lives and how to list it", () => {
+      const notes = normalized("## Operator notes", "- Session must survive the night");
+      expect(notes).toContain("Where a crashed agent's partial work goes: `drawbar/salvage/<branch>`");
+      expect(notes).toContain("untracked files included");
+      expect(notes).toContain("branch --list 'drawbar/salvage/*'");
+    });
+
+    // The documented location must be the one the module actually derives, not a stale copy.
+    test("the documented salvage prefix is the module's own SALVAGE_BRANCH_PREFIX", () => {
+      const stackSrc = readNonEmpty(join(root, "scripts/lib/stack.ts"));
+      const m = stackSrc.match(/export const SALVAGE_BRANCH_PREFIX = "([^"]+)"/);
+      expect(m, "stack.ts must export SALVAGE_BRANCH_PREFIX").not.toBeNull();
+      const ship = readNonEmpty(join(root, SHIP));
+      expect(ship).toContain(m![1]!);
+    });
+  });
+
+  describe("rule 3 — no orchestrator git write against a worktree an agent holds", () => {
+    test("the Hard rules carry the prohibition and its concrete cause", () => {
+      const rules = normalized("## Hard rules", "## Operator notes");
+      expect(rules).toContain("The orchestrator performs no git write against a worktree an agent holds");
+      expect(rules).toContain("ran the pre-push hook against a worktree an implementer was actively editing");
+      expect(rules).toContain("While `in_flight` is non-null, the orchestrator's git access to `$PROJECT_DIR` is **read-only**");
+    });
+
+    test("the Hard rules give the GitHub-API form for ref manipulation", () => {
+      const rules = normalized("## Hard rules", "## Operator notes");
+      expect(rules).toContain("Ref manipulation goes through the GitHub API");
+      expect(rules).toContain("gh api");
+      expect(rules).toContain("git/refs");
+    });
+
+    // The exemption must be stated, or the prohibition and Crash recovery's writes contradict
+    // each other and a reader resolves the conflict whichever way they like.
+    test("crash recovery's own writes are explicitly exempted, with the reason", () => {
+      const rules = normalized("## Hard rules", "## Operator notes");
+      expect(rules).toContain("Crash recovery's cleanup writes only because a stale `in_flight` means no agent is live");
+    });
+
+    // Regression guard: the orchestrator must not acquire a push against the code repo. The
+    // knowledge-repo push lives in kb-sync.ts against $ENV_DIR, which is a different repository.
+    test("the runbook contains no orchestrator git push against $PROJECT_DIR", () => {
+      const ship = readNonEmpty(join(root, SHIP));
+      for (const line of ship.split("\n")) {
+        if (!line.includes("git push") && !line.includes("push --force")) continue;
+        expect(line, `orchestrator push against the code repo: ${line.trim()}`).not.toContain("$PROJECT_DIR");
+      }
+    });
+  });
 });
