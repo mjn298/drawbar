@@ -57,6 +57,42 @@ Surface relevant prior decisions, patterns, and any `MUST-CHECK:` entries for th
 
 Explore purpose, constraints, and success criteria. Investigate the codebase (read the actual files) before proposing anything. Batch independent, decision-shaped questions into a single `AskUserQuestion` call (up to 4); reserve one-at-a-time for genuinely exploratory threads or where a later question depends on an earlier answer. **Gate:** confirm scope with the user before designing.
 
+### Provenance — what you may assert as fact
+
+Before you write a factual claim someone else will act on, ask the one question with a
+mechanical answer:
+
+**Did I read the thing that answers this question, in this session?**
+
+- **Yes** → assert it, and cite `file:line`.
+- **No** → do not assert it. Write it as an instruction to check.
+
+The test is **per-question, not per-file**. A search that answered one question licenses
+nothing about a different one in the same file: grepping `ruleSets` opens the schema and still
+says nothing about whether a rule carries an `id`. Record what each read *established*, not
+which paths you touched.
+
+**Point at the evidence, not the conclusion.** Instead of "location rules have no `id`, keep
+`key={index}`", write "I have not read the rule schema — check `BaseRuleSchema` in
+`shared/types/locationGroup.ts` and match whichever is correct." The second is shorter, and it
+produces the right result even when your belief is wrong. That is the whole trick: a belief
+written as evidence-plus-instruction is self-correcting, while the same belief written as a
+decision is binding — and an agent told it is a hard requirement will build it faithfully.
+
+**Before instructing a copy or mirror, state what differs between the source's container and
+the destination's container.** One line. If nothing differs, say so. Reading both sides is not
+enough and never was: the one time this failed, both files had been read in full and the
+sentence naming the difference was simply never written, so "match X exactly" shipped a
+component that rendered flush against a panel border. The reference tells you what the code
+says; only the comparison tells you what it will *do* where it lands. A `match X exactly` with
+no difference line beside it is unwriteable.
+
+**Prefer falsification over confirmation.** Search for the counter-example, not the example. If
+a claim cannot be falsified cheaply, downgrade it to an instruction: "check whether X, and match
+accordingly" rather than "X is true, do Y."
+
+A false claim in a locked spec is the most expensive kind: `/drawbar-plan` decomposes it into stories, and every one of them inherits it. Nobody re-reads a spec the way they re-read a diff.
+
 ## 4. Propose approaches
 
 Present 2–3 approaches with trade-offs and a recommendation. If the user's constraints have already narrowed the space, lead with the recommended approach and briefly note the discarded alternatives and why they're out — don't manufacture a full N-way comparison. **Gate:** the user picks an approach.

@@ -7337,7 +7337,7 @@ describe("PCO-374/375/376 fix pass: the new rules are closed in place, and nothi
     expect(docUnits(docSection("agents/security-reviewer.md", "## What to do"))).toEqual([
       "## What to do",
       "1. Query the knowledge base for security constraints relevant to this diff: `drawbar-kb " +
-        "recall \"MUST-CHECK security <area>\" --dir \"<path>\" --json` Every `MUST-CHECK:` security " +
+        "recall \"MUST-CHECK security <area>\" --dir \"$KB\" --json` Every `MUST-CHECK:` security " +
         "entry that applies is a hard requirement — flag any violation as Critical.",
       "2. Review the diff across these lenses. Default to skepticism: if an exposure is plausible, " +
         "raise it.",
@@ -8023,6 +8023,7 @@ describe("PCO-395 provenance — the read set decides what may be asserted as fa
   // `drawbar-design.md` is deliberately absent — it belongs to PCO-394.
   const PROVENANCE_SURFACES = [
     "agents/drawbar-story-lead.md",
+    "commands/drawbar-design.md",
     "commands/drawbar-plan.md",
     "commands/drawbar-work.md",
   ];
@@ -8336,5 +8337,113 @@ describe("PCO-396 contradiction protocol — a false brief claim is reported, no
   // merely missing.
   test("story-implementer's lesson-capture fence writes to $KB", () => {
     expect(flat("agents/story-implementer.md")).toContain('drawbar-kb add --dir "$KB"');
+  });
+});
+
+// PCO-394. The residual after PCO-395/396: the one failure mode a read-set rule provably cannot
+// catch, because both files were read in full and the lead simply never compared them — plus the
+// design surface, which is the last place a lead authors claims that nothing else covers.
+describe("PCO-394 the residual — copied code needs a comparison, and design is a surface", () => {
+  const flat = (p: string) => readNonEmpty(join(root, p)).replace(/\s+/g, " ");
+
+  const RULE_HEAD = "### Provenance — what you may assert as fact";
+  const RULE_TAIL = 'rather than "X is true, do Y."';
+
+  // The whole shared block, sliced between fixed delimiters so the copies can be compared as
+  // bytes rather than sampled by substring. PCO-395 anchored on one sentence, which left every
+  // other word of the block free to drift between surfaces.
+  function provenanceBlock(rel: string): string {
+    const txt = readNonEmpty(join(root, rel));
+    const start = txt.indexOf(RULE_HEAD);
+    expect(start, `${rel}: provenance block heading not found`).toBeGreaterThan(-1);
+    const end = txt.indexOf(RULE_TAIL, start);
+    expect(end, `${rel}: provenance block terminator not found after the heading`).toBeGreaterThan(start);
+    return txt.slice(start, end + RULE_TAIL.length);
+  }
+
+  test("the design command carries the provenance rule at all", () => {
+    expect(flat("commands/drawbar-design.md")).toContain("Did I read the thing that answers");
+  });
+
+  // Deliberate duplication is only safe with a drift guard. Without this the four copies are four
+  // documents that merely started the same.
+  test("every surface carries a byte-identical provenance block", () => {
+    const surfaces = [
+      "agents/drawbar-story-lead.md",
+      "commands/drawbar-design.md",
+      "commands/drawbar-plan.md",
+      "commands/drawbar-work.md",
+    ];
+    const blocks = surfaces.map((s) => [s, provenanceBlock(s)] as const);
+    expect(blocks[0]![1].length, "the block did not extract — the comparison would be vacuous").toBeGreaterThan(800);
+    for (const [rel, body] of blocks.slice(1)) {
+      expect(body, `${rel} has drifted from the canonical block`).toBe(blocks[0]![1]);
+    }
+  });
+
+  // The rule case study #1 needs. Worded as an obligation to COMPARE — "read the enclosing
+  // container" is the wrong diagnosis and must not come back, because the destination file had
+  // already been read in full when the false claim was written.
+  test("the comparison rule is an obligation to state the difference, not to read more", () => {
+    const canonical = provenanceBlock("commands/drawbar-work.md").replace(/\s+/g, " ");
+    expect(canonical).toContain(
+      "Before instructing a copy or mirror, state what differs between the source's container and the destination's container"
+    );
+    expect(canonical, "the reason must survive, or the rule reads as a style note").toContain(
+      "Reading both sides is not enough and never was"
+    );
+    expect(canonical, "a bare `match X exactly` must be called unwriteable").toContain("is unwriteable");
+  });
+
+  test("falsify-over-confirm and the downgrade-to-instruction phrasing are both stated", () => {
+    const canonical = provenanceBlock("commands/drawbar-work.md").replace(/\s+/g, " ");
+    expect(canonical).toContain("Prefer falsification over confirmation");
+    expect(canonical).toContain("check whether X, and match accordingly");
+  });
+
+  // design-reviewer runs BEFORE lock — the earliest point a false claim can be stopped, and the
+  // only reviewer PCO-396 left without a premise rule.
+  test("design-reviewer is told the design's factual claims can be wrong", () => {
+    const doc = flat("agents/design-reviewer.md");
+    expect(doc).toContain("A design can be factually wrong about the code");
+    // The operative instruction, not only the observation. Without this the section can lose its
+    // verb and still pass, which leaves a reviewer agreeing the premise may be false and doing
+    // nothing about it.
+    expect(doc, "the reviewer must be told what to DO about a false premise").toContain(
+      "raise it as a finding"
+    );
+    expect(doc, "the reason it is this reviewer's job must survive").toContain(
+      "You are the earliest stop in the pipeline"
+    );
+  });
+
+  test("all three reviewers now question what they are handed", () => {
+    for (const rel of ["agents/code-reviewer.md", "agents/security-reviewer.md"]) {
+      expect(flat(rel), rel).toContain("A spec can be factually wrong about the code");
+    }
+    expect(flat("agents/design-reviewer.md")).toContain("factually wrong about the code");
+  });
+
+  // PCO-396 fixed the Inputs prose and left the command fences on a placeholder, because its scan
+  // forbade the old path shapes and its positive test only wanted `$KB` somewhere in the file.
+  // Asserted at the invocation, which is the thing an agent actually copies.
+  test("every drawbar-kb invocation in a shipped agent doc passes --dir \"$KB\"", () => {
+    const { readdirSync } = require("node:fs") as typeof import("node:fs");
+    const agents = readdirSync(join(root, "agents")).filter((f) => f.endsWith(".md"));
+    expect(agents.length, "no agent docs found — the scan would be vacuous").toBeGreaterThan(0);
+    const offenders: string[] = [];
+    let seen = 0;
+    for (const f of agents) {
+      for (const line of readNonEmpty(join(root, "agents", f)).split("\n")) {
+        // `recall` and `add` both act on a store; `path`/`stats` legitimately take none.
+        if (!/drawbar-kb\s+(recall|add)\b/.test(line)) continue;
+        seen++;
+        // Deliberately not gated on the line already having `--dir`: an invocation that names no
+        // store at all is the other half of this defect, and skipping it is how it survives.
+        if (!line.includes('--dir "$KB"')) offenders.push(`agents/${f}: ${line.trim()}`);
+      }
+    }
+    expect(seen, "no drawbar-kb invocations found — this scan is vacuous").toBeGreaterThan(2);
+    expect(offenders, "hand the resolved store through as `$KB`, never a placeholder").toEqual([]);
   });
 });
