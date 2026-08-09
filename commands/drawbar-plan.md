@@ -1,7 +1,7 @@
 ---
 name: drawbar-plan
 description: Decompose a locked design (a Linear parent issue) into good, testable, ordered story sub-issues using the Locked/Discretion template.
-argument-hint: "<PCO-id of the parent issue>"
+argument-hint: "<issue-id of the parent issue> [--project <linear project>]"
 ---
 
 # drawbar plan
@@ -12,19 +12,24 @@ Turn the locked spec into a sequence of small, testable stories. Each story is a
 
 ```bash
 command -v drawbar-kb >/dev/null 2>&1 || { echo "drawbar-kb not found — run /drawbar-setup"; exit 1; }
-[ -d "$PWD/.drawbar/memory" ] || { echo "no .drawbar/memory — run /drawbar-setup"; exit 1; }
+KB=$(drawbar-kb path) || { echo "drawbar context unresolvable — run /drawbar-setup"; exit 1; }
+[ -d "$KB" ] || { echo "no knowledge base at $KB — run /drawbar-setup"; exit 1; }
 ```
+
+`drawbar-kb path` resolves the store from the main worktree root, so a linked worktree reads the same knowledge as the main checkout. Use `$KB` from here on, never `$PWD/.drawbar/memory`.
 
 ## 1. Load the locked spec
 
-`$ARGUMENTS` is the parent issue id. Load it with the Linear MCP `get_issue` (description + comments). This is the spec you are decomposing.
+`$ARGUMENTS` is the parent issue id, optionally followed by `--project <linear project>`. Load the parent with the Linear MCP `get_issue` (description + comments). This is the spec you are decomposing.
+
+Sub-issues inherit neither team nor project automatically. Take both from the parent you just loaded; where `--project` is given it overrides the parent's project, and where the parent has no project, fall back to `project` from `drawbar-kb context --json` before asking the user.
 
 ## 2. Recall MUST-CHECK constraints
 
 Detect the story's stack from the spec (languages, frameworks). Then:
 
 ```bash
-drawbar-kb recall "MUST-CHECK <stack keywords>" --dir "$PWD/.drawbar/memory" --json
+drawbar-kb recall "MUST-CHECK <stack keywords>" --dir "$KB" --json
 ```
 
 Every `MUST-CHECK:` entry returned becomes a validation rule the stories must honor.
@@ -74,4 +79,4 @@ If the Linear MCP is unavailable, present the stories to the user and note they 
 
 ## 6. Report
 
-Print the parent id and the ordered child ids/titles. Next: `/drawbar-work <PCO-id>`.
+Print the parent id and the ordered child ids/titles. Next: `/drawbar-work <issue-id>`.

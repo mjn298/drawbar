@@ -12,9 +12,12 @@ Implement one story, test-first. The **Opus lead** orchestrates: it takes the st
 
 ```bash
 command -v drawbar-kb >/dev/null 2>&1 || { echo "drawbar-kb not found — run /drawbar-setup"; exit 1; }
-[ -d "$PWD/.drawbar/memory" ] || { echo "no .drawbar/memory — run /drawbar-setup"; exit 1; }
+KB=$(drawbar-kb path) || { echo "drawbar context unresolvable — run /drawbar-setup"; exit 1; }
+[ -d "$KB" ] || { echo "no knowledge base at $KB — run /drawbar-setup"; exit 1; }
 command -v linear >/dev/null 2>&1 || echo "WARNING: no \`linear\` CLI — every review will report spec_source: \"brief\" and no story can come back clean"
 ```
+
+`drawbar-kb path` resolves the store from the main worktree root, which is the only reason this command works at all from a linked worktree — and stories are implemented in worktrees constantly. `$PWD/.drawbar/memory` there is an empty directory that recalls nothing and swallows every lesson written to it. Use `$KB`, and hand `$KB` (absolute, as printed) to every agent you dispatch.
 
 The `linear` warning is a warning and not an exit on purpose: a brief-sourced review is degraded but
 honest, and §6 already refuses to treat it as a clean pass. What the operator must never have to
@@ -33,7 +36,7 @@ This is the common case for a single ticket — a leaf story id is just as valid
 ## 2. Recall + read comments
 
 ```bash
-drawbar-kb recall "<story title and files>" --dir "$PWD/.drawbar/memory" --json
+drawbar-kb recall "<story title and files>" --dir "$KB" --json
 ```
 
 Also read any comments on the story (`list_comments`) — the user may have left direction. Honor every Locked decision and `MUST-CHECK:` that applies.
@@ -58,7 +61,7 @@ The brief must hand the agent everything it needs to work without you:
 
 - The story's **description and acceptance criteria** (What / Decisions / Testing / Validation / Files).
 - Every **Locked** decision and `MUST-CHECK:` recalled in step 2 — verbatim; they are hard requirements.
-- The **`$PWD/.drawbar/memory`** path (for recall and inline lesson capture).
+- The **`$KB`** path from preflight, verbatim and absolute (for recall and inline lesson capture). Never a path built from the agent's own `$PWD` — a subagent's working directory is not guaranteed to be yours.
 - The instruction to work in red→green increments, **show the RED run**, and return a verifiable report — not to commit, push, open a PR, change Linear status, or run reviews. Those are yours.
 
 For a story large enough to split into independent, non-conflicting slices, you may dispatch more than one `story-implementer` in parallel — but only when the slices don't touch the same files. Most stories are one agent.
@@ -80,7 +83,7 @@ If anything is missing, wrong, or unverifiable, **send it back**: re-dispatch `s
 Dispatch **two reviewers in parallel** on the story's diff, in a single message:
 
 - `code-reviewer` — spec compliance, code quality, and tests (pass it the acceptance criteria).
-- `security-reviewer` — security only: committed secrets/credentials, authz/tenant isolation, injection, data exposure (pass it the `.drawbar/memory` path so it can recall `MUST-CHECK security` constraints).
+- `security-reviewer` — security only: committed secrets/credentials, authz/tenant isolation, injection, data exposure (pass it `$KB` so it can recall `MUST-CHECK security` constraints).
 
 Pass both the project directory as `$PROJECT_DIR`: each pins the commit it read with `git -C "$PROJECT_DIR" rev-parse HEAD`, and a subagent's working directory is not guaranteed to be the project's. Tell both that the diff they are reading is **uncommitted** — step 4 told the implementer not to commit and step 8 is where the first commit happens — so the sha they capture names the commit this work sits on top of and none of the work itself, which is exactly what their own contract says to report and to say plainly.
 
@@ -112,7 +115,7 @@ The implementer captures lessons it hits while building. As the lead, add anythi
 
 ```bash
 echo '{"key":"<kebab-key>","type":"<learned|decision|pattern|fact|investigation|deviation>","content":"<the lesson>","source":"agent","tags":["..."],"issue":"<issue-id>","files":["<path>"]}' \
-  | drawbar-kb add --dir "$PWD/.drawbar/memory"
+  | drawbar-kb add --dir "$KB"
 ```
 
 For a mistake to guard against in future, use type `learned` with content beginning `MUST-CHECK:`.

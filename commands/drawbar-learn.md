@@ -1,7 +1,7 @@
 ---
 name: drawbar-learn
 description: Curate durable lessons from the current session's work into the knowledge base. Runs standalone or as the tail of /drawbar-work.
-argument-hint: "[PCO-id for attribution]"
+argument-hint: "[issue-id for attribution]"
 ---
 
 # drawbar learn
@@ -12,8 +12,11 @@ Distill what was learned into durable, queryable knowledge.
 
 ```bash
 command -v drawbar-kb >/dev/null 2>&1 || { echo "drawbar-kb not found — run /drawbar-setup"; exit 1; }
-[ -d "$PWD/.drawbar/memory" ] || { echo "no .drawbar/memory — run /drawbar-setup"; exit 1; }
+KB=$(drawbar-kb path) || { echo "drawbar context unresolvable — run /drawbar-setup"; exit 1; }
+[ -d "$KB" ] || { echo "no knowledge base at $KB — run /drawbar-setup"; exit 1; }
 ```
+
+`drawbar-kb path` resolves the store from the main worktree root, so lessons learned in a linked worktree land in the repository's one store. Use `$KB`, never `$PWD/.drawbar/memory`.
 
 ## 1. Review the session
 
@@ -34,8 +37,8 @@ Pull out durable lessons — not transient narration. Use the right type:
 Pipe a JSON object on stdin per entry (content is never shell-interpolated):
 
 ```bash
-echo '{"key":"<kebab-key>","type":"<type>","content":"<lesson>","source":"agent","tags":["..."],"issue":"<PCO-id or empty>","files":["<path>"]}' \
-  | drawbar-kb add --dir "$PWD/.drawbar/memory"
+echo '{"key":"<kebab-key>","type":"<type>","content":"<lesson>","source":"agent","tags":["..."],"issue":"<issue-id or empty>","files":["<path>"]}' \
+  | drawbar-kb add --dir "$KB"
 ```
 
 `drawbar-kb add` validates and **upserts** by key — one entry per key, so a correction always wins over what it corrects. Re-adding an unchanged entry is a no-op (`{"written":false,"superseded":false,...}`). Changing any field under an existing key replaces that key's line in place and archives the old copy (`{"written":true,"superseded":true,...}`).

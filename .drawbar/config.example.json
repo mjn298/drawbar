@@ -1,0 +1,5 @@
+{
+  "team": "<TEAM>",
+  "project": "<optional standing Linear project — most repos omit this and pass --project instead>",
+  "memoryDir": "<optional; omit to keep the store at <repo root>/.drawbar/memory where it can be tracked>"
+}

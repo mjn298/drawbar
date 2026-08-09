@@ -1328,6 +1328,9 @@ describe("PCO-352 S7: blocker gate clauses, Locked-11 halt, Unplanned filing", (
 // scripts/lib/ modules are split by provenance:
 //   - PRE_EXISTING (predate this epic; the KB CLI): store.ts, schema.ts, fts.ts, migrate.ts
 //   - EPIC_ADDED (added one story at a time): ship-config.ts, run-state.ts, kb-sync.ts
+//   - project-config.ts joins the second set: it is the resolver that replaced the hardcoded
+//     `PCO` team and the per-worktree `$PWD/.drawbar/memory` store path. It is not a blocker
+//     gate and implements no topological sort, which is what Locked 4 forbids.
 // PCO-364 (R1) removed coderabbit.ts and merge-guard.ts from EPIC_ADDED — deleted, not left
 // dormant (Locked E), along with the merge path and CodeRabbit gating they implemented. Never
 // asserting `length === N`: a literal count would be wrong again the moment any future story
@@ -1336,7 +1339,7 @@ describe("PCO-352 S7: blocker gate clauses, Locked-11 halt, Unplanned filing", (
 // and separately confirms no blocker-gate/topo-sort-shaped module exists anywhere.
 describe("PCO-352 S7 Locked 4: no blocker-gate/topo-sort module is added; scripts/lib/ stays within its known set", () => {
   const PRE_EXISTING = new Set(["store.ts", "schema.ts", "fts.ts", "migrate.ts"]);
-  const EPIC_ADDED = new Set(["ship-config.ts", "run-state.ts", "kb-sync.ts", "stack.ts"]);
+  const EPIC_ADDED = new Set(["ship-config.ts", "run-state.ts", "kb-sync.ts", "stack.ts", "project-config.ts"]);
 
   function libModules(): string[] {
     const { readdirSync } = require("node:fs") as typeof import("node:fs");
@@ -6861,7 +6864,7 @@ const WK6_FULL: readonly string[] = [
     "- `code-reviewer` — spec compliance, code quality, and tests (pass it the acceptance " +
       "criteria).",
     "- `security-reviewer` — security only: committed secrets/credentials, authz/tenant " +
-      "isolation, injection, data exposure (pass it the `.drawbar/memory` path so it can recall " +
+      "isolation, injection, data exposure (pass it `$KB` so it can recall " +
       "`MUST-CHECK security` constraints).",
     "Pass both the project directory as `$PROJECT_DIR`: each pins the commit it read with " +
       "`git -C \"$PROJECT_DIR\" rev-parse HEAD`, and a subagent's working directory is not " +
@@ -6956,9 +6959,13 @@ const SHIP_PINNED_ELSEWHERE: readonly string[] = [
 ];
 
 const WORK_PINNED_ELSEWHERE: readonly string[] = [
+  // The store path is resolved by `drawbar-kb path` rather than assumed to be
+  // `$PWD/.drawbar/memory`: this command runs from a linked worktree constantly, and that
+  // relative path is a different, empty directory there.
   "```bash command -v drawbar-kb >/dev/null 2>&1 || { echo \"drawbar-kb not found — run " +
-    "/drawbar-setup\"; exit 1; } [ -d \"$PWD/.drawbar/memory\" ] || { echo \"no .drawbar/memory — " +
-    "run /drawbar-setup\"; exit 1; } command -v linear >/dev/null 2>&1 || echo \"WARNING: no " +
+    "/drawbar-setup\"; exit 1; } KB=$(drawbar-kb path) || { echo \"drawbar context unresolvable " +
+    "— run /drawbar-setup\"; exit 1; } [ -d \"$KB\" ] || { echo \"no knowledge base at $KB — run " +
+    "/drawbar-setup\"; exit 1; } command -v linear >/dev/null 2>&1 || echo \"WARNING: no " +
     "\\`linear\\` CLI — every review will report spec_source: \\\"brief\\\" and no story can come " +
     "back clean\" ```",
 ];
@@ -7871,5 +7878,99 @@ describe("PCO-381: crash and worktree discipline", () => {
         expect(line, `orchestrator push against the code repo: ${line.trim()}`).not.toContain("$PROJECT_DIR");
       }
     });
+  });
+});
+
+// --- the two hardcodings this epic removed stay removed ----------------------------------------
+//
+// Both were the same class of bug: a value that is a property of the OPERATOR'S project, written
+// into prose that ships to everybody. `PCO`/`DRAWBAR` are the authoring workspace's own team and
+// project, and every other workspace silently filed against them. `$PWD/.drawbar/memory` is the
+// working directory's store, and a session running in a linked worktree silently got an empty
+// one — recall returned nothing and every lesson written went where no later session looks.
+//
+// Prose is where both regress, because prose has no compiler. Scanned by reading the shipped
+// files off disk (never a hardcoded snapshot list), so a command added later is covered the day
+// it lands rather than the day somebody remembers to extend this.
+describe("no shipped instruction hardcodes a team, a project, or a per-worktree store path", () => {
+  function shippedDocs(): string[] {
+    const { readdirSync } = require("node:fs") as typeof import("node:fs");
+    const out: string[] = [];
+    for (const dir of ["commands", "agents"]) {
+      for (const f of readdirSync(join(root, dir))) {
+        if (f.endsWith(".md")) out.push(join(dir, f));
+      }
+    }
+    for (const d of readdirSync(join(root, "skills"))) {
+      const skill = join("skills", d, "SKILL.md");
+      if (existsSync(join(root, skill))) out.push(skill);
+    }
+    return out;
+  }
+
+  test("there is at least one shipped doc to scan (the scan is not vacuously green)", () => {
+    expect(shippedDocs().length).toBeGreaterThan(0);
+  });
+
+  // `$PWD/.drawbar/memory` may still be NAMED — three docs name it precisely to forbid it, and
+  // deleting those warnings is its own regression. What may not survive is a doc telling an
+  // agent to USE it: `--dir "$PWD/...`, `KB="$PWD/...`, or a bare `[ -d "$PWD/.drawbar/memory" ]`
+  // preflight. The distinction is the point: this catches the instruction, not the word.
+  test("no shipped doc instructs an agent to USE $PWD/.drawbar/memory", () => {
+    const offenders: string[] = [];
+    for (const rel of shippedDocs()) {
+      for (const line of readNonEmpty(join(root, rel)).split("\n")) {
+        if (!line.includes("$PWD/.drawbar/memory")) continue;
+        // A line that forbids it says so; a line that uses it feeds it to a flag or a test.
+        if (/--dir\s+"?\$PWD\/\.drawbar\/memory|=\s*"?\$PWD\/\.drawbar\/memory|-d\s+"\$PWD\/\.drawbar\/memory"/.test(line)) {
+          offenders.push(`${rel}: ${line.trim()}`);
+        }
+      }
+    }
+    expect(offenders, "resolve the store with `drawbar-kb path` — $PWD is the worktree, not the repo").toEqual([]);
+  });
+
+  // The three docs that carry the warning must keep carrying it. Without this, the test above
+  // stays green after somebody deletes the explanation, and the next author reintroduces the
+  // path because nothing on the page says not to.
+  test("the commands that resolve the store also say why $PWD is wrong", () => {
+    for (const rel of ["commands/drawbar-design.md", "commands/drawbar-work.md", "commands/drawbar-learn.md"]) {
+      const txt = readNonEmpty(join(root, rel));
+      expect(txt, `${rel} must resolve the store rather than assume it`).toContain("KB=$(drawbar-kb path)");
+      expect(txt, `${rel} must say why $PWD/.drawbar/memory is wrong`).toContain("$PWD/.drawbar/memory");
+    }
+  });
+
+  // The literal team and project the plugin used to ship with. Scoped to the shipped
+  // instructions — `docs/` keeps the historical plans and specs that named them, and rewriting
+  // history is not what this guards.
+  test("no shipped doc names the authoring workspace's team or project as the one to file against", () => {
+    const offenders: string[] = [];
+    for (const rel of shippedDocs()) {
+      for (const line of readNonEmpty(join(root, rel)).split("\n")) {
+        if (/team\s+\*\*PCO\*\*|project\s+\*\*DRAWBAR\*\*|\bPCO-id\b/.test(line)) {
+          offenders.push(`${rel}: ${line.trim()}`);
+        }
+      }
+    }
+    expect(offenders, "the team comes from .drawbar/config.json; the project comes from --project").toEqual([]);
+  });
+
+  // The replacement has to be reachable, not just the old value absent. A design command that
+  // dropped `PCO` and put nothing in its place would pass every assertion above and then have
+  // no team at all.
+  test("drawbar-design resolves both the team and the project, and refuses to guess a team", () => {
+    const txt = readNonEmpty(join(root, "commands/drawbar-design.md"));
+    expect(txt).toContain("drawbar-kb context --json");
+    expect(txt).toContain("`.drawbar/config.json`");
+    expect(txt).toContain("--project");
+    // The failure mode worth naming: filing into whichever team `list_teams` returns first is
+    // silently wrong in exactly the way the hardcoded team was.
+    expect(txt).toContain("do not file into whichever one happens to come back first from `list_teams`");
+  });
+
+  test("the shipped example config documents every key the resolver accepts", () => {
+    const example = JSON.parse(readNonEmpty(join(root, ".drawbar/config.example.json"))) as Record<string, unknown>;
+    expect(Object.keys(example).sort()).toEqual(["memoryDir", "project", "team"]);
   });
 });
