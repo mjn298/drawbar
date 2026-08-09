@@ -752,6 +752,16 @@ describe("version reconcile", () => {
     expect(pkg.version).toMatch(/^\d+\.\d+\.\d+$/);
     expect(pkg.version).toBe(plugin.version);
   });
+
+  // The reconcile above pins the two files EQUAL, which any matching pair satisfies — including
+  // a pair nobody meant to change. Pinning the value makes a bump a deliberate edit to a named
+  // test rather than a side effect, and gives PCO-397's replay something to check the loaded
+  // plugin against: the cache is keyed by plugin.json's version, so a replay run against a stale
+  // build would pass confidently while exercising none of the new rules.
+  test("the shipped version is 0.3.0 (PCO-393: new prompt rules and a new report key)", () => {
+    const pkg = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
+    expect(pkg.version).toBe("0.3.0");
+  });
 });
 
 describe("scaffolding", () => {
