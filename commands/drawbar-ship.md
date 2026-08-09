@@ -436,8 +436,8 @@ Then dispatch **one** `drawbar-story-lead` agent (Opus). The brief must carry:
   Linear's `gitBranchName` from `get_issue`, which guarantees the PR auto-links
 - that it must **not** merge and has no Linear authority
 
-It returns the JSON report in its §7: `{status, branch, base, spec_source, reviewed_sha, head_sha,
-findings, dedup, mutation_pairs, out_of_scope, lessons, summary}`. It carries no `pr` — it opens none; §4 below is what opens
+It returns the JSON report in its §7: `{story, status, branch, base, parked_reason, spec_source,
+reviewed_sha, head_sha, findings, dedup, mutation_pairs, out_of_scope, false_claims, lessons, summary}`. It carries no `pr` — it opens none; §4 below is what opens
 the PR and learns its number. **Do not ask it for the diff.** If you find yourself wanting
 one, the split is not working.
 
@@ -825,6 +825,10 @@ array during the run: the repair belongs to the operator's morning review.
 Post a `save_comment` on the story: what shipped, the PR link, the stack position (this
 story's place in the run's stack, e.g. "position 3 of the run, based on `<BASE>`"), the
 sub-issues filed in §3, and the story-lead's `mutation_pairs`.
+
+**Carry the report's `false_claims` into that comment too, under their own heading**, or say plainly that there were none. Each one is a place the brief asserted something the code contradicts — a defect in drawbar's own research rather than in the diff, and the only signal that ever corrects it. It reaches nobody from inside the report alone: unlike `findings` and `out_of_scope`, nothing files it as a sub-issue, so this comment is where it becomes visible.
+
+**Lead with the correction, and never quote a false claim as a bare statement.** Write each as `what is actually true (file:line) — an earlier brief wrongly asserted: "<claim>"`, correction first and the claim clearly subordinate to it. `/drawbar-work` instructs a lead to read this story's comments, so anything posted here is re-read by a later session — a bare quote of a false claim is indistinguishable from a statement of fact by the time it is recalled, which is exactly the failure this whole story exists to stop. The same rule the report contract states: a claim is a signal about our research, not a fact about the code, and it never earns the phrasing of one.
 
 **Leave the story `In Progress`. No status transition of any kind** — never `Done`, `Ready
 for QA`, `Ready for Rollout`, `Rolled Out`, or any completed-type status. The operator's own
