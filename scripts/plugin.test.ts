@@ -7222,11 +7222,11 @@ describe("PCO-374/375/376 fix pass: the new rules are closed in place, and nothi
   });
 
   test("ship §4's prose carries exactly these units and nothing else, down to the fence", () => {
-    expect(docSectionProse(SH_374, SH4)).toEqual(SH4_PROSE);
+    expect(docSectionProse(SH_374, SH4)).toEqual([...SH4_PROSE]);
   });
 
   test("drawbar-work §6 carries exactly these units and nothing else", () => {
-    expect(docUnits(docSection(WK_374, WK6))).toEqual(WK6_FULL);
+    expect(docUnits(docSection(WK_374, WK6))).toEqual([...WK6_FULL]);
   });
 
   // --- the reviewer docs' two remaining open regions -------------------------------------------
@@ -7553,7 +7553,7 @@ describe("PCO-371 fix pass: §4's fence comments are closed, and no fence commen
   test("§4's fence carries exactly these comment units and nothing else", () => {
     const units = fenceCommentUnits(section4Fence());
     expect(units.length, "§4's fence comments did not extract — the pin would be vacuous").toBeGreaterThan(20);
-    expect(units).toEqual(SH4_FENCE_COMMENTS);
+    expect(units).toEqual([...SH4_FENCE_COMMENTS]);
   });
 
   // The two claims in that block that are the whole of PCO-371, named explicitly so a future edit
