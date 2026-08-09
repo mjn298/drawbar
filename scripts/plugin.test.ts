@@ -7157,6 +7157,13 @@ describe("PCO-374/375/376 fix pass: the new rules are closed in place, and nothi
         "or the story record** — a claim about the code that the code contradicts. Copy each one " +
         "through with its `contradicted_by` evidence; an empty array is the normal case and says " +
         "so honestly.",
+      "**A `claim` string is for your caller's judgment, not for republication as a statement.** " +
+        "It is a false proposition, and every place it gets copied is a place a later reader can " +
+        "meet it stripped of the context that marked it false. Your caller leads with the " +
+        "correction and subordinates the claim to it; nothing downstream writes it to the " +
+        "knowledge base, where recall is keyword-matched and a one-line entry arrives with no " +
+        "framing at all. Record the corrected truth, positively phrased — never the claim, and " +
+        "never its negation.",
       "**`false_claims` is not `out_of_scope`.** `out_of_scope` is a real defect in the code that " +
         "this story is not the place to fix. A false claim is a defect in *your own research*, and " +
         "it is the only signal that ever corrects it — collapsing the two loses the one thing that " +
@@ -8236,6 +8243,46 @@ describe("PCO-396 contradiction protocol — a false brief claim is reported, no
   // no instruction to forward it, and the finding dies one hop short of the report that carries it.
   test("the story-lead's gate forwards false claims into its own report", () => {
     expect(flat(LEAD)).toContain("carry them into `false_claims` in §7");
+  });
+
+  // --- a false claim must not become durable, retrievable text ---------------------------------
+  //
+  // The claim is a false proposition. Recall is keyword-matched, and an entry arrives in a later
+  // session as one line with none of the framing that marked it false — so a stored claim, or a
+  // stored negation of one, is a claim waiting to be read as fact. Storing the corrected truth
+  // instead loses nothing: preventing the error needs the truth to be easy to recall, not the
+  // falsehood to be on file.
+  test("the KB write records the correction, positively phrased, never the claim", () => {
+    const work = flat("commands/drawbar-work.md");
+    expect(work).toContain("Write the correction to the KB, never the claim");
+    expect(work).toContain("positively phrased");
+    // Both halves. Forbidding the claim while allowing its negation leaves the proposition intact.
+    expect(work, "a negation still carries the false proposition").toContain("including as a negation");
+  });
+
+  test("story-implementer keeps a false claim out of its inline lesson capture", () => {
+    const impl = flat(IMPL);
+    expect(impl).toContain("A false brief claim goes in your report, not in here");
+    expect(impl).toContain("never the claim, and never its negation");
+  });
+
+  // Linear comments are re-read: /drawbar-work §2 tells a lead to read the story's comments, so a
+  // bare quote posted here returns to a later session looking exactly like a statement of fact.
+  test("ship's summary comment leads with the correction, never a bare quote", () => {
+    const txt = readNonEmpty(join(root, SHIP_DOC));
+    const at = txt.indexOf("## 5. Post the summary comment");
+    const section = txt.slice(at, txt.indexOf("## 6.", at)).replace(/\s+/g, " ");
+    expect(section).toContain("Lead with the correction, and never quote a false claim as a bare statement");
+    expect(section, "the reason must survive, or the rule reads as style").toContain(
+      "instructs a lead to read this story's comments"
+    );
+    expect(section, "'verbatim' was the original defect — it must not come back").not.toContain(
+      "into that comment too, verbatim"
+    );
+  });
+
+  test("the report contract says a claim string is not for republication", () => {
+    expect(flat(LEAD)).toContain("not for republication as a statement");
   });
 
   // --- the reviewers ---------------------------------------------------------------------------

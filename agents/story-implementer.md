@@ -68,6 +68,8 @@ echo '{"key":"<kebab-key>","type":"<learned|decision|pattern|fact|investigation|
 
 For a mistake to guard against in future, use type `learned` with content beginning `MUST-CHECK:`.
 
+**A false brief claim goes in your report, not in here.** If it is worth a KB entry at all, write the **corrected truth, positively phrased** and with `file:line` — never the claim, and never its negation. "Rules are NOT id-less" still carries the false proposition, and recall matches keywords rather than meaning, so a later session meets that line with none of the framing that made it a correction.
+
 ## What to return
 
 Your final message is a report the lead uses to verify completion — make it verifiable, not a summary:

@@ -277,6 +277,13 @@ story 1 every night.
 story record** — a claim about the code that the code contradicts. Copy each one through with its
 `contradicted_by` evidence; an empty array is the normal case and says so honestly.
 
+**A `claim` string is for your caller's judgment, not for republication as a statement.** It is a
+false proposition, and every place it gets copied is a place a later reader can meet it stripped of
+the context that marked it false. Your caller leads with the correction and subordinates the claim
+to it; nothing downstream writes it to the knowledge base, where recall is keyword-matched and a
+one-line entry arrives with no framing at all. Record the corrected truth, positively phrased —
+never the claim, and never its negation.
+
 **`false_claims` is not `out_of_scope`.** `out_of_scope` is a real defect in the code that this
 story is not the place to fix. A false claim is a defect in *your own research*, and it is the only
 signal that ever corrects it — collapsing the two loses the one thing that feeds the provenance rule
