@@ -2410,7 +2410,11 @@ describe("PCO-370 R3b: §4's executable stacked-PR fence", () => {
     expect(lines.indexOf(mk), "the ignore file is written before its directory exists").toBeLessThan(lines.indexOf(ign));
     // Executed, against real git rather than by reading the pattern: what Preflight WRITES must
     // actually ignore all four inputs, and must not ignore itself.
-    const cwd = mkdtempSync(join(tmpdir(), "drawbar-pf-"));
+    // Resolved at creation. `cd` keeps the LOGICAL path, so `$PWD` echoes back whatever it was
+    // handed — and on macOS `$TMPDIR` sits under the `/var` -> `/private/var` symlink, so an
+    // unresolved `mkdtemp` path and its `realpath` are two different strings for one directory.
+    // Handing `cd` an already-resolved path makes the two agree on every platform.
+    const cwd = realpathSync(mkdtempSync(join(tmpdir(), "drawbar-pf-")));
     gitInit(cwd);
     const { exitCode, output } = await runScript([`cd '${cwd}'`, mk, ign, say].join("\n"));
     expect(exitCode, `Preflight's scaffolding did not run: ${output}`).toBe(0);

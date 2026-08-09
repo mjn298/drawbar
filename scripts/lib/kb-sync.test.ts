@@ -32,7 +32,13 @@ let envDir: string;
 let kbDir: string;
 
 beforeEach(() => {
-  envDir = mkdtempSync(join(tmpdir(), "kb-sync-env-"));
+  // Resolved at creation, because the module's trust root calls `realpath` on the config path
+  // for real whenever the default seams are wired up. On macOS `$TMPDIR` sits under the
+  // `/var` -> `/private/var` symlink, so an unresolved `mkdtemp` path and anything that has
+  // been through `realpath` are two different strings for the same directory, and every
+  // expectation built from `envDir` misses by that prefix. Resolving here makes `realpath` a
+  // no-op instead of leaving each assertion to guess which side of the boundary it is on.
+  envDir = realpathSync(mkdtempSync(join(tmpdir(), "kb-sync-env-")));
   kbDir = join(envDir, ".drawbar", "memory");
 });
 
