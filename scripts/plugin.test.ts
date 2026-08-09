@@ -949,7 +949,7 @@ describe("Locked 23 — preserved verbatim (grep-assertable, or hash-pinned for 
     expect(
       hash,
       "§4 body hash changed — if this is an intentional edit, regenerate with the one-liner in the comment above; if not, something silently altered §4."
-    ).toBe("e3e06c41f1f3e83c490c7046f6b59287d02ec0d97d8ebb34170063f3f2d93858");
+    ).toBe("85c257210a86333ad896ee843148d0cafeecde489f27bdb5e5363277d062ff22");
   });
 });
 
@@ -7972,5 +7972,120 @@ describe("no shipped instruction hardcodes a team, a project, or a per-worktree 
   test("the shipped example config documents every key the resolver accepts", () => {
     const example = JSON.parse(readNonEmpty(join(root, ".drawbar/config.example.json"))) as Record<string, unknown>;
     expect(Object.keys(example).sort()).toEqual(["memoryDir", "project", "team"]);
+  });
+});
+
+// PCO-395. A lead's own belief about the code, labelled `Locked`, reaches a Sonnet
+// implementer as a hard requirement and gets built even when it is false. These tests pin
+// the rule that decides what may be asserted as fact at all.
+//
+// Anchors below are deliberately plain prose with no markdown emphasis inside them: an
+// assertion anchored on a `*word*` passes again the moment someone rewords the emphasis,
+// which is how a guard reports a false "caught". See MUST-CHECK
+// mutation-gate-substring-assert-reports-false-caught.
+describe("PCO-395 provenance — the read set decides what may be asserted as fact", () => {
+  // The three surfaces where a lead writes a factual claim someone else acts on.
+  // `drawbar-design.md` is deliberately absent — it belongs to PCO-394.
+  const PROVENANCE_SURFACES = [
+    "agents/drawbar-story-lead.md",
+    "commands/drawbar-plan.md",
+    "commands/drawbar-work.md",
+  ];
+
+  // The load-bearing sentence, byte-identical across surfaces so PCO-394 can pin the copies.
+  const RULE = "Did I read the thing that answers";
+  const PER_QUESTION = "per-question, not per-file";
+
+  // These docs are hard-wrapped, so a prose anchor must be wrap-insensitive or it fails the
+  // day someone reflows a paragraph without changing a word. Collapsing whitespace keeps the
+  // assertion about content rather than about where a line happens to break.
+  const flat = (p: string) => readNonEmpty(join(root, p)).replace(/\s+/g, " ");
+
+  for (const surface of PROVENANCE_SURFACES) {
+    test(`${surface} carries the provenance rule`, () => {
+      expect(flat(surface)).toContain(RULE);
+    });
+
+    // Without this half the rule degrades to "did I open the file", which is exactly the
+    // coarser test that would have licensed PCO-393's case #2 — three greps for other
+    // symbols in the very file whose schema the claim was about.
+    test(`${surface} scopes the test per-question, not per-file`, () => {
+      expect(flat(surface)).toContain(PER_QUESTION);
+    });
+  }
+
+  // Drift guard in the style of the leak-scan file-list test above: a command or agent
+  // added later cannot silently skip the rule, and a surface that quietly drops it fails
+  // here rather than passing every per-surface test by simply not being in the list.
+  test("the set of files carrying the rule is exactly the expected list", () => {
+    const all = [
+      ...COMMANDS.map((c) => `commands/${c}.md`),
+      ...AGENTS.map((a) => `agents/${a}.md`),
+    ];
+    const carrying = all.filter((p) => flat(p).includes(RULE)).sort();
+    expect(carrying).toEqual([...PROVENANCE_SURFACES].sort());
+  });
+
+  // Anchored on the brief-construction sentence in each doc, not on the bare string
+  // "## Read set": that shorter anchor is also satisfied by a passing prose mention or by the
+  // worked example further down, so deleting the actual instruction left it green.
+  test("brief construction carries a Read set on both the attended and unattended paths", () => {
+    expect(flat("commands/drawbar-work.md")).toContain(
+      "A **`## Read set`** — one line per read, naming what it established and what it did not."
+    );
+    expect(flat("agents/drawbar-story-lead.md")).toContain(
+      "The brief also carries a **`## Read set`** — one line per read, naming what it established and what it did not."
+    );
+  });
+
+  // Assert BOTH halves. A doc that keeps the allow-list and drops the deny-list still lets
+  // a lead guess be Locked, and a test checking only one half passes against it happily.
+  test("drawbar-plan.md names what may AND may not be Locked", () => {
+    const plan = flat("commands/drawbar-plan.md");
+    expect(plan).toContain("Only these may be Locked:");
+    expect(plan).toContain("may NOT be Locked");
+  });
+
+  test("a lead observation has a home that is neither Locked nor Discretion", () => {
+    const plan = flat("commands/drawbar-plan.md");
+    expect(plan).toContain("They are evidence, not decisions");
+  });
+
+  // The transformation is the whole point and is easy to miss from an abstract rule, so
+  // the worked example has to survive in the doc, not just the principle.
+  test("the worked before/after example is present, not only the abstract rule", () => {
+    for (const p of PROVENANCE_SURFACES) {
+      expect(flat(p), p).toContain("Point at the evidence, not the conclusion");
+    }
+  });
+
+  describe("the mutation gate survives the narrowing of Locked", () => {
+    const leadDoc = () => flat("agents/drawbar-story-lead.md");
+
+    // Narrowing `Locked` shrinks this gate's input set. Acceptance criteria are the
+    // authoritative statements that survive the recategorisation, so the gate rebases onto
+    // them; without this it thins out silently and a green suite means less than it did.
+    test("the gate mutates acceptance criteria as well as Locked decisions", () => {
+      expect(leadDoc()).toContain("Per acceptance criterion:");
+    });
+
+    test("the existing per-Locked arm is not replaced", () => {
+      expect(leadDoc()).toContain("Per `Locked` decision:");
+    });
+
+    // A mislabelled guess that gets pinned by a test is the worst outcome in PCO-393:
+    // the wrong behaviour becomes permanent and expensive to undo.
+    test("the gate refuses to pin a lead observation with a test", () => {
+      expect(leadDoc()).toContain("Never mutate against a lead observation");
+    });
+
+    test("a short Locked list is documented as expected, not as a gap", () => {
+      expect(leadDoc()).toContain("A short `Locked` list is the expected outcome");
+    });
+  });
+
+  test("story-implementer is told an observation is evidence, not a requirement", () => {
+    const impl = flat("agents/story-implementer.md");
+    expect(impl).toContain("An observation is evidence, not a requirement");
   });
 });

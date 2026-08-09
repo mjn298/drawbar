@@ -57,11 +57,42 @@ You are the lead (Opus): you orchestrate and verify, you do **not** type the imp
 Task(subagent_type="story-implementer", prompt="<brief>")
 ```
 
+### Provenance — what you may assert as fact
+
+Before you write a factual claim someone else will act on, ask the one question with a
+mechanical answer:
+
+**Did I read the thing that answers this question, in this session?**
+
+- **Yes** → assert it, and cite `file:line`.
+- **No** → do not assert it. Write it as an instruction to check.
+
+The test is **per-question, not per-file**. A search that answered one question licenses
+nothing about a different one in the same file: grepping `ruleSets` opens the schema and still
+says nothing about whether a rule carries an `id`. Record what each read *established*, not
+which paths you touched.
+
+**Point at the evidence, not the conclusion.** Instead of "location rules have no `id`, keep
+`key={index}`", write "I have not read the rule schema — check `BaseRuleSchema` in
+`shared/types/locationGroup.ts` and match whichever is correct." The second is shorter, and it
+produces the right result even when your belief is wrong. That is the whole trick: a belief
+written as evidence-plus-instruction is self-correcting, while the same belief written as a
+decision is binding — and an agent told it is a hard requirement will build it faithfully.
+
 The brief must hand the agent everything it needs to work without you:
 
 - The story's **description and acceptance criteria** (What / Decisions / Testing / Validation / Files).
 - Every **Locked** decision and `MUST-CHECK:` recalled in step 2 — verbatim; they are hard requirements.
 - The **`$KB`** path from preflight, verbatim and absolute (for recall and inline lesson capture). Never a path built from the agent's own `$PWD` — a subagent's working directory is not guaranteed to be yours.
+- A **`## Read set`** — one line per read, naming what it established and what it did not. Your
+  own conclusions go here as evidence with `file:line`, never in the Locked list. Anything you
+  assert that no entry backs is the defect step 5 looks for.
+
+  ```
+  ## Read set
+  - shared/types/locationGroup.ts — grepped `ruleSets` only; rule id-ness NOT established
+  - pages/Organization/GroupDetail.tsx — full read
+  ```
 - The instruction to work in red→green increments, **show the RED run**, and return a verifiable report — not to commit, push, open a PR, change Linear status, or run reviews. Those are yours.
 
 For a story large enough to split into independent, non-conflicting slices, you may dispatch more than one `story-implementer` in parallel — but only when the slices don't touch the same files. Most stories are one agent.

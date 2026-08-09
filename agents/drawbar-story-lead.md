@@ -85,9 +85,42 @@ git -C "$PROJECT_DIR" pull --ff-only || { echo "FATAL: base branch '$BASE_BRANCH
 git -C "$PROJECT_DIR" checkout -b "$BRANCH"
 ```
 
+### Provenance — what you may assert as fact
+
+Before you write a factual claim someone else will act on, ask the one question with a
+mechanical answer:
+
+**Did I read the thing that answers this question, in this session?**
+
+- **Yes** → assert it, and cite `file:line`.
+- **No** → do not assert it. Write it as an instruction to check.
+
+The test is **per-question, not per-file**. A search that answered one question licenses
+nothing about a different one in the same file: grepping `ruleSets` opens the schema and still
+says nothing about whether a rule carries an `id`. Record what each read *established*, not
+which paths you touched.
+
+**Point at the evidence, not the conclusion.** Instead of "location rules have no `id`, keep
+`key={index}`", write "I have not read the rule schema — check `BaseRuleSchema` in
+`shared/types/locationGroup.ts` and match whichever is correct." The second is shorter, and it
+produces the right result even when your belief is wrong. That is the whole trick: a belief
+written as evidence-plus-instruction is self-correcting, while the same belief written as a
+decision is binding — and an agent told it is a hard requirement will build it faithfully.
+
 Dispatch the **`story-implementer`** agent (Sonnet) to build the story test-first. Hand it
 the acceptance criteria, every `Locked` / `MUST-CHECK:` verbatim, and `$KB`. Require it to
 show the RED run, and tell it not to commit, push, open a pull request, or run reviews.
+
+The brief also carries a **`## Read set`** — one line per read, naming what it established and
+what it did not. Your own conclusions about the code go there as evidence with `file:line`,
+never among the `Locked` decisions you pass through verbatim. The distinction is the point:
+what you were handed is authoritative, what you concluded this session is not. Its entries
+look like this:
+
+```
+- shared/types/locationGroup.ts — grepped `ruleSets` only; rule id-ness NOT established
+- pages/Organization/GroupDetail.tsx — full read
+```
 
 **Commit each verified increment before doing anything destructive.** Once an increment is
 green, commit it. Reverting a mutation with `git checkout -- <file>` against uncommitted
@@ -110,10 +143,19 @@ closure was never invoked by any test.
 Before review, prove the tests bite:
 
 - **Per `Locked` decision:** mutate the source to violate it. A *named* test must fail.
+- **Per acceptance criterion:** mutate the source to violate it. A *named* test must fail.
+  Acceptance criteria carry this gate's weight. A short `Locked` list is the expected outcome
+  of the provenance rule above, not a gap to fill and not evidence the gate weakened — the
+  criteria are the authoritative statements that survive it.
 - **Per injected seam:** enumerate every closure, repository, and dependency injected into
   any function under test, and mutate **each independently**. Each must produce a failure.
   A seam no test exercises is a hole regardless of how many tests pass.
 - Restore each mutation before the next (the tree is committed, so `git checkout --` is safe).
+
+**Never mutate against a lead observation.** Entries in the brief's `## Read set` are evidence,
+not decisions, and a mutation pass that pins one with a test makes a guess permanent — the
+single most expensive outcome available here, because the wrong behaviour then has a green
+suite defending it. Mutate what was decided, never what was merely concluded.
 
 Record every `mutation → failing test` pair; it goes in your report.
 
