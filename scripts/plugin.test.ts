@@ -2410,7 +2410,11 @@ describe("PCO-370 R3b: §4's executable stacked-PR fence", () => {
     expect(lines.indexOf(mk), "the ignore file is written before its directory exists").toBeLessThan(lines.indexOf(ign));
     // Executed, against real git rather than by reading the pattern: what Preflight WRITES must
     // actually ignore all four inputs, and must not ignore itself.
-    const cwd = mkdtempSync(join(tmpdir(), "drawbar-pf-"));
+    // Resolved at creation. `cd` keeps the LOGICAL path, so `$PWD` echoes back whatever it was
+    // handed — and on macOS `$TMPDIR` sits under the `/var` -> `/private/var` symlink, so an
+    // unresolved `mkdtemp` path and its `realpath` are two different strings for one directory.
+    // Handing `cd` an already-resolved path makes the two agree on every platform.
+    const cwd = realpathSync(mkdtempSync(join(tmpdir(), "drawbar-pf-")));
     gitInit(cwd);
     const { exitCode, output } = await runScript([`cd '${cwd}'`, mk, ign, say].join("\n"));
     expect(exitCode, `Preflight's scaffolding did not run: ${output}`).toBe(0);
@@ -7218,11 +7222,11 @@ describe("PCO-374/375/376 fix pass: the new rules are closed in place, and nothi
   });
 
   test("ship §4's prose carries exactly these units and nothing else, down to the fence", () => {
-    expect(docSectionProse(SH_374, SH4)).toEqual(SH4_PROSE);
+    expect(docSectionProse(SH_374, SH4)).toEqual([...SH4_PROSE]);
   });
 
   test("drawbar-work §6 carries exactly these units and nothing else", () => {
-    expect(docUnits(docSection(WK_374, WK6))).toEqual(WK6_FULL);
+    expect(docUnits(docSection(WK_374, WK6))).toEqual([...WK6_FULL]);
   });
 
   // --- the reviewer docs' two remaining open regions -------------------------------------------
@@ -7549,7 +7553,7 @@ describe("PCO-371 fix pass: §4's fence comments are closed, and no fence commen
   test("§4's fence carries exactly these comment units and nothing else", () => {
     const units = fenceCommentUnits(section4Fence());
     expect(units.length, "§4's fence comments did not extract — the pin would be vacuous").toBeGreaterThan(20);
-    expect(units).toEqual(SH4_FENCE_COMMENTS);
+    expect(units).toEqual([...SH4_FENCE_COMMENTS]);
   });
 
   // The two claims in that block that are the whole of PCO-371, named explicitly so a future edit

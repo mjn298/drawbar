@@ -9,6 +9,7 @@ import {
   HEARTBEAT_SECONDS_MIN,
   HEARTBEAT_SECONDS_MAX,
   type RunState,
+  type ParseReason,
 } from "./run-state";
 
 // Placeholder-id scheme (per the story's HARD CONSTRAINT): every story/issue id used below is
@@ -657,7 +658,10 @@ describe("in_flight — the authoritative duplicate-dispatch guard, with a stale
 // table-driven test per reason, each producing a malformed run-state via exactly one
 // documented divergence from VALID_RUN_STATE, and asserting the EXACT reason it must produce.
 describe("parseRunState — every ParseReason is exercised at least once (Coverage)", () => {
-  const cases: { name: string; text: () => string; reason: string }[] = [
+  // `reason` is the union, not `string`: the table below is the only place every `ParseReason`
+  // is written out by hand, so a typo here would otherwise sit in a green suite asserting a
+  // value `parseRunState` can never return.
+  const cases: { name: string; text: () => string; reason: ParseReason }[] = [
     { name: "invalid_json: not valid JSON at all", text: () => "{not valid json", reason: "invalid_json" },
     { name: "not_object: root is a JSON array", text: () => JSON.stringify([1, 2, 3]), reason: "not_object" },
     { name: "not_object: root is a bare number", text: () => JSON.stringify(42), reason: "not_object" },
@@ -761,7 +765,10 @@ describe("parseRunState — every ParseReason is exercised at least once (Covera
   // twice (array root, bare number root), so the assertion is against the pinned literal
   // list, not `cases.length`.
   test("this table covers all 16 ParseReason values, not merely a subset", () => {
-    const ALL_PARSE_REASONS = [
+    // Typed as the union too, so this hand-maintained exhaustiveness list cannot drift into
+    // naming a reason that does not exist — which would make the coverage check assert against
+    // a value no table row could ever legitimately carry.
+    const ALL_PARSE_REASONS: ParseReason[] = [
       "invalid_json",
       "not_object",
       "missing_key",
