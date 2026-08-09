@@ -40,7 +40,7 @@ Plus Claude Code itself (the plugin host).
 
    Then run `/reload-plugins` (or restart) so the `/drawbar-*` commands load.
 
-2. **Run `/drawbar-setup` once in a project.** It links the `drawbar-kb` CLI onto your PATH (via `bun link` from the installed plugin) and initializes `<project>/.drawbar/memory/`.
+2. **Run `/drawbar-setup` once in a project.** It links the `drawbar-kb` CLI onto your PATH (via `bun link` from the installed plugin), records your Linear team in `.drawbar/config.json`, and initializes the knowledge base.
 
    If `drawbar-kb` still isn't found afterward, add Bun's global bin to PATH:
 
@@ -53,22 +53,48 @@ Plus Claude Code itself (the plugin host).
 ## Use
 
 ```
-/drawbar-setup [legacy knowledge.jsonl]   # once per machine + per project
-/drawbar-design <feature | issue-id>       # spec → Linear parent issue
-/drawbar-plan <issue-id>                    # ordered story sub-issues
-/drawbar-work <issue-id>                    # implement next story, TDD
-/drawbar-learn [issue-id]                   # curate lessons into the KB
+/drawbar-setup [legacy knowledge.jsonl]              # once per machine + per project
+/drawbar-design <feature | issue-id> [--project P]   # spec → Linear parent issue
+/drawbar-plan <issue-id> [--project P]               # ordered story sub-issues
+/drawbar-work <issue-id>                             # implement next story, TDD
+/drawbar-learn [issue-id]                            # curate lessons into the KB
 ```
 
 `issue-id` is a Linear issue identifier (e.g. `ABC-123`) — your team's own prefix.
 
 The `[legacy knowledge.jsonl]` argument to `/drawbar-setup` is **only** for migrating an existing **lavra** knowledge base into drawbar. If you weren't using lavra before — most people — skip it and start with a fresh, empty knowledge base.
 
-Knowledge lives in `<project>/.drawbar/memory/` (the JSONL is committed; the SQLite index is gitignored). Query it directly anytime:
+## Project config
+
+drawbar hardcodes no Linear team. `/drawbar-setup` writes a repo-local `.drawbar/config.json`; see `.drawbar/config.example.json` for the full shape.
+
+```json
+{ "team": "PAS" }
+```
+
+| Key | Meaning |
+|---|---|
+| `team` | **Required in practice.** The Linear team new issues are filed against. Without it, `/drawbar-design` stops and asks rather than guessing. |
+| `project` | Optional standing Linear project. Most repos omit it and pass `--project` per invocation, because a project is a unit of work rather than a property of the checkout. |
+| `memoryDir` | Optional. Moves the knowledge store off the repo root — see below. |
+
+Environment overrides, for a machine-wide choice no config file records: `DRAWBAR_TEAM`, `DRAWBAR_PROJECT`, `DRAWBAR_MEMORY_DIR`, and `DRAWBAR_CONFIG` (points at a config file elsewhere).
+
+## Where knowledge lives
+
+The store is per **repository**, not per working directory. It resolves in this order — `--dir`, `DRAWBAR_MEMORY_DIR`, `memoryDir` in the config, then `<main worktree root>/.drawbar/memory`.
+
+The default anchors to the **main worktree root** — the parent of the shared `.git` directory — so every linked worktree of the repo reads and writes the same knowledge. This is deliberate: a store resolved from `$PWD` gives each worktree its own empty one, and stories are implemented in worktrees constantly.
+
+Whether the store is committed is your choice. Leave `memoryDir` unset to keep it at `<repo root>/.drawbar/memory`, where the JSONL can be tracked and shared with the team (the SQLite index beside it is gitignored). Set `memoryDir` to a path outside the repo — `~/.drawbar/<repo>` works — to keep it local to your machine.
+
+Ask the CLI rather than assuming:
 
 ```bash
-drawbar-kb recall "dynamodb tenancy" --dir "$PWD/.drawbar/memory" --json
-drawbar-kb stats --dir "$PWD/.drawbar/memory"
+drawbar-kb context           # root, config, store, team, project — and where each came from
+KB=$(drawbar-kb path)        # just the absolute store path
+drawbar-kb recall "dynamodb tenancy" --dir "$KB" --json
+drawbar-kb stats --dir "$KB"
 ```
 
 ## Development
