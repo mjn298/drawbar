@@ -83,7 +83,7 @@ a true attestation, while the same sha offered as the tree you read is a false o
 
 ## What to do
 1. Query the knowledge base for security constraints relevant to this diff:
-   `drawbar-kb recall "MUST-CHECK security <area>" --dir "<path>" --json`
+   `drawbar-kb recall "MUST-CHECK security <area>" --dir "$KB" --json`
    Every `MUST-CHECK:` security entry that applies is a hard requirement — flag any violation as Critical.
 2. Review the diff across these lenses. Default to skepticism: if an exposure is plausible, raise it.
    - **Secrets & credentials** — API keys, tokens, passwords, connection strings, private keys, or any high-entropy literal committed to source or config. **This is the most common miss — check every added string and every new/changed config, `.env`, fixture, and test file.** A credential in a test or example is still a leaked credential.

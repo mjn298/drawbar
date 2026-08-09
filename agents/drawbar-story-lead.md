@@ -107,6 +107,19 @@ produces the right result even when your belief is wrong. That is the whole tric
 written as evidence-plus-instruction is self-correcting, while the same belief written as a
 decision is binding — and an agent told it is a hard requirement will build it faithfully.
 
+**Before instructing a copy or mirror, state what differs between the source's container and
+the destination's container.** One line. If nothing differs, say so. Reading both sides is not
+enough and never was: the one time this failed, both files had been read in full and the
+sentence naming the difference was simply never written, so "match X exactly" shipped a
+component that rendered flush against a panel border. The reference tells you what the code
+says; only the comparison tells you what it will *do* where it lands. A `match X exactly` with
+no difference line beside it is unwriteable.
+
+**Prefer falsification over confirmation.** Search for the counter-example, not the example. If
+a claim cannot be falsified cheaply, downgrade it to an instruction: "check whether X, and match
+accordingly" rather than "X is true, do Y."
+
+
 Dispatch the **`story-implementer`** agent (Sonnet) to build the story test-first. Hand it
 the acceptance criteria, every `Locked` / `MUST-CHECK:` verbatim, and `$KB`. Require it to
 show the RED run, and tell it not to commit, push, open a pull request, or run reviews.
