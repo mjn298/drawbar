@@ -133,6 +133,11 @@ Read the report *and* the diff. Confirm the RED runs were shown, not claimed. Re
 covering tests plus typecheck and lint yourself. Check every acceptance criterion and every
 `Locked` decision. Send it back with specific gaps if anything is unverified.
 
+**Collect any brief claims the implementer reported false, and carry them into `false_claims` in
+§7.** They are about *your* brief, so the temptation is to fix the wording and move on — don't:
+unreported, the same claim goes into the next brief and into the knowledge base. Where one changes
+what the story should have done, that is a gap, and the story goes back.
+
 ## 4. Mutation gate — tests must actually pin behavior
 
 A passing suite is not evidence. In a real run a worker shipped 13 green tests where the
@@ -262,10 +267,21 @@ story 1 every night.
   "dedup": [{"dedup_key": {"file": "...", "line": 0, "claim_hash": "..."}, "reported_by": ["code-reviewer", "security-reviewer"], "action": "collapsed | suppressed", "kept": "Critical | Important | Minor"}],
   "mutation_pairs": [{"mutation": "...", "failing_test": "..."}],
   "out_of_scope": [{"title": "...", "detail": "file:line, what is wrong, why out of scope"}],
+  "false_claims": [{"claim": "...", "contradicted_by": "file:line", "evidence": "what the code says"}],
   "lessons": [{"key": "kebab-key", "type": "learned", "content": "...", "tags": ["..."]}],
   "summary": "two or three sentences"
 }
 ```
+
+**`false_claims` carries what the implementer or a reviewer found to be untrue in the brief or the
+story record** — a claim about the code that the code contradicts. Copy each one through with its
+`contradicted_by` evidence; an empty array is the normal case and says so honestly.
+
+**`false_claims` is not `out_of_scope`.** `out_of_scope` is a real defect in the code that this
+story is not the place to fix. A false claim is a defect in *your own research*, and it is the only
+signal that ever corrects it — collapsing the two loses the one thing that feeds the provenance rule
+in §2 and the knowledge base. A claim you found false and silently worked around is worse than one
+you implemented: nobody downstream can tell it ever happened.
 
 **`spec_source`, `reviewed_sha` and `head_sha` are reported per reviewer and are never inferred.**
 Copy each reviewer's own values through verbatim; a value you filled in for a reviewer that did not

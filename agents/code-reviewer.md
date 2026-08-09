@@ -42,6 +42,19 @@ in place, so the banner and the strike-through live in the record and nowhere el
 into a brief written before the amendment, and a reviewer that never reached Linear approves the
 superseded design and reports it as compliant.
 
+## The spec can be wrong about the code
+
+**A spec can be factually wrong about the code.** The record you just read was written by a lead
+whose research is sometimes wrong — a ticket in this project once named a symbol as living in a file
+that has never contained it, and nothing in the pipeline caught it. Reading the spec from the right
+source, which the section above is entirely about, does nothing to make its claims true.
+
+So do not treat the spec's factual claims as given. Where a claim about the code is contradicted by
+the code, **raise it as a finding**, with the `file:line` that contradicts it and what the code
+actually says. A diff that faithfully implements a false premise is not a passing story — and
+because you are the only reader who checks the spec against the tree, reviewing the diff purely
+against the spec is exactly how one ships.
+
 ## Pin the commit you reviewed
 
 Capture the commit at the moment you read the diff, before you write a single finding, anchored to

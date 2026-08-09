@@ -4300,6 +4300,18 @@ describe("PCO-369 R6: cross-references reconciled, the stack model documented, L
     },
     // --- agents/drawbar-story-lead.md, referring to itself -----------------------------------
     { doc: "agent", anchor: "Make it the report in §7, nothing else.", ns: [{ n: 7, title: "Report" }] },
+    // PCO-396: the §3 gate hands false claims forward, and §7 explains why they are not
+    // `out_of_scope` by pointing back at the provenance rule §2 states.
+    {
+      doc: "agent",
+      anchor: "carry them into `false_claims` in §7",
+      ns: [{ n: 7, title: "Report" }],
+    },
+    {
+      doc: "agent",
+      anchor: "feeds the provenance rule in §2",
+      ns: [{ n: 2, title: "Branch and implement" }],
+    },
     {
       doc: "agent",
       anchor: "goes into the implementer's brief in §2 verbatim",
@@ -5235,6 +5247,8 @@ const PROJECT_DIR_BULLET =
   "`git -C`, because the directory you happen to start in is not guaranteed to be the project's.";
 
 const SPEC_HEADING = "## Read the spec from Linear first (hard precondition)";
+// PCO-396: reading the spec from the right source does not make its claims true.
+const PREMISE_HEADING = "## The spec can be wrong about the code";
 const SHA_HEADING = "## Pin the commit you reviewed";
 const DEDUP_HEADING = "## Every finding carries a dedup key";
 
@@ -5242,6 +5256,7 @@ const REVIEWER_SECTIONS: Record<string, string[]> = {
   "agents/code-reviewer.md": [
     "## Inputs you are given",
     SPEC_HEADING,
+    PREMISE_HEADING,
     SHA_HEADING,
     "## What to do",
     "## A test that cannot fail is Critical (must fix)",
@@ -5251,6 +5266,7 @@ const REVIEWER_SECTIONS: Record<string, string[]> = {
   "agents/security-reviewer.md": [
     "## Inputs you are given",
     SPEC_HEADING,
+    PREMISE_HEADING,
     SHA_HEADING,
     "## What to do",
     "## A test that cannot fail is Critical (must fix)",
@@ -6945,8 +6961,9 @@ const SHIP_PINNED_ELSEWHERE: readonly string[] = [
   "# same run output, and the first is a machine problem nobody will look for. command -v linear " +
     ">/dev/null 2>&1 || echo \"WARNING: no \\`linear\\` CLI — every review will report spec_source: " +
     "\\\"brief\\\" and no story can come back clean\"",
-  "It returns the JSON report in its §7: `{status, branch, base, spec_source, reviewed_sha, " +
-    "head_sha, findings, dedup, mutation_pairs, out_of_scope, lessons, summary}`. It carries no " +
+  "It returns the JSON report in its §7: `{story, status, branch, base, parked_reason, " +
+    "spec_source, reviewed_sha, head_sha, findings, dedup, mutation_pairs, out_of_scope, " +
+    "false_claims, lessons, summary}`. It carries no " +
     "`pr` — it opens none; §4 below is what opens the PR and learns its number. **Do not ask it " +
     "for the diff.** If you find yourself wanting one, the split is not working.",
   "cat > \"$PR_BODY_FILE\" <<'DRAWBAR_PR_BODY_SENTINEL' <the PR body, verbatim — nothing here " +
@@ -7133,8 +7150,19 @@ describe("PCO-374/375/376 fix pass: the new rules are closed in place, and nothi
         "\"security-reviewer\"], \"action\": \"collapsed | suppressed\", \"kept\": \"Critical | Important " +
         "| Minor\"}], \"mutation_pairs\": [{\"mutation\": \"...\", \"failing_test\": \"...\"}], " +
         "\"out_of_scope\": [{\"title\": \"...\", \"detail\": \"file:line, what is wrong, why out of " +
-        "scope\"}], \"lessons\": [{\"key\": \"kebab-key\", \"type\": \"learned\", \"content\": \"...\", \"tags\": " +
+        "scope\"}], \"false_claims\": [{\"claim\": \"...\", \"contradicted_by\": \"file:line\", \"evidence\": \"what the code says\"}], " +
+        "\"lessons\": [{\"key\": \"kebab-key\", \"type\": \"learned\", \"content\": \"...\", \"tags\": " +
         "[\"...\"]}], \"summary\": \"two or three sentences\" } ```",
+      "**`false_claims` carries what the implementer or a reviewer found to be untrue in the brief " +
+        "or the story record** — a claim about the code that the code contradicts. Copy each one " +
+        "through with its `contradicted_by` evidence; an empty array is the normal case and says " +
+        "so honestly.",
+      "**`false_claims` is not `out_of_scope`.** `out_of_scope` is a real defect in the code that " +
+        "this story is not the place to fix. A false claim is a defect in *your own research*, and " +
+        "it is the only signal that ever corrects it — collapsing the two loses the one thing that " +
+        "feeds the provenance rule in §2 and the knowledge base. A claim you found false and " +
+        "silently worked around is worse than one you implemented: nobody downstream can tell it " +
+        "ever happened.",
       "**`spec_source`, `reviewed_sha` and `head_sha` are reported per reviewer and are never " +
         "inferred.** Copy each reviewer's own values through verbatim; a value you filled in for " +
         "a reviewer that did not report one is a fabricated attestation, and it is exactly what " +
@@ -7275,7 +7303,7 @@ describe("PCO-374/375/376 fix pass: the new rules are closed in place, and nothi
       "## Inputs you are given",
       "- The story's Linear issue id — the spec is read from Linear, not from this brief.",
       "- The diff under review (a base..head range or a diff file).",
-      "- The project's `.drawbar/memory` path.",
+      "- **`$KB`** — the knowledge-base path, absolute, exactly as the lead handed it to you. Use it verbatim; never rebuild it from your own `$PWD`, which inside a linked worktree is a different, empty directory.",
       PROJECT_DIR_BULLET,
     ]);
   });
@@ -8087,5 +8115,179 @@ describe("PCO-395 provenance — the read set decides what may be asserted as fa
   test("story-implementer is told an observation is evidence, not a requirement", () => {
     const impl = flat("agents/story-implementer.md");
     expect(impl).toContain("An observation is evidence, not a requirement");
+  });
+});
+
+// PCO-396. PCO-395 narrowed what the lead may assert; this is the backstop for the residue.
+// The agents that actually open the code must check the brief's factual claims, stop on a false
+// one, and have somewhere to report it — on the unattended path the report is a pinned JSON
+// schema, so a finding with no key to travel in is a finding that never reaches anybody.
+describe("PCO-396 contradiction protocol — a false brief claim is reported, not built", () => {
+  const flat = (p: string) => readNonEmpty(join(root, p)).replace(/\s+/g, " ");
+  const IMPL = "agents/story-implementer.md";
+  const LEAD = "agents/drawbar-story-lead.md";
+  const SHIP_DOC = "commands/drawbar-ship.md";
+
+  // Both triggers must exist. Asserting only the new one passes against a doc that deleted the
+  // old, and "this constraint blocks me" is still the right escape hatch for a different case.
+  test("story-implementer distinguishes a blocking constraint from a false one", () => {
+    const t = flat(IMPL);
+    expect(t, "the existing blocks-the-story hatch must survive").toContain(
+      "if one blocks the story as written"
+    );
+    expect(t, "the new factually-false trigger must exist").toContain(
+      "a factual claim in the brief is contradicted by the code"
+    );
+  });
+
+  // Compliance and silent correction fail the same way: the lead never learns its brief was
+  // wrong, so the claim goes into the next brief and into the knowledge base.
+  test("silent correction is forbidden, not only compliance", () => {
+    expect(flat(IMPL)).toContain("Quietly building the right thing instead is not the answer");
+  });
+
+  test("the step-zero claim check exists and is bounded by the brief's Read set", () => {
+    const t = flat(IMPL);
+    expect(t).toContain("Before you write the first test");
+    expect(t, "the check must be scoped by the Read set, not a full re-derivation").toContain(
+      "bounded by the `## Read set`"
+    );
+  });
+
+  test("the return contract carries false claims as a distinct named item", () => {
+    const t = flat(IMPL);
+    expect(t).toContain("Brief claims found to be false");
+    expect(t, "it must stay separate from constraints worked around").toContain(
+      "constraint you had to work around"
+    );
+  });
+
+  // A fix-pass brief is written fastest and reviewed least, so it is the likeliest carrier of a
+  // false claim. Sliced rather than searched whole-file: a match anywhere else would pass while
+  // fix mode itself said nothing.
+  test("fix mode carries the same permission", () => {
+    const txt = readNonEmpty(join(root, IMPL));
+    const fixMode = txt.slice(txt.indexOf("## Fix mode")).replace(/\s+/g, " ");
+    expect(fixMode.length, "fix-mode slice did not extract — the assertion would be vacuous").toBeGreaterThan(200);
+    expect(fixMode).toContain("a factual claim in the findings or the brief is contradicted by the code");
+  });
+
+  // --- the channel -----------------------------------------------------------------------------
+
+  function leadReportKeys(): string[] {
+    const txt = readNonEmpty(join(root, LEAD));
+    const at = txt.indexOf("## 7. Report");
+    expect(at, "story-lead §7 heading not found").toBeGreaterThan(-1);
+    const open = txt.indexOf("```json", at);
+    const close = txt.indexOf("```", open + 7);
+    const block = txt.slice(open, close);
+    return [...block.matchAll(/^\s*"(\w+)":/gm)].map((m) => m[1]!).sort();
+  }
+
+  function shipEnumeratedKeys(): string[] {
+    const txt = readNonEmpty(join(root, SHIP_DOC));
+    const at = txt.indexOf("It returns the JSON report in its §7:");
+    expect(at, "ship's §7 enumeration sentence not found").toBeGreaterThan(-1);
+    const open = txt.indexOf("`{", at);
+    const close = txt.indexOf("}`", open);
+    return txt
+      .slice(open + 2, close)
+      .split(",")
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0)
+      .sort();
+  }
+
+  // The drift that silently drops the signal. Ship hard-refuses a report whose shape it does not
+  // recognise, so a key added to §7 and not here is a key no unattended run can carry. Asserted
+  // as set equality rather than "the new key is present in both" — the latter stays green while
+  // the two lists disagree about everything else.
+  test("story-lead's §7 key set is exactly what ship enumerates", () => {
+    const lead = leadReportKeys();
+    expect(lead.length, "§7 key extraction is broken — the pin would be vacuous").toBeGreaterThan(10);
+    expect(lead).toEqual(shipEnumeratedKeys());
+  });
+
+  test("both carry a key for false brief claims", () => {
+    expect(leadReportKeys()).toContain("false_claims");
+    expect(shipEnumeratedKeys()).toContain("false_claims");
+  });
+
+  test("false claims are not folded into out_of_scope, which means something else", () => {
+    const t = flat(LEAD);
+    expect(t).toContain("`false_claims` is not `out_of_scope`");
+  });
+
+  // Reaching the operator matters as much as reaching the report: this is the only signal that
+  // ever corrects the lead's own research.
+  test("ship surfaces false claims to the operator in the summary comment", () => {
+    const txt = readNonEmpty(join(root, SHIP_DOC));
+    const at = txt.indexOf("## 5. Post the summary comment");
+    expect(at, "ship §5 heading not found").toBeGreaterThan(-1);
+    const section = txt.slice(at, txt.indexOf("## 6.", at)).replace(/\s+/g, " ");
+    expect(section).toContain("false_claims");
+  });
+
+  test("the lead's verification gate expects the new report item", () => {
+    expect(flat("commands/drawbar-work.md")).toContain("brief claims the implementer found to be false");
+  });
+
+  // The link in the chain: without it the implementer reports a false claim into a gate that has
+  // no instruction to forward it, and the finding dies one hop short of the report that carries it.
+  test("the story-lead's gate forwards false claims into its own report", () => {
+    expect(flat(LEAD)).toContain("carry them into `false_claims` in §7");
+  });
+
+  // --- the reviewers ---------------------------------------------------------------------------
+
+  // Each reviewer reads the spec from Linear, not from the dispatch brief, so the premise it must
+  // question is the TICKET's. A false ticket is the one failure class nothing else catches.
+  for (const rel of ["agents/code-reviewer.md", "agents/security-reviewer.md"]) {
+    test(`${rel} is told to question the ticket's factual claims`, () => {
+      expect(flat(rel)).toContain("A spec can be factually wrong about the code");
+    });
+  }
+
+  // --- $KB consistency in agents/ (PR #26 covered commands/ and skills/, not agents/) ----------
+
+  // An agent doc that names the store by its PATH SHAPE invites the agent to rebuild it from its
+  // own $PWD, which inside a linked worktree is an empty directory that recalls nothing and
+  // swallows every lesson written to it. That is the reconstruction PR #26 exists to prevent.
+  test("no agent doc names the store by path shape instead of the handed-in $KB", () => {
+    const { readdirSync } = require("node:fs") as typeof import("node:fs");
+    const agents = readdirSync(join(root, "agents")).filter((f) => f.endsWith(".md"));
+    expect(agents.length, "no agent docs found — the scan would be vacuous").toBeGreaterThan(0);
+    const offenders: string[] = [];
+    for (const f of agents) {
+      for (const line of readNonEmpty(join(root, "agents", f)).split("\n")) {
+        // A line that forbids the reconstruction may name it; one that describes the INPUT by
+        // path shape is the regression.
+        if (/The project's `?\.drawbar\/memory|<\.drawbar\/memory path>/.test(line)) {
+          offenders.push(`agents/${f}: ${line.trim()}`);
+        }
+      }
+    }
+    expect(offenders, "hand these agents `$KB` as resolved by `drawbar-kb path`").toEqual([]);
+  });
+
+  // The scan above is negative-only: it forbids the old path shape but says nothing when the
+  // instruction is deleted outright, which leaves the agent with no store at all rather than the
+  // wrong one. Every agent that is handed a store must still name `$KB`.
+  for (const rel of [
+    "agents/story-implementer.md",
+    "agents/security-reviewer.md",
+    "agents/design-reviewer.md",
+    "agents/drawbar-story-lead.md",
+  ]) {
+    test(`${rel} names $KB as the store it is handed`, () => {
+      expect(flat(rel), `${rel} must name the resolved store`).toContain("$KB");
+    });
+  }
+
+  // The one place story-implementer WRITES to the store. A recall that silently reads the wrong
+  // directory is bad; a write that lands there is worse, because the lesson is gone rather than
+  // merely missing.
+  test("story-implementer's lesson-capture fence writes to $KB", () => {
+    expect(flat("agents/story-implementer.md")).toContain('drawbar-kb add --dir "$KB"');
   });
 });
