@@ -36,6 +36,31 @@ Every `MUST-CHECK:` entry returned becomes a validation rule the stories must ho
 
 ## 3. Decompose into ordered stories
 
+### Provenance — what you may assert as fact
+
+Before you write a factual claim someone else will act on, ask the one question with a
+mechanical answer:
+
+**Did I read the thing that answers this question, in this session?**
+
+- **Yes** → assert it, and cite `file:line`.
+- **No** → do not assert it. Write it as an instruction to check.
+
+The test is **per-question, not per-file**. A search that answered one question licenses
+nothing about a different one in the same file: grepping `ruleSets` opens the schema and still
+says nothing about whether a rule carries an `id`. Record what each read *established*, not
+which paths you touched.
+
+**Point at the evidence, not the conclusion.** Instead of "location rules have no `id`, keep
+`key={index}`", write "I have not read the rule schema — check `BaseRuleSchema` in
+`shared/types/locationGroup.ts` and match whichever is correct." The second is shorter, and it
+produces the right result even when your belief is wrong. That is the whole trick: a belief
+written as evidence-plus-instruction is self-correcting, while the same belief written as a
+decision is binding — and an agent told it is a hard requirement will build it faithfully.
+
+A false claim in a ticket outlives a false claim in a brief: nobody re-reads it, and it sits in
+the backlog until someone implements it exactly as written.
+
 Break the work into sequential stories (small enough to implement and review independently). For each, write a sub-issue description using this exact template:
 
 ```
@@ -43,7 +68,12 @@ Break the work into sequential stories (small enough to implement and review ind
 [Clear description of what to implement.]
 
 ## Context
-[Relevant findings, constraints, patterns from the spec and recall.]
+[Relevant findings, constraints, patterns from the spec and recall. Your own conclusions
+about how the code behaves live here, each with file:line and the question it answered.]
+
+## Read set
+[One line per read: what it established, and what it did NOT. A claim in this ticket that
+no entry backs is a defect.]
 
 ## Decisions
 ### Locked
@@ -66,6 +96,22 @@ Break the work into sequential stories (small enough to implement and review ind
 ## References
 [Sources: spec sections, recalled knowledge keys, files.]
 ```
+
+### What may carry the `Locked` label
+
+`Locked` means someone decided this, and an implementing agent is told it is a hard
+requirement rather than a suggestion. That authority has to come from somewhere.
+
+**Only these may be Locked:** operator decisions, decisions inherited from the parent's
+locked spec, design-review outcomes, and `MUST-CHECK:` entries recalled from the knowledge
+base.
+
+**Your own conclusions from reading code this session may NOT be Locked.** They are evidence,
+not decisions — they belong in `## Context` with `file:line`, backed by a `## Read set` entry.
+Neither `### Locked` nor `### Discretion` fits them: `Discretion` means the implementer chooses,
+and an observation is not a choice.
+
+This narrows `Locked`; it does not soften it. What still qualifies stays absolute.
 
 ## 4. Cross-check (warning-only)
 
