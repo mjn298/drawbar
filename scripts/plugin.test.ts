@@ -47,6 +47,26 @@ describe("plugin manifest & bin", () => {
     expect(p.description.length).toBeGreaterThan(0);
   });
 
+  test("Codex manifest matches the Claude plugin version and exposes skills", () => {
+    const codex = JSON.parse(readFileSync(join(root, ".codex-plugin/plugin.json"), "utf8"));
+    const claude = JSON.parse(readFileSync(join(root, ".claude-plugin/plugin.json"), "utf8"));
+    expect(codex.name).toBe("drawbar");
+    expect(codex.version).toBe(claude.version);
+    expect(codex.skills).toBe("./skills/");
+    expect(codex.interface.displayName).toBe("drawbar");
+  });
+
+  test("Codex marketplace points to the installable compatibility package", () => {
+    const marketplace = JSON.parse(readFileSync(join(root, ".agents/plugins/marketplace.json"), "utf8"));
+    const plugin = marketplace.plugins.find((entry: { name: string }) => entry.name === "drawbar");
+    expect(marketplace.name).toBe("drawbar");
+    expect(plugin?.source).toEqual({ source: "local", path: "./plugins/drawbar" });
+    expect(plugin?.policy).toEqual({ installation: "AVAILABLE", authentication: "ON_INSTALL" });
+    expect(readFileSync(join(root, "plugins/drawbar/.codex-plugin/plugin.json"), "utf8")).toBe(
+      readFileSync(join(root, ".codex-plugin/plugin.json"), "utf8"),
+    );
+  });
+
   test("package.json links the drawbar-kb bin to scripts/kb.ts", () => {
     const pkg = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
     expect(pkg.bin?.["drawbar-kb"]).toBe("scripts/kb.ts");
@@ -88,6 +108,14 @@ describe("skill", () => {
     expect(fm.name).toBe("drawbar-knowledge");
     expect((fm.description ?? "").length).toBeGreaterThan(0);
   });
+
+  for (const name of ["drawbar-setup", "drawbar-design", "drawbar-plan", "drawbar-work", "drawbar-learn", "drawbar-ship"]) {
+    test(`${name} provides a Codex skill entry point`, () => {
+      const fm = frontmatter(join(root, "skills", name, "SKILL.md"));
+      expect(fm.name).toBe(name);
+      expect((fm.description ?? "").length).toBeGreaterThan(0);
+    });
+  }
 });
 
 // PCO-347 fix pass: this repo is public. The ported files were produced by redacting a

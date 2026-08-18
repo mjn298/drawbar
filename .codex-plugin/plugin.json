@@ -1,0 +1,21 @@
+{
+  "name": "drawbar",
+  "version": "0.3.0",
+  "description": "Lean, Linear-native design, plan, work, learn, and ship workflows with a per-project knowledge base.",
+  "author": { "name": "mjn" },
+  "keywords": ["linear", "planning", "knowledge-base", "workflow"],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "drawbar",
+    "shortDescription": "Linear-native development workflow with durable project knowledge",
+    "longDescription": "Design, plan, implement, learn from, and ship Linear-tracked work while retaining a per-project knowledge base.",
+    "developerName": "mjn",
+    "category": "Productivity",
+    "capabilities": ["Interactive", "Read", "Write"],
+    "defaultPrompt": [
+      "Set up drawbar for this project",
+      "Design a feature and create its Linear specification",
+      "Plan the stories for this Linear issue"
+    ]
+  }
+}

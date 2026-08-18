@@ -1,0 +1,1 @@
+../../../../scripts/lib/project-config.ts

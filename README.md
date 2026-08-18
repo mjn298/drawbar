@@ -1,6 +1,6 @@
 # drawbar
 
-A lean, Linear-native design → plan → work → learn workflow for Claude Code, with a per-project compounding knowledge base.
+A lean, Linear-native design → plan → work → learn workflow for Claude Code and Codex, with a per-project compounding knowledge base.
 
 Enjoy a mix of AI generated readme, and my interjections in the text below. 
 
@@ -25,9 +25,9 @@ If you want maximum agent autonomy, drawbar will feel too hands-on. If you want 
 drawbar needs two things set up before it works:
 
 - **[Bun](https://bun.sh)** — runs the `drawbar-kb` knowledge CLI (and the tests). Install: `curl -fsSL https://bun.sh/install | bash`.
-- **The Linear MCP, connected in Claude Code** — drawbar tracks all work in Linear *through the MCP* (`mcp__…Linear…` tools must be available in your session). Without it, the design/plan/work commands can still run locally but won't write to Linear.
+- **The Linear MCP, connected in Claude Code or Codex** — drawbar tracks all work in Linear through the MCP. Without it, the workflows can still run locally but won't write to Linear.
 
-Plus Claude Code itself (the plugin host).
+Plus either Claude Code or Codex (the plugin host).
 
 ## Install
 
@@ -48,6 +48,17 @@ Plus Claude Code itself (the plugin host).
    export PATH="$(bun pm bin -g):$PATH"
    ```
 
+### Codex
+
+Codex exposes the same workflows as skills, selected from natural-language requests rather than slash commands:
+
+```bash
+codex plugin marketplace add mjn298/drawbar
+codex plugin add drawbar@drawbar
+```
+
+Ask Codex to “set up drawbar for this project.” When it needs to link or invoke bundled scripts, set `CLAUDE_PLUGIN_ROOT` to the installed plugin directory containing `package.json`; the variable is retained for compatibility with the shared workflow files.
+
 > Hacking on drawbar itself? Skip the marketplace and load the repo directly — see [Development](#development).
 
 ## Use
@@ -59,6 +70,8 @@ Plus Claude Code itself (the plugin host).
 /drawbar-work <issue-id>                             # implement next story, TDD
 /drawbar-learn [issue-id]                            # curate lessons into the KB
 ```
+
+In Codex, ask naturally: “set up drawbar”, “design <feature> with drawbar”, “plan <issue-id> with drawbar”, “work on <issue-id> with drawbar”, “learn from <issue-id> with drawbar”, or “ship <issue-id> with drawbar”.
 
 `issue-id` is a Linear issue identifier (e.g. `ABC-123`) — your team's own prefix.
 
