@@ -1,0 +1,20 @@
+{
+  "name": "drawbar",
+  "interface": {
+    "displayName": "drawbar"
+  },
+  "plugins": [
+    {
+      "name": "drawbar",
+      "source": {
+        "source": "local",
+        "path": "./plugins/drawbar"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

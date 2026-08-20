@@ -1,0 +1,1 @@
+../../../../scripts/lib/kb-sync.ts
