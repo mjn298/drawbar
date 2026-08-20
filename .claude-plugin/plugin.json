@@ -1,6 +1,6 @@
 {
   "name": "drawbar",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Lean, Linear-native design→plan→work→learn workflow with a per-project compounding knowledge base.",
   "author": { "name": "mjn" }
 }

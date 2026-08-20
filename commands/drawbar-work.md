@@ -64,8 +64,14 @@ mechanical answer:
 
 **Did I read the thing that answers this question, in this session?**
 
-- **Yes** → assert it, and cite `file:line`.
+- **Yes** → assert it, and say where — the file and the symbol in it.
 - **No** → do not assert it. Write it as an instruction to check.
+
+**Name the file and the symbol. Never a line number.** Write `BaseRuleSchema` in
+`shared/types/locationGroup.ts` — not `shared/types/locationGroup.ts:74`. Line numbers go stale
+the moment anyone edits above them, and this text outlives the tree it was written against; a
+symbol name still finds the code a month later. (Review findings are the exception: a reviewer
+names a line against the sha it pinned, and reports it the same sitting.)
 
 The test is **per-question, not per-file**. A search that answered one question licenses
 nothing about a different one in the same file: grepping `ruleSets` opens the schema and still
@@ -98,7 +104,7 @@ The brief must hand the agent everything it needs to work without you:
 - Every **Locked** decision and `MUST-CHECK:` recalled in step 2 — verbatim; they are hard requirements.
 - The **`$KB`** path from preflight, verbatim and absolute (for recall and inline lesson capture). Never a path built from the agent's own `$PWD` — a subagent's working directory is not guaranteed to be yours.
 - A **`## Read set`** — one line per read, naming what it established and what it did not. Your
-  own conclusions go here as evidence with `file:line`, never in the Locked list. Anything you
+  own conclusions go here as evidence naming the file and symbol, never in the Locked list. Anything you
   assert that no entry backs is the defect step 5 looks for.
 
   ```

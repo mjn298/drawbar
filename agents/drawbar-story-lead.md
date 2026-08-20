@@ -92,8 +92,14 @@ mechanical answer:
 
 **Did I read the thing that answers this question, in this session?**
 
-- **Yes** → assert it, and cite `file:line`.
+- **Yes** → assert it, and say where — the file and the symbol in it.
 - **No** → do not assert it. Write it as an instruction to check.
+
+**Name the file and the symbol. Never a line number.** Write `BaseRuleSchema` in
+`shared/types/locationGroup.ts` — not `shared/types/locationGroup.ts:74`. Line numbers go stale
+the moment anyone edits above them, and this text outlives the tree it was written against; a
+symbol name still finds the code a month later. (Review findings are the exception: a reviewer
+names a line against the sha it pinned, and reports it the same sitting.)
 
 The test is **per-question, not per-file**. A search that answered one question licenses
 nothing about a different one in the same file: grepping `ruleSets` opens the schema and still
@@ -125,7 +131,7 @@ the acceptance criteria, every `Locked` / `MUST-CHECK:` verbatim, and `$KB`. Req
 show the RED run, and tell it not to commit, push, open a pull request, or run reviews.
 
 The brief also carries a **`## Read set`** — one line per read, naming what it established and
-what it did not. Your own conclusions about the code go there as evidence with `file:line`,
+what it did not. Your own conclusions about the code go there as evidence naming file and symbol,
 never among the `Locked` decisions you pass through verbatim. The distinction is the point:
 what you were handed is authoritative, what you concluded this session is not. Its entries
 look like this:
@@ -241,7 +247,7 @@ Do not push, and leave your caller no pull request to open: set `status: parked`
 `parked_reason` naming the surviving Critical, and carry the finding in `findings`.
 
 **Findings that are real but outside this story's scope are not yours to fix or to widen
-the pull request for.** Collect them for `out_of_scope` in your report — file:line, what is
+the pull request for.** Collect them for `out_of_scope` in your report — file and symbol, what is
 wrong, why it is out of scope, and the evidence. Your caller files them in Linear.
 
 ## 6. Commit and push
@@ -276,11 +282,11 @@ story 1 every night.
   "spec_source": {"code_reviewer": "cli | brief", "security_reviewer": "cli | brief"},
   "reviewed_sha": {"code_reviewer": "<full sha>", "security_reviewer": "<full sha>"},
   "head_sha": "<the branch head you pushed>",
-  "findings": [{"severity": "Critical | Important", "detail": "file:line, what survives the fix pass, why", "dedup_key": {"file": "...", "line": 0, "claim_hash": "..."}}],
+  "findings": [{"severity": "Critical | Important", "detail": "file and symbol, what survives the fix pass, why", "dedup_key": {"file": "...", "line": 0, "claim_hash": "..."}}],
   "dedup": [{"dedup_key": {"file": "...", "line": 0, "claim_hash": "..."}, "reported_by": ["code-reviewer", "security-reviewer"], "action": "collapsed | suppressed", "kept": "Critical | Important | Minor"}],
   "mutation_pairs": [{"mutation": "...", "failing_test": "..."}],
-  "out_of_scope": [{"title": "...", "detail": "file:line, what is wrong, why out of scope"}],
-  "false_claims": [{"claim": "...", "contradicted_by": "file:line", "evidence": "what the code says"}],
+  "out_of_scope": [{"title": "...", "detail": "file and symbol, what is wrong, why out of scope"}],
+  "false_claims": [{"claim": "...", "contradicted_by": "file and symbol", "evidence": "what the code says"}],
   "lessons": [{"key": "kebab-key", "type": "learned", "content": "...", "tags": ["..."]}],
   "summary": "two or three sentences"
 }
@@ -321,9 +327,9 @@ request.
 **`flagged` — Important findings survived the one fix pass.** The branch is still pushed and
 your caller still opens the pull request; the surviving findings travel in `findings` so your
 caller can decide how to surface them. **`detail` and `dedup_key` are both for your caller's eyes,
-not for verbatim republication:** `detail` carries `file:line` and the specifics of a defect nobody
-has patched, and `dedup_key` carries the same `file` and `line` in structured form, so a serializer
-that skips `detail` and emits the key has published the location anyway. The pull request is public,
+not for verbatim republication:** `detail` names the file and symbol and the specifics of a defect
+nobody has patched, and `dedup_key` carries that same location in structured form — `file` and
+`line` — so a serializer that skips `detail` and emits the key has published the location anyway. The pull request is public,
 and it is opened before any human has reviewed the story. How much of that is safe to publish is
 your caller's call, not something you authorize here. This is not a failure to complete the story.
 
