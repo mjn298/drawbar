@@ -469,8 +469,9 @@ silently** — a suppression nobody can see is indistinguishable from a finding 
 reported.
 
 **Mandatory, not discretionary.** For each entry in `out_of_scope`, `save_issue` a new
-sub-issue under the same parent: title naming the bug not the symptom; description with
-file:line, what is wrong, why it is out of scope here, and the PR that surfaced it; status
+sub-issue under the same parent: title naming the bug not the symptom; description naming the
+file and symbol (not a line number — the issue outlives the tree), what is wrong, why it is out
+of scope here, and the PR that surfaced it; status
 `Unplanned`; label `found-in-review`. Never file it `Todo` — `Unplanned → Todo` is the human
 triage gate, and this command has no authority to walk a finding through it unattended.
 
@@ -828,7 +829,7 @@ sub-issues filed in §3, and the story-lead's `mutation_pairs`.
 
 **Carry the report's `false_claims` into that comment too, under their own heading**, or say plainly that there were none. Each one is a place the brief asserted something the code contradicts — a defect in drawbar's own research rather than in the diff, and the only signal that ever corrects it. It reaches nobody from inside the report alone: unlike `findings` and `out_of_scope`, nothing files it as a sub-issue, so this comment is where it becomes visible.
 
-**Lead with the correction, and never quote a false claim as a bare statement.** Write each as `what is actually true (file:line) — an earlier brief wrongly asserted: "<claim>"`, correction first and the claim clearly subordinate to it. `/drawbar-work` instructs a lead to read this story's comments, so anything posted here is re-read by a later session — a bare quote of a false claim is indistinguishable from a statement of fact by the time it is recalled, which is exactly the failure this whole story exists to stop. The same rule the report contract states: a claim is a signal about our research, not a fact about the code, and it never earns the phrasing of one.
+**Lead with the correction, and never quote a false claim as a bare statement.** Write each as `what is actually true (file and symbol) — an earlier brief wrongly asserted: "<claim>"`, correction first and the claim clearly subordinate to it. `/drawbar-work` instructs a lead to read this story's comments, so anything posted here is re-read by a later session — a bare quote of a false claim is indistinguishable from a statement of fact by the time it is recalled, which is exactly the failure this whole story exists to stop. The same rule the report contract states: a claim is a signal about our research, not a fact about the code, and it never earns the phrasing of one.
 
 **Leave the story `In Progress`. No status transition of any kind** — never `Done`, `Ready
 for QA`, `Ready for Rollout`, `Rolled Out`, or any completed-type status. The operator's own

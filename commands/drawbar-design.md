@@ -64,8 +64,14 @@ mechanical answer:
 
 **Did I read the thing that answers this question, in this session?**
 
-- **Yes** → assert it, and cite `file:line`.
+- **Yes** → assert it, and say where — the file and the symbol in it.
 - **No** → do not assert it. Write it as an instruction to check.
+
+**Name the file and the symbol. Never a line number.** Write `BaseRuleSchema` in
+`shared/types/locationGroup.ts` — not `shared/types/locationGroup.ts:74`. Line numbers go stale
+the moment anyone edits above them, and this text outlives the tree it was written against; a
+symbol name still finds the code a month later. (Review findings are the exception: a reviewer
+names a line against the sha it pinned, and reports it the same sitting.)
 
 The test is **per-question, not per-file**. A search that answered one question licenses
 nothing about a different one in the same file: grepping `ruleSets` opens the schema and still
@@ -114,6 +120,12 @@ Grep the draft for stragglers before locking: any symbol you renamed mid-session
 Author and edit the spec as a **local draft** — a working scratchpad (repo file or scratch buffer). This is a *draft*, **not** a synced mirror: Linear remains the single source of truth; the draft is just the editing surface and is disposable once locked. Push to the Linear issue description only at genuine lock points (post-review, and after any material constraint change). Note that `save_issue` **replaces the description wholesale** — there is no partial update, so don't author by repeated full-description rewrites in Linear.
 
 Write the final spec as the parent issue's description via the Linear MCP (`save_issue` — create a new issue in the team and project resolved in step 1 if this started from free text, else update the existing one). The spec must be detailed enough that implementation makes zero judgment calls: goal, constraints, locked decisions, architecture, and acceptance criteria.
+
+**Write it plainly.** Complete is not the same as long. Short sentences, one idea each; no
+jargon, no buzzwords, no metaphors dressing up a simple point — say "makes it slower", not
+"introduces latency overhead". Say each thing once, in the section that owns it. Cut any
+sentence that doesn't change a decision someone downstream makes. A spec nobody finishes
+reading gets implemented from its first two sections.
 
 A `## Story decomposition` section — suggested ordering and sequencing constraints (schema-PR isolation, global-surface isolation, dependency order) — is welcome here; it keeps `/drawbar-plan` mechanical. Don't enumerate per-story acceptance criteria, though — that's `/drawbar-plan`'s job. Some overlap is fine and expected.
 

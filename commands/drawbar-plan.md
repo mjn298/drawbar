@@ -43,8 +43,14 @@ mechanical answer:
 
 **Did I read the thing that answers this question, in this session?**
 
-- **Yes** → assert it, and cite `file:line`.
+- **Yes** → assert it, and say where — the file and the symbol in it.
 - **No** → do not assert it. Write it as an instruction to check.
+
+**Name the file and the symbol. Never a line number.** Write `BaseRuleSchema` in
+`shared/types/locationGroup.ts` — not `shared/types/locationGroup.ts:74`. Line numbers go stale
+the moment anyone edits above them, and this text outlives the tree it was written against; a
+symbol name still finds the code a month later. (Review findings are the exception: a reviewer
+names a line against the sha it pinned, and reports it the same sitting.)
 
 The test is **per-question, not per-file**. A search that answered one question licenses
 nothing about a different one in the same file: grepping `ruleSets` opens the schema and still
@@ -74,6 +80,24 @@ accordingly" rather than "X is true, do Y."
 A false claim in a ticket outlives a false claim in a brief: nobody re-reads it, and it sits in
 the backlog until someone implements it exactly as written.
 
+### How to write it
+
+**Plain and short.** A story should land in one read. A ticket nobody finishes reading is a
+ticket nobody follows.
+
+- Short sentences, one idea each. If a sentence needs a second read, rewrite it.
+- No jargon, no buzzwords, no invented compounds, no metaphors. Say "makes it slower", not
+  "introduces latency overhead". Real names of things — `companyId`, oRPC, Zod — are fine;
+  the padding around them is not.
+- Say it once. Don't restate the goal in What, then Context, then Validation.
+- Bullets over paragraphs in What, Testing, Validation, Files.
+- Cut any sentence that doesn't change what the implementer does. Motivation, background, and
+  "why this matters" belong in the parent spec, not in every child.
+- A section with nothing to say gets one line, or `None`. Don't pad it.
+
+The template below is the required shape, not a word count. Most sections are one to five
+lines.
+
 Break the work into sequential stories (small enough to implement and review independently). For each, write a sub-issue description using this exact template:
 
 ```
@@ -82,7 +106,8 @@ Break the work into sequential stories (small enough to implement and review ind
 
 ## Context
 [Relevant findings, constraints, patterns from the spec and recall. Your own conclusions
-about how the code behaves live here, each with file:line and the question it answered.]
+about how the code behaves live here, each naming the file and symbol, and the question it
+answered.]
 
 ## Read set
 [One line per read: what it established, and what it did NOT. A claim in this ticket that
@@ -120,7 +145,8 @@ locked spec, design-review outcomes, and `MUST-CHECK:` entries recalled from the
 base.
 
 **Your own conclusions from reading code this session may NOT be Locked.** They are evidence,
-not decisions — they belong in `## Context` with `file:line`, backed by a `## Read set` entry.
+not decisions — they belong in `## Context`, naming the file and symbol, backed by a
+`## Read set` entry.
 Neither `### Locked` nor `### Discretion` fits them: `Discretion` means the implementer chooses,
 and an observation is not a choice.
 
@@ -128,7 +154,7 @@ This narrows `Locked`; it does not soften it. What still qualifies stays absolut
 
 ## 4. Cross-check (warning-only)
 
-Before creating issues, verify each story: all template sections present; acceptance criteria are testable; every recalled `MUST-CHECK:` is covered by a Locked decision; scope is reasonable for one sitting. Report any gaps as warnings.
+Before creating issues, verify each story: all template sections present; acceptance criteria are testable; every recalled `MUST-CHECK:` is covered by a Locked decision; scope is reasonable for one sitting; no code reference anchored to a line number; and the description passes a read-aloud test — plain words, nothing restated, nothing padded. Report any gaps as warnings.
 
 ## 5. Create the sub-issues
 

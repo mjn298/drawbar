@@ -786,9 +786,9 @@ describe("version reconcile", () => {
   // test rather than a side effect, and gives PCO-397's replay something to check the loaded
   // plugin against: the cache is keyed by plugin.json's version, so a replay run against a stale
   // build would pass confidently while exercising none of the new rules.
-  test("the shipped version is 0.3.0 (PCO-393: new prompt rules and a new report key)", () => {
+  test("the shipped version is 0.4.0 (symbol anchors and plain-language tickets)", () => {
     const pkg = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
-    expect(pkg.version).toBe("0.3.0");
+    expect(pkg.version).toBe("0.4.0");
   });
 });
 
@@ -3766,9 +3766,10 @@ describe("PCO-367 R4: the story-lead takes a base branch, opens no PR, returns o
     expect(body).not.toContain("can write them into the pull request body");
     expect(body).toContain(
       "**`detail` and `dedup_key` are both for your caller's eyes, not for verbatim " +
-        "republication:** `detail` carries `file:line` and the specifics of a defect nobody has " +
-        "patched, and `dedup_key` carries the same `file` and `line` in structured form, so a " +
-        "serializer that skips `detail` and emits the key has published the location anyway.",
+        "republication:** `detail` names the file and symbol and the specifics of a defect nobody " +
+        "has patched, and `dedup_key` carries that same location in structured form — `file` and " +
+        "`line` — so a serializer that skips `detail` and emits the key has published the location " +
+        "anyway.",
     );
     expect(body).toContain(
       "The pull request is public, and it is opened before any human has reviewed the story.",
@@ -6357,8 +6358,8 @@ describe("PCO-376: findings carry a dedup key, and a re-found defect is commente
         '"Critical | Important | Minor"}],',
     );
     expect(txt).toContain(
-      '"findings": [{"severity": "Critical | Important", "detail": "file:line, what survives the ' +
-        'fix pass, why", "dedup_key": {"file": "...", "line": 0, "claim_hash": "..."}}],',
+      '"findings": [{"severity": "Critical | Important", "detail": "file and symbol, what survives ' +
+        'the fix pass, why", "dedup_key": {"file": "...", "line": 0, "claim_hash": "..."}}],',
     );
   });
 
@@ -7149,8 +7150,8 @@ describe("PCO-374/375/376 fix pass: the new rules are closed in place, and nothi
         "set `status: parked` with `parked_reason` naming the surviving Critical, and carry the " +
         "finding in `findings`.",
       "**Findings that are real but outside this story's scope are not yours to fix or to widen " +
-        "the pull request for.** Collect them for `out_of_scope` in your report — file:line, what " +
-        "is wrong, why it is out of scope, and the evidence. Your caller files them in Linear.",
+        "the pull request for.** Collect them for `out_of_scope` in your report — file and " +
+        "symbol, what is wrong, why it is out of scope, and the evidence. Your caller files them in Linear.",
 
     ]);
   });
@@ -7182,13 +7183,13 @@ describe("PCO-374/375/376 fix pass: the new rules are closed in place, and nothi
         "null, \"spec_source\": {\"code_reviewer\": \"cli | brief\", \"security_reviewer\": \"cli | " +
         "brief\"}, \"reviewed_sha\": {\"code_reviewer\": \"<full sha>\", \"security_reviewer\": \"<full " +
         "sha>\"}, \"head_sha\": \"<the branch head you pushed>\", \"findings\": [{\"severity\": \"Critical " +
-        "| Important\", \"detail\": \"file:line, what survives the fix pass, why\", \"dedup_key\": " +
+        "| Important\", \"detail\": \"file and symbol, what survives the fix pass, why\", \"dedup_key\": " +
         "{\"file\": \"...\", \"line\": 0, \"claim_hash\": \"...\"}}], \"dedup\": [{\"dedup_key\": {\"file\": " +
         "\"...\", \"line\": 0, \"claim_hash\": \"...\"}, \"reported_by\": [\"code-reviewer\", " +
         "\"security-reviewer\"], \"action\": \"collapsed | suppressed\", \"kept\": \"Critical | Important " +
         "| Minor\"}], \"mutation_pairs\": [{\"mutation\": \"...\", \"failing_test\": \"...\"}], " +
-        "\"out_of_scope\": [{\"title\": \"...\", \"detail\": \"file:line, what is wrong, why out of " +
-        "scope\"}], \"false_claims\": [{\"claim\": \"...\", \"contradicted_by\": \"file:line\", \"evidence\": \"what the code says\"}], " +
+        "\"out_of_scope\": [{\"title\": \"...\", \"detail\": \"file and symbol, what is wrong, why out of " +
+        "scope\"}], \"false_claims\": [{\"claim\": \"...\", \"contradicted_by\": \"file and symbol\", \"evidence\": \"what the code says\"}], " +
         "\"lessons\": [{\"key\": \"kebab-key\", \"type\": \"learned\", \"content\": \"...\", \"tags\": " +
         "[\"...\"]}], \"summary\": \"two or three sentences\" } ```",
       "**`false_claims` carries what the implementer or a reviewer found to be untrue in the brief " +
@@ -7224,10 +7225,10 @@ describe("PCO-374/375/376 fix pass: the new rules are closed in place, and nothi
       "**`flagged` — Important findings survived the one fix pass.** The branch is still pushed " +
         "and your caller still opens the pull request; the surviving findings travel in " +
         "`findings` so your caller can decide how to surface them. **`detail` and `dedup_key` are " +
-        "both for your caller's eyes, not for verbatim republication:** `detail` carries " +
-        "`file:line` and the specifics of a defect nobody has patched, and `dedup_key` carries " +
-        "the same `file` and `line` in structured form, so a serializer that skips `detail` and " +
-        "emits the key has published the location anyway. The pull request is public, and it is " +
+        "both for your caller's eyes, not for verbatim republication:** `detail` names the file " +
+        "and symbol and the specifics of a defect nobody has patched, and `dedup_key` carries " +
+        "that same location in structured form — `file` and `line` — so a serializer that skips " +
+        "`detail` and emits the key has published the location anyway. The pull request is public, and it is " +
         "opened before any human has reviewed the story. How much of that is safe to publish is " +
         "your caller's call, not something you authorize here. This is not a failure to complete " +
         "the story.",
@@ -7269,8 +7270,9 @@ describe("PCO-374/375/376 fix pass: the new rules are closed in place, and nothi
         "finding that went missing. **Nothing is dropped silently** — a suppression nobody can see is " +
         "indistinguishable from a finding that was never reported.",
       "**Mandatory, not discretionary.** For each entry in `out_of_scope`, `save_issue` a new " +
-        "sub-issue under the same parent: title naming the bug not the symptom; description with " +
-        "file:line, what is wrong, why it is out of scope here, and the PR that surfaced it; status " +
+        "sub-issue under the same parent: title naming the bug not the symptom; description naming " +
+        "the file and symbol (not a line number — the issue outlives the tree), what is wrong, why " +
+        "it is out of scope here, and the PR that surfaced it; status " +
         "`Unplanned`; label `found-in-review`. Never file it `Todo` — `Unplanned → Todo` is the human " +
         "triage gate, and this command has no authority to walk a finding through it unattended.",
       "**File one sub-issue for every surviving `findings[]` entry too**, under the same rules — " +
@@ -8483,5 +8485,61 @@ describe("PCO-394 the residual — copied code needs a comparison, and design is
     }
     expect(seen, "no drawbar-kb invocations found — this scan is vacuous").toBeGreaterThan(2);
     expect(offenders, "hand the resolved store through as `$KB`, never a placeholder").toEqual([]);
+  });
+});
+
+// Line numbers rot; the durable artifacts (Linear descriptions, comments, KB entries) outlive
+// the tree they were written against. The rule is stated in every doc that authors one, and the
+// scan below is the part that actually holds: a later edit that reintroduces `file:line` into a
+// ticket-writing doc fails here rather than quietly shipping stale anchors into the backlog.
+describe("code references in durable artifacts are anchored by symbol, not line number", () => {
+  const flat = (p: string) => readNonEmpty(join(root, p)).replace(/\s+/g, " ");
+  const AUTHORS_DURABLE_TEXT = [
+    "commands/drawbar-design.md",
+    "commands/drawbar-plan.md",
+    "commands/drawbar-work.md",
+    "agents/drawbar-story-lead.md",
+  ];
+
+  test("every provenance block tells the author to name the file and the symbol", () => {
+    for (const rel of AUTHORS_DURABLE_TEXT) {
+      expect(flat(rel), rel).toContain("- **Yes** → assert it, and say where — the file and the symbol in it.");
+      expect(flat(rel), rel).toContain("**Name the file and the symbol. Never a line number.**");
+    }
+  });
+
+  // The reviewers are the deliberate exception — they read one pinned sha and report the same
+  // sitting — so they are excluded here rather than silently passing.
+  test("no ticket-writing doc instructs the author to write a `file:line` anchor", () => {
+    for (const rel of [...AUTHORS_DURABLE_TEXT, "agents/story-implementer.md", "commands/drawbar-ship.md"]) {
+      for (const line of readNonEmpty(join(root, rel)).split("\n")) {
+        // The bans on *publishing* a `file:line` in a public PR body or an issue title name the
+        // shape in order to forbid it; those are the opposite of an instruction to write one.
+        if (/\bno |never |not |carries no |forbid|named here beside/i.test(line)) continue;
+        expect(line, `${rel}: ${line.trim()}`).not.toContain("file:line");
+      }
+    }
+  });
+});
+
+// Tickets nobody finishes reading get implemented from their first two sections.
+describe("ticket prose is plain and short", () => {
+  const flat = (p: string) => readNonEmpty(join(root, p)).replace(/\s+/g, " ");
+  test("the story template is preceded by a plain-language rule", () => {
+    const plan = flat("commands/drawbar-plan.md");
+    expect(plan).toContain("### How to write it");
+    expect(plan).toContain("**Plain and short.** A story should land in one read.");
+    expect(plan).toContain("No jargon, no buzzwords, no invented compounds, no metaphors.");
+    expect(plan).toContain("A section with nothing to say gets one line, or `None`.");
+  });
+
+  test("the plan cross-check enforces both rules before any issue is created", () => {
+    const plan = flat("commands/drawbar-plan.md");
+    expect(plan).toContain("no code reference anchored to a line number");
+    expect(plan).toContain("passes a read-aloud test — plain words, nothing restated, nothing padded");
+  });
+
+  test("the locked spec carries the same plain-language rule", () => {
+    expect(flat("commands/drawbar-design.md")).toContain("**Write it plainly.** Complete is not the same as long.");
   });
 });
