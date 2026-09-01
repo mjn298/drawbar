@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   storePaths, ensureDir, readEntries, appendEntry, archiveOlderThan,
-  readArchiveEntries, compactActive,
+  readArchiveEntries, compactActive, archiveByKeys,
 } from "./store";
 import type { Entry } from "./schema";
 
@@ -25,6 +25,17 @@ describe("ensureDir", () => {
     const p = ensureDir(dir);
     expect(existsSync(p.dir)).toBe(true);
     expect(readFileSync(join(dir, ".gitignore"), "utf8")).toContain("index.db");
+  });
+
+  test("fresh .gitignore also ignores the archive file", () => {
+    ensureDir(dir);
+    expect(readFileSync(join(dir, ".gitignore"), "utf8")).toContain("knowledge.archive.jsonl");
+  });
+
+  test("leaves an existing .gitignore untouched", () => {
+    writeFileSync(join(dir, ".gitignore"), "custom\n");
+    ensureDir(dir);
+    expect(readFileSync(join(dir, ".gitignore"), "utf8")).toBe("custom\n");
   });
 });
 
@@ -147,6 +158,151 @@ describe("archiveOlderThan", () => {
     archiveOlderThan(dir, 100);
     expect(existsSync(storePaths(dir).active + ".tmp")).toBe(false);
     expect(readEntries(dir).map((e) => e.key)).toEqual(["keep"]);
+  });
+
+  test("--dry-run reports what would move but changes nothing on disk", () => {
+    appendEntry(dir, entry({ key: "old", ts: 10 }));
+    appendEntry(dir, entry({ key: "new", ts: 200 }));
+    const activeBefore = readFileSync(storePaths(dir).active, "utf8");
+    expect(existsSync(storePaths(dir).archive)).toBe(false);
+
+    const res = archiveOlderThan(dir, 100, { dryRun: true });
+    expect(res.archived).toBe(1);
+    expect(res.keys).toEqual(["old"]);
+
+    expect(readFileSync(storePaths(dir).active, "utf8")).toBe(activeBefore);
+    expect(existsSync(storePaths(dir).archive)).toBe(false);
+  });
+});
+
+describe("archiveByKeys", () => {
+  test("moves exactly the named entries and leaves others active", () => {
+    appendEntry(dir, entry({ key: "a", ts: 1 }));
+    appendEntry(dir, entry({ key: "b", ts: 2 }));
+    appendEntry(dir, entry({ key: "c", ts: 3 }));
+
+    const res = archiveByKeys(dir, ["b"]);
+    expect(res.archived).toBe(1);
+    expect(res.keys).toEqual(["b"]);
+    expect(res.missing).toEqual([]);
+
+    expect(readEntries(dir).map((e) => e.key)).toEqual(["a", "c"]);
+    expect(readArchiveEntries(dir).map((e) => e.key)).toEqual(["b"]);
+  });
+
+  test("archives nothing and reports the missing key when it matches no active row", () => {
+    appendEntry(dir, entry({ key: "a", ts: 1 }));
+    const activeBefore = readFileSync(storePaths(dir).active, "utf8");
+    expect(existsSync(storePaths(dir).archive)).toBe(false);
+
+    const res = archiveByKeys(dir, ["nope"]);
+    expect(res.archived).toBe(0);
+    expect(res.keys).toEqual([]);
+    expect(res.missing).toEqual(["nope"]);
+
+    expect(readFileSync(storePaths(dir).active, "utf8")).toBe(activeBefore);
+    expect(existsSync(storePaths(dir).archive)).toBe(false);
+  });
+
+  test("mixed present/missing keys archives nothing (fail closed)", () => {
+    appendEntry(dir, entry({ key: "a", ts: 1 }));
+    appendEntry(dir, entry({ key: "b", ts: 2 }));
+    const activeBefore = readFileSync(storePaths(dir).active, "utf8");
+    expect(existsSync(storePaths(dir).archive)).toBe(false);
+
+    const res = archiveByKeys(dir, ["a", "nope"]);
+    expect(res.archived).toBe(0);
+    expect(res.missing).toEqual(["nope"]);
+
+    expect(readFileSync(storePaths(dir).active, "utf8")).toBe(activeBefore);
+    expect(existsSync(storePaths(dir).archive)).toBe(false);
+  });
+
+  test("moves every duplicate row for a key that matches more than one", () => {
+    const p = ensureDir(dir);
+    writeFileSync(
+      p.active,
+      [
+        JSON.stringify(entry({ key: "a", content: "a1", ts: 1 })),
+        JSON.stringify(entry({ key: "a", content: "a2", ts: 2 })),
+        JSON.stringify(entry({ key: "b", content: "b1", ts: 3 })),
+      ].join("\n") + "\n",
+    );
+
+    const res = archiveByKeys(dir, ["a"]);
+    expect(res.archived).toBe(2);
+    expect(readEntries(dir).map((e) => e.key)).toEqual(["b"]);
+    expect(readArchiveEntries(dir).map((e) => e.content).sort()).toEqual(["a1", "a2"]);
+  });
+
+  test("a repeated identical requested key behaves as one request", () => {
+    appendEntry(dir, entry({ key: "a", ts: 1 }));
+    appendEntry(dir, entry({ key: "b", ts: 2 }));
+
+    const res = archiveByKeys(dir, ["a", "a"]);
+    expect(res.archived).toBe(1);
+    expect(res.keys).toEqual(["a"]);
+    expect(readEntries(dir).map((e) => e.key)).toEqual(["b"]);
+  });
+
+  test("--dry-run reports the match but changes nothing on disk", () => {
+    appendEntry(dir, entry({ key: "a", ts: 1 }));
+    appendEntry(dir, entry({ key: "b", ts: 2 }));
+    const activeBefore = readFileSync(storePaths(dir).active, "utf8");
+    expect(existsSync(storePaths(dir).archive)).toBe(false);
+
+    const res = archiveByKeys(dir, ["a"], { dryRun: true });
+    expect(res.archived).toBe(1);
+    expect(res.keys).toEqual(["a"]);
+    expect(res.missing).toEqual([]);
+
+    expect(readFileSync(storePaths(dir).active, "utf8")).toBe(activeBefore);
+    expect(existsSync(storePaths(dir).archive)).toBe(false);
+  });
+
+  test("dry-run with a missing key changes nothing and reports it missing", () => {
+    appendEntry(dir, entry({ key: "a", ts: 1 }));
+    const activeBefore = readFileSync(storePaths(dir).active, "utf8");
+
+    const res = archiveByKeys(dir, ["nope"], { dryRun: true });
+    expect(res.archived).toBe(0);
+    expect(res.missing).toEqual(["nope"]);
+    expect(readFileSync(storePaths(dir).active, "utf8")).toBe(activeBefore);
+    expect(existsSync(storePaths(dir).archive)).toBe(false);
+  });
+
+  test("empty store: any requested key is reported missing, nothing archived", () => {
+    const res = archiveByKeys(dir, ["anything"]);
+    expect(res.archived).toBe(0);
+    expect(res.missing).toEqual(["anything"]);
+    expect(existsSync(storePaths(dir).archive)).toBe(false);
+  });
+
+  test("empty key list is a no-op: active file untouched, no archive created", () => {
+    const p = ensureDir(dir);
+    // A malformed line would be silently dropped by a rewrite; an empty
+    // request must not touch the file at all.
+    writeFileSync(
+      p.active,
+      '{"bad json\n' + JSON.stringify(entry({ key: "a" })) + "\n",
+    );
+    const activeBefore = readFileSync(storePaths(dir).active, "utf8");
+
+    const res = archiveByKeys(dir, []);
+    expect(res).toEqual({ archived: 0, keys: [], missing: [] });
+    expect(readFileSync(storePaths(dir).active, "utf8")).toBe(activeBefore);
+    expect(existsSync(storePaths(dir).archive)).toBe(false);
+  });
+
+  test("every entry matches: whole store moves to archive", () => {
+    appendEntry(dir, entry({ key: "a", ts: 1 }));
+    appendEntry(dir, entry({ key: "b", ts: 2 }));
+
+    const res = archiveByKeys(dir, ["a", "b"]);
+    expect(res.archived).toBe(2);
+    expect(res.keys.sort()).toEqual(["a", "b"]);
+    expect(readEntries(dir).length).toBe(0);
+    expect(readArchiveEntries(dir).map((e) => e.key).sort()).toEqual(["a", "b"]);
   });
 });
 

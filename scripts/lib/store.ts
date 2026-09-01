@@ -16,7 +16,7 @@ export function storePaths(dir: string): StorePaths {
 export function ensureDir(dir: string): StorePaths {
   mkdirSync(dir, { recursive: true });
   const gi = join(dir, ".gitignore");
-  if (!existsSync(gi)) writeFileSync(gi, "index.db\n");
+  if (!existsSync(gi)) writeFileSync(gi, "index.db\nknowledge.archive.jsonl\n");
   return storePaths(dir);
 }
 
@@ -127,14 +127,41 @@ export function compactActive(dir: string, opts: { dryRun?: boolean } = {}): {
   return { scanned, keys, removed };
 }
 
-export function archiveOlderThan(dir: string, cutoffTs: number): { archived: number } {
+export function archiveOlderThan(dir: string, cutoffTs: number, opts: { dryRun?: boolean } = {}): {
+  archived: number; keys: string[];
+} {
   const p = ensureDir(dir);
   const active = readEntries(dir); // active only
   const old = active.filter((e) => e.ts < cutoffTs);
   const keep = active.filter((e) => e.ts >= cutoffTs);
-  if (old.length === 0) return { archived: 0 };
+  const keys = old.map((e) => e.key);
+  if (old.length === 0 || opts.dryRun) return { archived: old.length, keys };
 
   for (const e of old) appendFileSync(p.archive, JSON.stringify(e) + "\n");
   writeActiveAtomic(p, keep);
-  return { archived: old.length };
+  return { archived: old.length, keys };
+}
+
+// Fail closed: if any requested key matches no active row, archive nothing
+// and report every missing key, so a caller never partially archives a typo'd batch.
+export function archiveByKeys(dir: string, requestedKeys: string[], opts: { dryRun?: boolean } = {}): {
+  archived: number; keys: string[]; missing: string[];
+} {
+  const p = ensureDir(dir);
+  const active = readEntries(dir); // active only
+  const wanted = [...new Set(requestedKeys)];
+  const missing = wanted.filter((k) => !active.some((e) => e.key === k));
+  if (missing.length > 0) return { archived: 0, keys: [], missing };
+
+  const matched = active.filter((e) => wanted.includes(e.key));
+  // No-op guard, symmetric with archiveOlderThan: skip the rewrite so an
+  // empty/no-match request can't reserialize the active file and silently
+  // drop malformed lines that readFile ignores.
+  if (matched.length === 0) return { archived: 0, keys: [], missing: [] };
+  const keep = active.filter((e) => !wanted.includes(e.key));
+  if (opts.dryRun) return { archived: matched.length, keys: wanted, missing: [] };
+
+  for (const e of matched) appendFileSync(p.archive, JSON.stringify(e) + "\n");
+  writeActiveAtomic(p, keep);
+  return { archived: matched.length, keys: wanted, missing: [] };
 }
