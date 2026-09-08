@@ -67,10 +67,10 @@ A `superseded:true` you did not expect means you just overwrote knowledge under 
 
 - `drawbar-kb stats [--json]` — counts by type, active vs archived, plus `duplicateKeys` (active keys with more than one line — should always be 0).
 - `drawbar-kb reindex` — rebuild the FTS index from the JSONL.
-- `drawbar-kb archive --days <n>` — age out entries older than N days.
-- `drawbar-kb compact [--dry-run]` — collapse any duplicate-key lines in the active store to newest-per-key, archiving the losers, then reindex. `--dry-run` reports the same counts without touching disk.
+- `drawbar-kb archive [--days <n>] [--key <k> [--key <k> ...]] [--dry-run]` — age out entries older than N days (default 90), or archive specific keys instead. `--key` and `--days` are mutually exclusive. `--dry-run` reports what would be archived without touching disk. Refuses to run against a directory with no store yet.
+- `drawbar-kb compact [--dry-run]` — collapse any duplicate-key lines in the active store to newest-per-key, archiving the losers, then reindex. `--dry-run` reports the same counts without touching disk. Refuses to run against a directory with no store yet.
 - `drawbar-kb import <legacy.jsonl>` — one-time import of a legacy corpus (repairs corruption, reports every dropped line).
 - `drawbar-kb path` — the resolved store path, one absolute line, without creating it.
 - `drawbar-kb context [--json]` — the full resolution: root, config path, store, team, project, and where each value came from.
 
-Every command above accepts `--dir <path>` to override the resolved store, and it always wins.
+Every command above accepts `--dir <path>` to override the resolved store, and it always wins. Every command also accepts `--help` (or `-h`) to print its usage and exit, without touching the filesystem.

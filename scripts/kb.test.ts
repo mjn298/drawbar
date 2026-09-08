@@ -2,9 +2,10 @@ import { test, expect, describe, beforeEach } from "bun:test";
 import { mkdtempSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { run } from "./kb";
+import { run, parseFlags } from "./kb";
 import { readEntries, readArchiveEntries, ensureDir } from "./lib/store";
 import { buildIndex } from "./lib/fts";
+import { KNOWLEDGE_TYPES } from "./lib/schema";
 
 // Byte-comparison snapshot of everything on disk the store touches, for asserting a dry-run
 // (or a rejected invocation) truly wrote nothing -- not knowledge.jsonl/archive alone, but
@@ -35,6 +36,20 @@ async function cli(args: string[], stdin = ""): Promise<{ code: number; out: str
   const code = await proc.exited;
   return { code, out, err };
 }
+
+describe("parseFlags (unit)", () => {
+  test("a bare -- ends option parsing; everything after is positional (PCO-402 LD14)", () => {
+    const { positionals, flags } = parseFlags(["--", "--weird"]);
+    expect(positionals).toEqual(["--weird"]);
+    expect(Object.keys(flags)).toEqual([]);
+  });
+
+  test("a bare -- ends option parsing even mid-argv, and later -- tokens are literal positionals", () => {
+    const { positionals, flags } = parseFlags(["--dir", "x", "--", "--dir", "--"]);
+    expect(flags.dir).toBe("x");
+    expect(positionals).toEqual(["--dir", "--"]);
+  });
+});
 
 describe("run (in-process)", () => {
   test("reindex on an empty dir exits 0", async () => {
@@ -622,5 +637,336 @@ describe("cli (subprocess, real stdin)", () => {
     const { code, out } = await cli(["archive", "--dir", dir, "--days", "0"]);
     expect(code).toBe(0);
     expect(JSON.parse(out)).toEqual({ archived: 1, dryRun: false });
+  });
+});
+
+// The per-command flag sets from the story's "Per-command flag sets (authoritative)" table.
+const EXPECTED_FLAGS: Record<string, string[]> = {
+  add: [],
+  recall: ["type", "tag", "file", "since", "limit", "json", "all"],
+  reindex: [],
+  stats: ["json"],
+  archive: ["days", "key", "dry-run"],
+  compact: ["dry-run"],
+  import: [],
+  context: ["json"],
+  path: [],
+};
+const ALL_COMMANDS = Object.keys(EXPECTED_FLAGS);
+
+describe("flag table for every command (PCO-402)", () => {
+  for (const cmd of ALL_COMMANDS) {
+    test(`${cmd} --help prints usage on stdout, exits 0, and creates nothing`, async () => {
+      const missing = join(dir, "missing");
+      const { code, out } = await cli([cmd, "--help", "--dir", missing]);
+      expect(code).toBe(0);
+      expect(out).toContain("usage:");
+      expect(existsSync(missing)).toBe(false);
+    });
+
+    test(`${cmd} -h prints usage on stdout, exits 0, and creates nothing`, async () => {
+      const missing = join(dir, "missing");
+      const { code, out } = await cli([cmd, "-h", "--dir", missing]);
+      expect(code).toBe(0);
+      expect(out).toContain("usage:");
+      expect(existsSync(missing)).toBe(false);
+    });
+
+    test(`generated usage for ${cmd} names every flag in its row`, async () => {
+      const missing = join(dir, "missing");
+      const { out } = await cli([cmd, "--help", "--dir", missing]);
+      for (const flag of EXPECTED_FLAGS[cmd]!) {
+        expect(out, `usage for ${cmd} is missing --${flag}`).toContain(`--${flag}`);
+      }
+      expect(out).toContain("--dir");
+      expect(out).toContain("--project");
+      expect(out).toContain("--help");
+    });
+
+    test(`generated usage for ${cmd} names -h alongside --help (PCO-402 fix pass)`, async () => {
+      const missing = join(dir, "missing");
+      const { out } = await cli([cmd, "--help", "--dir", missing]);
+      // Bare `.toContain("-h")` would pass vacuously: "--help" itself contains the substring
+      // "-h". Require -h as its own token, not embedded inside --help.
+      expect(out).toMatch(/(^|[\s[|])-h([\s\]|]|$)/);
+    });
+  }
+
+  test("top-level usage names -h alongside --help (PCO-402 fix pass)", async () => {
+    const { out } = await cli(["--help"]);
+    expect(out).toMatch(/(^|[\s[|])-h([\s\]|]|$)/);
+  });
+
+  test("--help and help print the top-level listing on stdout, exit 0, and create nothing", async () => {
+    for (const args of [["--help"], ["help"]]) {
+      const missing = join(dir, "missing");
+      const { code, out } = await cli([...args, "--dir", missing]);
+      expect(code).toBe(0);
+      expect(out).toContain("usage:");
+      for (const cmd of ALL_COMMANDS) expect(out).toContain(cmd);
+      expect(existsSync(missing)).toBe(false);
+    }
+  });
+
+  // A genuinely bare invocation takes no arguments at all, so it cannot also carry --dir --
+  // it never reaches resolveContext, so nothing is at risk of being created regardless.
+  test("a bare invocation (no args at all) prints the top-level listing on stdout, exit 0", async () => {
+    const { code, out } = await cli([]);
+    expect(code).toBe(0);
+    expect(out).toContain("usage:");
+    for (const cmd of ALL_COMMANDS) expect(out).toContain(cmd);
+  });
+
+  test("bogus --help prints the same top-level listing on stderr, exits 1", async () => {
+    const missing = join(dir, "missing");
+    const { code, out, err } = await cli(["bogus", "--help", "--dir", missing]);
+    expect(code).toBe(1);
+    expect(out).toBe("");
+    expect(err).toContain("usage:");
+    expect(existsSync(missing)).toBe(false);
+  });
+
+  test("archive -h resolves the command before printing help, so it gets archive's own usage", async () => {
+    const { out } = await cli(["archive", "-h", "--dir", dir]);
+    expect(out).toContain("--key");
+    expect(out).toContain("--dry-run");
+  });
+
+  test("recall -- -h treats -h after -- as a literal query term, not a help flag", async () => {
+    const { code, out } = await cli(["recall", "--dir", dir, "--", "-h"]);
+    expect(code).toBe(0);
+    expect(out).not.toContain("usage:");
+  });
+
+  test("archive --help | cat is not truncated by process.exit in the import.meta.main block", async () => {
+    const proc = Bun.spawnSync(
+      ["bash", "-c", `bun run ${JSON.stringify(join(import.meta.dir, "kb.ts"))} archive --help --dir ${JSON.stringify(dir)} | cat`],
+    );
+    const out = proc.stdout.toString();
+    expect(out).toContain("usage:");
+    expect(out).toContain("--dry-run");
+  });
+
+  test("stats --days 30 is rejected: --days is not a stats flag", async () => {
+    expect(await run(["stats", "--dir", dir, "--days", "30"])).toBe(1);
+  });
+
+  // toBe(1) alone pins *a* failure, not *which*: a wrong-flag message, or one routed to
+  // stdout, would leave that assertion green. Pin the exact stderr text and an empty stdout.
+  test("stats --days 30 names the unknown flag on stderr, and stdout is empty (PCO-402 fix pass)", async () => {
+    const { code, out, err } = await cli(["stats", "--dir", dir, "--days", "30"]);
+    expect(code).toBe(1);
+    expect(err).toBe("stats: unknown flag --days\n");
+    expect(out).toBe("");
+  });
+
+  test(`recall --json "content" is rejected: --json is boolean-typed and does not take a value`, async () => {
+    expect(await run(["recall", "--dir", dir, "--json", "content"])).toBe(1);
+  });
+
+  test("recall --json content names --json does-not-take-a-value on stderr, and stdout is empty (PCO-402 fix pass)", async () => {
+    const { code, out, err } = await cli(["recall", "--dir", dir, "--json", "content"]);
+    expect(code).toBe(1);
+    expect(err).toBe("recall: --json does not take a value\n");
+    expect(out).toBe("");
+  });
+
+  test("stats --dir with no value is rejected", async () => {
+    expect(await run(["stats", "--dir"])).toBe(1);
+  });
+
+  test("stats --dir with no value names --dir requires-a-value on stderr, and stdout is empty (PCO-402 fix pass)", async () => {
+    const { code, out, err } = await cli(["stats", "--dir"]);
+    expect(code).toBe(1);
+    expect(err).toBe("stats: --dir requires a value\n");
+    expect(out).toBe("");
+  });
+
+  test("recall --type fakt is rejected", async () => {
+    expect(await run(["recall", "x", "--dir", dir, "--type", "fakt"])).toBe(1);
+  });
+
+  test("recall --type fakt names the allowed --type values on stderr, and stdout is empty (PCO-402 fix pass)", async () => {
+    const { code, out, err } = await cli(["recall", "x", "--dir", dir, "--type", "fakt"]);
+    expect(code).toBe(1);
+    expect(err).toBe(`recall: --type must be one of: ${KNOWLEDGE_TYPES.join(", ")}\n`);
+    expect(out).toBe("");
+  });
+
+  test("recall accepts every KNOWLEDGE_TYPES value for --type", async () => {
+    for (const t of KNOWLEDGE_TYPES) {
+      expect(await run(["recall", "x", "--dir", dir, "--type", t])).toBe(0);
+    }
+  });
+
+  test("archive 30 (a typo for --days 30) is rejected and archives nothing", async () => {
+    const p = ensureDir(dir);
+    const old = Math.floor(Date.now() / 1000) - 100 * 86400;
+    writeFileSync(p.active, JSON.stringify({ key: "old", type: "fact", content: "c", source: "user", tags: [], ts: old, issue: null, files: [] }) + "\n");
+    expect(await run(["archive", "30", "--dir", dir])).toBe(1);
+    expect(readEntries(dir).length).toBe(1);
+  });
+
+  test("archive 30 names the unexpected-argument(s) message on stderr, and stdout is empty (PCO-402 fix pass)", async () => {
+    const { code, out, err } = await cli(["archive", "30", "--dir", dir]);
+    expect(code).toBe(1);
+    expect(err).toBe("archive: unexpected argument(s): 30\n");
+    expect(out).toBe("");
+  });
+
+  test("import with zero paths is rejected", async () => {
+    expect(await run(["import", "--dir", dir])).toBe(1);
+  });
+
+  test("import with two paths is rejected", async () => {
+    expect(await run(["import", "a.jsonl", "b.jsonl", "--dir", dir])).toBe(1);
+  });
+
+  test('import "" is rejected: run() returns 1, it does not reject (PCO-402 fix pass)', async () => {
+    // A test that only checks a subprocess exit code would not catch a rejected promise --
+    // `run` must RETURN 1 here, not throw, since positionals=[""] satisfies exact-arity-1.
+    expect(await run(["import", "", "--dir", dir])).toBe(1);
+  });
+
+  // These three pin the exact stderr text so the import case's try/catch around importLegacy
+  // (which also returns 1 for ENOENT/EISDIR) cannot mask the arity or empty-path guards firing
+  // above/before it (PCO-402 fix pass).
+  test("import with zero paths names the arity failure on stderr, and stdout is empty (PCO-402 fix pass)", async () => {
+    const { code, out, err } = await cli(["import", "--dir", dir]);
+    expect(code).toBe(1);
+    expect(err).toBe("import: expected exactly 1 argument(s), got 0\n");
+    expect(out).toBe("");
+  });
+
+  test("import with two paths names the arity failure on stderr, and stdout is empty (PCO-402 fix pass)", async () => {
+    const { code, out, err } = await cli(["import", "a.jsonl", "b.jsonl", "--dir", dir]);
+    expect(code).toBe(1);
+    expect(err).toBe("import: expected exactly 1 argument(s), got 2\n");
+    expect(out).toBe("");
+  });
+
+  test('import "" names the empty-path guard on stderr, not an ENOENT message (PCO-402 fix pass)', async () => {
+    const { code, out, err } = await cli(["import", "", "--dir", dir]);
+    expect(code).toBe(1);
+    expect(err).toBe("import: <path> must not be empty\n");
+    expect(out).toBe("");
+  });
+
+  test("import against an unreadable path returns 1 instead of throwing (PCO-402 fix pass)", async () => {
+    expect(await run(["import", join(dir, "nonexistent.jsonl"), "--dir", dir])).toBe(1);
+  });
+
+  test("import against a directory path returns 1 instead of throwing (PCO-402 fix pass)", async () => {
+    expect(await run(["import", dir, "--dir", dir])).toBe(1);
+  });
+
+  test("archive against a directory with no knowledge.jsonl exits 1", async () => {
+    expect(await run(["archive", "--dir", dir])).toBe(1);
+  });
+
+  test("archive against a directory with no knowledge.jsonl names the store path on stderr, and stdout is empty (PCO-402 fix pass)", async () => {
+    const { code, out, err } = await cli(["archive", "--dir", dir]);
+    expect(code).toBe(1);
+    expect(err).toBe(`archive: no knowledge store found at ${dir}\n`);
+    expect(out).toBe("");
+  });
+
+  test("compact against a directory with no knowledge.jsonl exits 1", async () => {
+    expect(await run(["compact", "--dir", dir])).toBe(1);
+  });
+
+  test("compact against a directory with no knowledge.jsonl names the store path on stderr, and stdout is empty (PCO-402 fix pass)", async () => {
+    const { code, out, err } = await cli(["compact", "--dir", dir]);
+    expect(code).toBe(1);
+    expect(err).toBe(`compact: no knowledge store found at ${dir}\n`);
+    expect(out).toBe("");
+  });
+
+  test("archive (days-based) against a NONEXISTENT dir refuses without creating it (LD18, PCO-402 fix pass)", async () => {
+    const missing = join(dir, "missing");
+    expect(await run(["archive", "--dir", missing])).toBe(1);
+    expect(existsSync(missing)).toBe(false);
+  });
+
+  test("compact against a NONEXISTENT dir refuses without creating it (LD18, PCO-402 fix pass)", async () => {
+    const missing = join(dir, "missing");
+    expect(await run(["compact", "--dir", missing])).toBe(1);
+    expect(existsSync(missing)).toBe(false);
+  });
+
+  test("stats --json against a nonexistent directory still creates it and reports zero entries", async () => {
+    const missing = join(dir, "missing");
+    const { code, out } = await cli(["stats", "--dir", missing, "--json"]);
+    expect(code).toBe(0);
+    expect(existsSync(missing)).toBe(true);
+    expect(JSON.parse(out)).toEqual({ active: 0, archived: 0, duplicateKeys: 0, byType: {} });
+  });
+
+  test("context against a nonexistent directory answers without creating it", async () => {
+    const missing = join(dir, "missing");
+    const { code } = await cli(["context", "--dir", missing]);
+    expect(code).toBe(0);
+    expect(existsSync(missing)).toBe(false);
+  });
+
+  test("path against a nonexistent directory answers without creating it", async () => {
+    const missing = join(dir, "missing");
+    const { code, out } = await cli(["path", "--dir", missing]);
+    expect(code).toBe(0);
+    expect(out.trim()).toBe(missing);
+    expect(existsSync(missing)).toBe(false);
+  });
+
+  // Positive coverage: every live invocation in the Read set's grep, one row per command.
+  test("path (bare) exits 0", async () => {
+    expect(await run(["path", "--dir", dir])).toBe(0);
+  });
+
+  test("context and context --json exit 0", async () => {
+    expect(await run(["context", "--dir", dir])).toBe(0);
+    expect(await run(["context", "--dir", dir, "--json"])).toBe(0);
+  });
+
+  test("stats and stats --json exit 0", async () => {
+    expect(await run(["stats", "--dir", dir])).toBe(0);
+    expect(await run(["stats", "--dir", dir, "--json"])).toBe(0);
+  });
+
+  test("reindex --dir exits 0", async () => {
+    expect(await run(["reindex", "--dir", dir])).toBe(0);
+  });
+
+  test('recall "<query>" --dir --json exits 0', async () => {
+    expect(await run(["recall", "some query", "--dir", dir, "--json"])).toBe(0);
+  });
+
+  test("recall with every documented filter flag exits 0", async () => {
+    expect(await run([
+      "recall", "q", "--dir", dir,
+      "--type", "fact", "--tag", "t", "--file", "f.ts", "--since", "0", "--limit", "5", "--all",
+    ])).toBe(0);
+  });
+
+  test("add --dir reads stdin and exits 0", async () => {
+    const entry = JSON.stringify({ key: "row-cov", type: "fact", content: "c", ts: 1 });
+    const { code } = await cli(["add", "--dir", dir], entry);
+    expect(code).toBe(0);
+  });
+
+  test('import "<path>" exits 0 against a real legacy file', async () => {
+    const legacy = join(dir, "legacy.jsonl");
+    writeFileSync(legacy, JSON.stringify({ key: "legacy-1", type: "fact", content: "c", ts: 1 }) + "\n");
+    expect(await run(["import", legacy, "--dir", dir])).toBe(0);
+  });
+
+  test("archive --days <n> exits 0", async () => {
+    await cli(["add", "--dir", dir], JSON.stringify({ key: "a1", type: "fact", content: "c", ts: 1 }));
+    expect(await run(["archive", "--dir", dir, "--days", "90"])).toBe(0);
+  });
+
+  test("compact and compact --dry-run exit 0", async () => {
+    await cli(["add", "--dir", dir], JSON.stringify({ key: "c1", type: "fact", content: "c", ts: 1 }));
+    expect(await run(["compact", "--dir", dir, "--dry-run"])).toBe(0);
+    expect(await run(["compact", "--dir", dir])).toBe(0);
   });
 });

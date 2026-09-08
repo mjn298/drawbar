@@ -786,9 +786,37 @@ describe("version reconcile", () => {
   // test rather than a side effect, and gives PCO-397's replay something to check the loaded
   // plugin against: the cache is keyed by plugin.json's version, so a replay run against a stale
   // build would pass confidently while exercising none of the new rules.
-  test("the shipped version is 0.4.0 (symbol anchors and plain-language tickets)", () => {
+  test("the shipped version is 0.5.0 (final flag table for every command, plus symlink-integrity test)", () => {
     const pkg = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
-    expect(pkg.version).toBe("0.4.0");
+    expect(pkg.version).toBe("0.5.0");
+  });
+});
+
+describe("plugin tree symlink integrity (PCO-402)", () => {
+  // Every .ts under plugins/drawbar/ must be a git symlink (index mode 120000) to the root
+  // copy, never a real file: a real copy silently drifts out of sync with what actually ships.
+  // plugins/drawbar/.codex-plugin/plugin.json is the one deliberate exception, covered by its
+  // own byte-parity assertion above ("Codex marketplace points to the installable compatibility
+  // package") -- this test is scoped to .ts files and does not touch it.
+  test("every .ts file under plugins/drawbar/ is a git symlink, not a real file", () => {
+    const res = Bun.spawnSync(["git", "ls-files", "-s", "plugins/drawbar"], { cwd: root });
+    expect(res.exitCode).toBe(0);
+    const lines = res.stdout.toString().trim().split("\n").filter((l) => l.length > 0);
+    const tsEntries = lines
+      .map((l) => {
+        const [mode, , , ...pathParts] = l.split(/\s+/);
+        return { mode: mode!, path: pathParts.join(" ") };
+      })
+      .filter((e) => e.path.endsWith(".ts"));
+    // Guards against the assertion below passing vacuously if the tree ever stops containing
+    // any tracked .ts files at all (e.g. a mass rename), which would make every() true on [].
+    expect(tsEntries.length, "expected at least one tracked .ts file under plugins/drawbar/").toBeGreaterThan(0);
+    for (const e of tsEntries) {
+      expect(e.mode, `${e.path} is mode ${e.mode}, expected 120000 (a symlink)`).toBe("120000");
+      // Mode 120000 alone is equally true of a symlink pointing at nothing: also require the
+      // link to actually resolve, so a wrong relative depth (`../../../` vs `../../../../`) fails.
+      expect(existsSync(join(root, e.path)), `${e.path} is a symlink but does not resolve`).toBe(true);
+    }
   });
 });
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 import { existsSync, readFileSync } from "node:fs";
-import { validateEntry } from "./lib/schema";
-import { appendEntry, readEntries, archiveOlderThan, archiveByKeys, compactActive, ensureDir } from "./lib/store";
+import { validateEntry, KNOWLEDGE_TYPES } from "./lib/schema";
+import { appendEntry, readEntries, archiveOlderThan, archiveByKeys, compactActive, ensureDir, storePaths } from "./lib/store";
 import { buildIndex, recall, type RecallFilters } from "./lib/fts";
 import { resolveContext, type DrawbarContext, type ResolveInput } from "./lib/project-config";
 import type { Runner } from "./lib/ship-config";
@@ -37,14 +37,18 @@ function parseNonNegInt(raw: string): number | null {
 
 // `repeatable` names flags that collect every occurrence into an array instead of
 // last-wins overwrite. Only used by callers that need `--key k1 --key k2` semantics.
-function parseFlags(args: string[], repeatable: readonly string[] = []): { positionals: string[]; flags: Flags } {
+// POSIX `--`: the first bare `--` token ends option parsing for good, so a query term
+// (or path) that happens to start with `--` is never mistaken for a flag name.
+export function parseFlags(args: string[], repeatable: readonly string[] = []): { positionals: string[]; flags: Flags } {
   const positionals: string[] = [];
   // Null-prototype: a plain `{}` lets `--__proto__ x` hit Object.prototype's setter and vanish as
   // an own property, so it never reaches validateFlags' Object.keys loop and bypasses the allowlist.
   const flags: Flags = Object.create(null);
+  let endOfOptions = false;
   for (let i = 0; i < args.length; i++) {
     const a = args[i]!;
-    if (a.startsWith("--")) {
+    if (!endOfOptions && a === "--") { endOfOptions = true; continue; }
+    if (!endOfOptions && a.startsWith("--")) {
       const name = a.slice(2);
       const next = args[i + 1];
       let value: FlagValue;
@@ -64,57 +68,142 @@ function parseFlags(args: string[], repeatable: readonly string[] = []): { posit
   return { positionals, flags };
 }
 
+// `-h` is recognized only as an exact argv token appearing strictly before the first literal
+// `--`: after end-of-options every token (including a literal "-h") is data, never a flag. `-h`
+// never becomes `flags.h` -- parseFlags only reacts to `--`-prefixed tokens -- so this is the
+// only place any command sees it.
+function hasHelpShort(argv: string[]): boolean {
+  for (const a of argv) {
+    if (a === "--") return false;
+    if (a === "-h") return true;
+  }
+  return false;
+}
+
 const REPEATABLE_FLAGS: readonly string[] = ["key"];
 
 type FlagType = "string" | "boolean";
-interface FlagSpec { name: string; type: FlagType; }
+// `validate` runs only once a string-typed flag's raw value has passed the type check (never
+// called for a boolean flag, and never for a missing/`true` value) -- it expresses a domain
+// narrower than "is a string" (digits-only, or one of KNOWLEDGE_TYPES) and returns the message
+// to report, or null if the value is acceptable.
+interface FlagSpec { name: string; type: FlagType; validate?: (raw: string) => string | null; }
+type Arity = { kind: "none" } | { kind: "any" } | { kind: "exact"; count: number };
+interface CommandSpec { flags: readonly FlagSpec[]; arity: Arity; requiresStore: boolean; }
 
-// Declarative allowlist for the mutating commands. Each row names a flag and whether it takes
-// a value ("string") or is presence-only ("boolean") -- the type drives validateFlags below.
-// Adding a row for another command later is a table entry, not a restructure.
-const COMMAND_FLAG_TABLE: Record<string, readonly FlagSpec[]> = {
-  archive: [
-    { name: "dir", type: "string" },
-    { name: "project", type: "string" },
-    { name: "days", type: "string" },
-    { name: "key", type: "string" },
-    { name: "dry-run", type: "boolean" },
-  ],
-  compact: [
-    { name: "dir", type: "string" },
-    { name: "project", type: "string" },
-    { name: "dry-run", type: "boolean" },
-  ],
+function nonNegIntValidate(raw: string): string | null {
+  // Reuses parseNonNegInt itself rather than re-deriving the digits-only rule, so the two can
+  // never drift: this is the same check archive/recall relied on before the table existed.
+  return parseNonNegInt(raw) === null ? "must be a non-negative integer (digits only)" : null;
+}
+
+function knowledgeTypeValidate(raw: string): string | null {
+  return (KNOWLEDGE_TYPES as readonly string[]).includes(raw)
+    ? null
+    : `must be one of: ${KNOWLEDGE_TYPES.join(", ")}`;
+}
+
+// `--dir` and `--project` are valid on every command; every row starts with these two.
+const GLOBAL_FLAGS: readonly FlagSpec[] = [
+  { name: "dir", type: "string" },
+  { name: "project", type: "string" },
+];
+function withGlobals(flags: readonly FlagSpec[]): readonly FlagSpec[] {
+  return [...GLOBAL_FLAGS, ...flags];
+}
+
+const DAYS: FlagSpec = { name: "days", type: "string", validate: nonNegIntValidate };
+const KEY: FlagSpec = { name: "key", type: "string" };
+const DRY_RUN: FlagSpec = { name: "dry-run", type: "boolean" };
+const TYPE: FlagSpec = { name: "type", type: "string", validate: knowledgeTypeValidate };
+const TAG: FlagSpec = { name: "tag", type: "string" };
+const FILE: FlagSpec = { name: "file", type: "string" };
+const SINCE: FlagSpec = { name: "since", type: "string", validate: nonNegIntValidate };
+const LIMIT: FlagSpec = { name: "limit", type: "string", validate: nonNegIntValidate };
+const JSON_FLAG: FlagSpec = { name: "json", type: "boolean" };
+const ALL_FLAG: FlagSpec = { name: "all", type: "boolean" };
+
+// The one authoritative source for: which flags a command accepts (and their types), its
+// positional arity, whether it requires an existing store, AND (via commandUsage/topUsage below)
+// its usage text -- so a new flag lands here once, and validation, help, and the unknown-flag
+// error can never disagree about what's allowed. Insertion order here is also display order.
+const COMMANDS: Record<string, CommandSpec> = {
+  add: { flags: withGlobals([]), arity: { kind: "none" }, requiresStore: false },
+  recall: { flags: withGlobals([TYPE, TAG, FILE, SINCE, LIMIT, JSON_FLAG, ALL_FLAG]), arity: { kind: "any" }, requiresStore: false },
+  reindex: { flags: withGlobals([]), arity: { kind: "none" }, requiresStore: false },
+  stats: { flags: withGlobals([JSON_FLAG]), arity: { kind: "none" }, requiresStore: false },
+  archive: { flags: withGlobals([DAYS, KEY, DRY_RUN]), arity: { kind: "none" }, requiresStore: true },
+  compact: { flags: withGlobals([DRY_RUN]), arity: { kind: "none" }, requiresStore: true },
+  import: { flags: withGlobals([]), arity: { kind: "exact", count: 1 }, requiresStore: false },
+  context: { flags: withGlobals([JSON_FLAG]), arity: { kind: "none" }, requiresStore: false },
+  path: { flags: withGlobals([]), arity: { kind: "none" }, requiresStore: false },
 };
 
-// Runs once per invocation, immediately after parseFlags and before any I/O (resolveContext,
-// ensureDir, store reads/writes): a typo'd or mistyped flag must be rejected even when the
-// active config is malformed, rather than losing the race to a later I/O failure.
-// Commands with no table entry are unvalidated here (S3 scope).
-function validateFlags(cmd: string, flags: Flags): string | null {
-  // hasOwnProperty guard: COMMAND_FLAG_TABLE is a plain object literal, so a bare `[cmd]` lookup
-  // for cmd="constructor" (or "toString" etc.) resolves to the inherited Object.prototype member
-  // instead of undefined, passing the `!table` check and crashing on `table.map` below.
-  const table = Object.prototype.hasOwnProperty.call(COMMAND_FLAG_TABLE, cmd) ? COMMAND_FLAG_TABLE[cmd] : undefined;
-  if (!table) return null;
-  const types = new Map(table.map((f) => [f.name, f.type] as const));
+// hasOwnProperty guard: COMMANDS is a plain object literal, so a bare `[cmd]` lookup for
+// cmd="constructor" (or "toString" etc.) resolves to the inherited Object.prototype member
+// instead of undefined -- letting a typo'd command name silently pass an "is this known" check.
+function getCommand(cmd: string): CommandSpec | undefined {
+  return Object.prototype.hasOwnProperty.call(COMMANDS, cmd) ? COMMANDS[cmd] : undefined;
+}
+
+// Runs once per invocation, immediately after help/unknown-command resolution and before any
+// I/O (resolveContext, ensureDir, store reads/writes): a typo'd, mistyped, or malformed flag is
+// rejected even when the active config is malformed, rather than losing the race to a later I/O
+// failure or silently defaulting (PCO-339/400's `--days`/`--dry-run` type-confusion bugs).
+function validateFlags(cmd: string, spec: CommandSpec, flags: Flags): string | null {
+  const byName = new Map(spec.flags.map((f) => [f.name, f] as const));
   for (const name of Object.keys(flags)) {
-    const type = types.get(name);
-    if (type === undefined) return `${cmd}: unknown flag --${name}`;
-    const value = flags[name]!;
-    const values = Array.isArray(value) ? value : [value];
+    const fspec = byName.get(name);
+    if (!fspec) return `${cmd}: unknown flag --${name}`;
+    const raw = flags[name]!;
+    const values = Array.isArray(raw) ? raw : [raw];
     for (const v of values) {
-      if (type === "string" && v === true) return `${cmd}: --${name} requires a value`;
-      if (type === "boolean" && typeof v === "string") return `${cmd}: --${name} does not take a value`;
+      if (fspec.type === "string" && v === true) return `${cmd}: --${name} requires a value`;
+      if (fspec.type === "boolean" && typeof v === "string") return `${cmd}: --${name} does not take a value`;
+      if (fspec.type === "string" && typeof v === "string" && fspec.validate) {
+        const msg = fspec.validate(v);
+        if (msg) return `${cmd}: --${name} ${msg}`;
+      }
     }
   }
   return null;
 }
 
-const USAGE = "usage: kb <add|recall|reindex|stats|archive|compact|import|context|path> [--dir <path>] [--project <name>] [...]\n" +
-  "  archive: [--days <n> | --key <k> [--key <k> ...]] [--dry-run]\n" +
-  "  compact: [--dry-run]\n" +
-  "  --help: show this message\n";
+function validateArity(cmd: string, positionals: string[], arity: Arity): string | null {
+  if (arity.kind === "any") return null;
+  if (arity.kind === "none") {
+    return positionals.length > 0 ? `${cmd}: unexpected argument(s): ${positionals.join(" ")}` : null;
+  }
+  return positionals.length === arity.count
+    ? null
+    : `${cmd}: expected exactly ${arity.count} argument(s), got ${positionals.length}`;
+}
+
+function flagUsage(f: FlagSpec): string {
+  if (f.type === "boolean") return `[--${f.name}]`;
+  return REPEATABLE_FLAGS.includes(f.name) ? `[--${f.name} <value> ...]` : `[--${f.name} <value>]`;
+}
+
+function positionalUsage(arity: Arity): string {
+  if (arity.kind === "any") return " [query terms...]";
+  if (arity.kind === "exact") return " <path>".repeat(arity.count);
+  return "";
+}
+
+// Derived from COMMANDS, not stored beside it: a flag added to a row is documented for free,
+// and a row can never drift out of sync with what validateFlags actually accepts.
+function commandUsage(cmd: string, spec: CommandSpec): string {
+  const parts = [...spec.flags.map(flagUsage), "[--help|-h]"].join(" ");
+  return `usage: kb ${cmd} ${parts}${positionalUsage(spec.arity)}\n`;
+}
+
+function topUsage(): string {
+  const names = Object.keys(COMMANDS);
+  return (
+    `usage: kb <${names.join("|")}> [--dir <path>] [--project <name>] [--help|-h]\n` +
+    `run "kb <command> --help" for that command's flags\n`
+  );
+}
 
 async function readStdin(): Promise<string> {
   return await new Response(Bun.stdin.stream()).text();
@@ -128,20 +217,36 @@ const READ_ONLY_COMMANDS: readonly string[] = ["context", "path"];
 export async function run(argv: string[], deps: RunDeps = {}): Promise<number> {
   const [cmd, ...rest] = argv;
   const { positionals, flags } = parseFlags(rest, REPEATABLE_FLAGS);
+  const helpRequested = "help" in flags || hasHelpShort(argv);
+  const knownSpec = cmd !== undefined ? getCommand(cmd) : undefined;
 
-  // Before everything else, including the malformed-config path resolveContext can hit:
-  // `--help` must exit 0 regardless of what else is wrong with the invocation. Gate on presence,
-  // not value: `--help` followed by a bare word binds that word (a string), not `true`, and it
-  // must still trigger help rather than falling through to validation.
-  if (cmd === "--help" || "help" in flags) { process.stdout.write(USAGE); return 0; }
-
-  if (cmd !== undefined) {
-    const flagError = validateFlags(cmd, flags);
-    if (flagError) { process.stderr.write(flagError + "\n"); return 1; }
+  // Bare invocation, the literal word "help", "--help", or "-h" as the command itself: the
+  // top-level listing, unconditionally, before any I/O.
+  if (cmd === undefined || cmd === "help" || cmd === "--help" || cmd === "-h") {
+    process.stdout.write(topUsage());
+    return 0;
   }
 
-  if (flags.dir === true) { process.stderr.write("--dir requires a value\n"); return 1; }
-  if (flags.project === true) { process.stderr.write("--project requires a value\n"); return 1; }
+  // An unknown command is a hard error regardless of --help/-h alongside it -- "bogus --help"
+  // is still "bogus", not a request for help. Resolved before validateFlags/arity so a typo'd
+  // command name never has to pass through a table row that doesn't exist for it.
+  if (!knownSpec) {
+    process.stderr.write(topUsage());
+    return 1;
+  }
+
+  // Known command + help intent: exit 0 with THIS command's usage regardless of what else is
+  // wrong with the invocation (LD18) -- resolved before validateFlags so `archive --help
+  // --bogus` still succeeds instead of losing to the unknown-flag error.
+  if (helpRequested) {
+    process.stdout.write(commandUsage(cmd, knownSpec));
+    return 0;
+  }
+
+  const flagError = validateFlags(cmd, knownSpec, flags);
+  if (flagError) { process.stderr.write(flagError + "\n"); return 1; }
+  const arityError = validateArity(cmd, positionals, knownSpec.arity);
+  if (arityError) { process.stderr.write(arityError + "\n"); return 1; }
 
   const input: ResolveInput = {
     cwd: deps.cwd ?? process.cwd(),
@@ -154,10 +259,23 @@ export async function run(argv: string[], deps: RunDeps = {}): Promise<number> {
   const resolved = resolveContext(input);
   // Fails closed on a malformed config rather than falling back to the default store: a session
   // that writes its lessons somewhere nobody reads again is worse than one that refuses to run.
-  if (!resolved.ok) { process.stderr.write(`${cmd ?? "kb"}: ${resolved.detail}\n`); return 1; }
+  if (!resolved.ok) { process.stderr.write(`${cmd}: ${resolved.detail}\n`); return 1; }
   const context: DrawbarContext = resolved.context;
   const dir = context.memoryDir;
-  if (cmd !== undefined && !READ_ONLY_COMMANDS.includes(cmd)) ensureDir(dir);
+  // Scoped to archive/compact only (LD17): stats --json's documented side effect of creating
+  // the store, and context/path's deliberate no-create-on-read, must both keep working. Checked
+  // once per requiresStore command, but only where a pure input error (archive's --key/--days
+  // mutual exclusion, an empty --key) does not already apply -- those fire regardless of
+  // whether a store exists, so they are decided inside their own case below instead.
+  const storeMissing = knownSpec.requiresStore && !existsSync(storePaths(dir).active);
+
+  // LD18: a refusal must never touch the filesystem, and `ensureDir` creates the directory plus
+  // a `.gitignore`. So it must not run ahead of a storeMissing refusal. The `--key` path is the
+  // exception: its own input errors (mutual exclusion, empty key, missing key) win over
+  // storeMissing and are decided in the case below, so it still needs the directory.
+  const archiveKeyPath = cmd === "archive" && flags.key !== undefined;
+  const skipEnsureDirForRefusal = storeMissing && !archiveKeyPath;
+  if (!READ_ONLY_COMMANDS.includes(cmd) && !skipEnsureDirForRefusal) ensureDir(dir);
 
   switch (cmd) {
     case "path": {
@@ -199,18 +317,8 @@ export async function run(argv: string[], deps: RunDeps = {}): Promise<number> {
       if (typeof flags.type === "string") filters.type = flags.type as KnowledgeType;
       if (typeof flags.tag === "string") filters.tag = flags.tag;
       if (typeof flags.file === "string") filters.file = flags.file;
-      if (flags.since === true) { process.stderr.write("recall: --since requires a value\n"); return 1; }
-      if (typeof flags.since === "string") {
-        const n = parseNonNegInt(flags.since);
-        if (n === null) { process.stderr.write("recall: --since must be a non-negative integer (digits only)\n"); return 1; }
-        filters.since = n;
-      }
-      if (flags.limit === true) { process.stderr.write("recall: --limit requires a value\n"); return 1; }
-      if (typeof flags.limit === "string") {
-        const n = parseNonNegInt(flags.limit);
-        if (n === null) { process.stderr.write("recall: --limit must be a non-negative integer (digits only)\n"); return 1; }
-        filters.limit = n;
-      }
+      if (typeof flags.since === "string") filters.since = parseNonNegInt(flags.since)!;
+      if (typeof flags.limit === "string") filters.limit = parseNonNegInt(flags.limit)!;
       if (flags.all === true) filters.includeArchive = true;
       const results = recall(dir, query, filters);
       if (flags.json === true) {
@@ -262,12 +370,11 @@ export async function run(argv: string[], deps: RunDeps = {}): Promise<number> {
         return 0;
       }
 
-      let days = 90;
-      if (typeof flags.days === "string") {
-        const n = parseNonNegInt(flags.days);
-        if (n === null) { process.stderr.write("archive: --days must be a non-negative integer (digits only)\n"); return 1; }
-        days = n;
-      }
+      // The --key path never reaches here: an empty store just makes every requested key
+      // "missing", which the branch above already reports. Only the days-based default -- the
+      // one that would otherwise silently "archive" zero rows from nothing -- needs the guard.
+      if (storeMissing) { process.stderr.write(`archive: no knowledge store found at ${dir}\n`); return 1; }
+      const days = typeof flags.days === "string" ? parseNonNegInt(flags.days)! : 90;
       const cutoff = Math.floor(Date.now() / 1000) - days * 86400;
       const res = archiveOlderThan(dir, cutoff, { dryRun });
       if (!dryRun) buildIndex(dir);
@@ -277,22 +384,32 @@ export async function run(argv: string[], deps: RunDeps = {}): Promise<number> {
       return 0;
     }
     case "compact": {
+      if (storeMissing) { process.stderr.write(`compact: no knowledge store found at ${dir}\n`); return 1; }
       const res = compactActive(dir, { dryRun: flags["dry-run"] === true });
       if (flags["dry-run"] !== true) buildIndex(dir);
       process.stdout.write(JSON.stringify(res) + "\n");
       return 0;
     }
     case "import": {
-      const src = positionals[0];
-      if (!src) { process.stderr.write("import: missing <path>\n"); return 1; }
+      const src = positionals[0]!; // arity validated to be exactly 1 above
+      if (src === "") { process.stderr.write("import: <path> must not be empty\n"); return 1; }
       const { importLegacy } = await import("./lib/migrate");
-      const report = importLegacy(src, dir);
+      let report;
+      try {
+        report = importLegacy(src, dir);
+      } catch (err) {
+        // A missing file, a directory, or any other unreadable path must return an exit code
+        // like every other input error, not reject the promise `run` returns.
+        process.stderr.write(`import: ${err instanceof Error ? err.message : String(err)}\n`);
+        return 1;
+      }
       process.stdout.write(JSON.stringify(report, null, 2) + "\n");
       return 0;
     }
     default:
-      process.stderr.write(USAGE);
-      return cmd ? 1 : 0;
+      // Unreachable: cmd passed the `!knownSpec` check above, so it names one of the cases.
+      process.stderr.write(topUsage());
+      return 1;
   }
 }
 
