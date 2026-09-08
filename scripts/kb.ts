@@ -1,13 +1,14 @@
 #!/usr/bin/env bun
 import { existsSync, readFileSync } from "node:fs";
 import { validateEntry } from "./lib/schema";
-import { appendEntry, readEntries, archiveOlderThan, compactActive, ensureDir } from "./lib/store";
+import { appendEntry, readEntries, archiveOlderThan, archiveByKeys, compactActive, ensureDir } from "./lib/store";
 import { buildIndex, recall, type RecallFilters } from "./lib/fts";
 import { resolveContext, type DrawbarContext, type ResolveInput } from "./lib/project-config";
 import type { Runner } from "./lib/ship-config";
 import type { KnowledgeType } from "./lib/schema";
 
-interface Flags { [k: string]: string | boolean; }
+type FlagValue = string | boolean;
+interface Flags { [k: string]: FlagValue | FlagValue[]; }
 
 // Every real I/O boundary the resolver needs, injectable and defaulting to the real thing —
 // the same seam shape `commands/drawbar-ship.md`'s module already uses, so a test can drive a
@@ -34,22 +35,86 @@ function parseNonNegInt(raw: string): number | null {
   return /^\d+$/.test(raw) ? Number(raw) : null;
 }
 
-function parseFlags(args: string[]): { positionals: string[]; flags: Flags } {
+// `repeatable` names flags that collect every occurrence into an array instead of
+// last-wins overwrite. Only used by callers that need `--key k1 --key k2` semantics.
+function parseFlags(args: string[], repeatable: readonly string[] = []): { positionals: string[]; flags: Flags } {
   const positionals: string[] = [];
-  const flags: Flags = {};
+  // Null-prototype: a plain `{}` lets `--__proto__ x` hit Object.prototype's setter and vanish as
+  // an own property, so it never reaches validateFlags' Object.keys loop and bypasses the allowlist.
+  const flags: Flags = Object.create(null);
   for (let i = 0; i < args.length; i++) {
     const a = args[i]!;
     if (a.startsWith("--")) {
       const name = a.slice(2);
       const next = args[i + 1];
-      if (next !== undefined && !next.startsWith("--")) { flags[name] = next; i++; }
-      else flags[name] = true;
+      let value: FlagValue;
+      if (next !== undefined && !next.startsWith("--")) { value = next; i++; }
+      else value = true;
+      if (repeatable.includes(name)) {
+        const arr = (flags[name] as FlagValue[] | undefined) ?? [];
+        arr.push(value);
+        flags[name] = arr;
+      } else {
+        flags[name] = value;
+      }
     } else {
       positionals.push(a);
     }
   }
   return { positionals, flags };
 }
+
+const REPEATABLE_FLAGS: readonly string[] = ["key"];
+
+type FlagType = "string" | "boolean";
+interface FlagSpec { name: string; type: FlagType; }
+
+// Declarative allowlist for the mutating commands. Each row names a flag and whether it takes
+// a value ("string") or is presence-only ("boolean") -- the type drives validateFlags below.
+// Adding a row for another command later is a table entry, not a restructure.
+const COMMAND_FLAG_TABLE: Record<string, readonly FlagSpec[]> = {
+  archive: [
+    { name: "dir", type: "string" },
+    { name: "project", type: "string" },
+    { name: "days", type: "string" },
+    { name: "key", type: "string" },
+    { name: "dry-run", type: "boolean" },
+  ],
+  compact: [
+    { name: "dir", type: "string" },
+    { name: "project", type: "string" },
+    { name: "dry-run", type: "boolean" },
+  ],
+};
+
+// Runs once per invocation, immediately after parseFlags and before any I/O (resolveContext,
+// ensureDir, store reads/writes): a typo'd or mistyped flag must be rejected even when the
+// active config is malformed, rather than losing the race to a later I/O failure.
+// Commands with no table entry are unvalidated here (S3 scope).
+function validateFlags(cmd: string, flags: Flags): string | null {
+  // hasOwnProperty guard: COMMAND_FLAG_TABLE is a plain object literal, so a bare `[cmd]` lookup
+  // for cmd="constructor" (or "toString" etc.) resolves to the inherited Object.prototype member
+  // instead of undefined, passing the `!table` check and crashing on `table.map` below.
+  const table = Object.prototype.hasOwnProperty.call(COMMAND_FLAG_TABLE, cmd) ? COMMAND_FLAG_TABLE[cmd] : undefined;
+  if (!table) return null;
+  const types = new Map(table.map((f) => [f.name, f.type] as const));
+  for (const name of Object.keys(flags)) {
+    const type = types.get(name);
+    if (type === undefined) return `${cmd}: unknown flag --${name}`;
+    const value = flags[name]!;
+    const values = Array.isArray(value) ? value : [value];
+    for (const v of values) {
+      if (type === "string" && v === true) return `${cmd}: --${name} requires a value`;
+      if (type === "boolean" && typeof v === "string") return `${cmd}: --${name} does not take a value`;
+    }
+  }
+  return null;
+}
+
+const USAGE = "usage: kb <add|recall|reindex|stats|archive|compact|import|context|path> [--dir <path>] [--project <name>] [...]\n" +
+  "  archive: [--days <n> | --key <k> [--key <k> ...]] [--dry-run]\n" +
+  "  compact: [--dry-run]\n" +
+  "  --help: show this message\n";
 
 async function readStdin(): Promise<string> {
   return await new Response(Bun.stdin.stream()).text();
@@ -62,7 +127,18 @@ const READ_ONLY_COMMANDS: readonly string[] = ["context", "path"];
 
 export async function run(argv: string[], deps: RunDeps = {}): Promise<number> {
   const [cmd, ...rest] = argv;
-  const { positionals, flags } = parseFlags(rest);
+  const { positionals, flags } = parseFlags(rest, REPEATABLE_FLAGS);
+
+  // Before everything else, including the malformed-config path resolveContext can hit:
+  // `--help` must exit 0 regardless of what else is wrong with the invocation. Gate on presence,
+  // not value: `--help` followed by a bare word binds that word (a string), not `true`, and it
+  // must still trigger help rather than falling through to validation.
+  if (cmd === "--help" || "help" in flags) { process.stdout.write(USAGE); return 0; }
+
+  if (cmd !== undefined) {
+    const flagError = validateFlags(cmd, flags);
+    if (flagError) { process.stderr.write(flagError + "\n"); return 1; }
+  }
 
   if (flags.dir === true) { process.stderr.write("--dir requires a value\n"); return 1; }
   if (flags.project === true) { process.stderr.write("--project requires a value\n"); return 1; }
@@ -166,17 +242,38 @@ export async function run(argv: string[], deps: RunDeps = {}): Promise<number> {
       return 0;
     }
     case "archive": {
+      const dryRun = flags["dry-run"] === true;
+      const keyFlag = flags.key as string[] | undefined; // validateFlags already rejected any `true` element
+
+      if (keyFlag !== undefined && flags.days !== undefined) {
+        process.stderr.write("archive: --key and --days are mutually exclusive\n");
+        return 1;
+      }
+
+      if (keyFlag !== undefined) {
+        if (keyFlag.some((k) => k === "")) { process.stderr.write("archive: --key must not be empty\n"); return 1; }
+        const res = archiveByKeys(dir, keyFlag, { dryRun });
+        if (res.missing.length > 0) {
+          process.stderr.write(`archive: no matching entries for key(s): ${res.missing.join(", ")}\n`);
+          return 1;
+        }
+        if (!dryRun) buildIndex(dir);
+        process.stdout.write(JSON.stringify({ archived: res.archived, dryRun, keys: res.keys }) + "\n");
+        return 0;
+      }
+
       let days = 90;
-      if (flags.days === true) { process.stderr.write("archive: --days requires a value\n"); return 1; }
       if (typeof flags.days === "string") {
         const n = parseNonNegInt(flags.days);
         if (n === null) { process.stderr.write("archive: --days must be a non-negative integer (digits only)\n"); return 1; }
         days = n;
       }
       const cutoff = Math.floor(Date.now() / 1000) - days * 86400;
-      const res = archiveOlderThan(dir, cutoff);
-      buildIndex(dir);
-      process.stdout.write(JSON.stringify(res) + "\n");
+      const res = archiveOlderThan(dir, cutoff, { dryRun });
+      if (!dryRun) buildIndex(dir);
+      // "keys" would be the whole store on a real day-based run, so it's dry-run only.
+      const out = dryRun ? { archived: res.archived, dryRun, keys: res.keys } : { archived: res.archived, dryRun };
+      process.stdout.write(JSON.stringify(out) + "\n");
       return 0;
     }
     case "compact": {
@@ -194,7 +291,7 @@ export async function run(argv: string[], deps: RunDeps = {}): Promise<number> {
       return 0;
     }
     default:
-      process.stderr.write("usage: kb <add|recall|reindex|stats|archive|compact|import|context|path> [--dir <path>] [...]\n");
+      process.stderr.write(USAGE);
       return cmd ? 1 : 0;
   }
 }

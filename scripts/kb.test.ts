@@ -1,9 +1,22 @@
 import { test, expect, describe, beforeEach } from "bun:test";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { run } from "./kb";
 import { readEntries, readArchiveEntries, ensureDir } from "./lib/store";
+import { buildIndex } from "./lib/fts";
+
+// Byte-comparison snapshot of everything on disk the store touches, for asserting a dry-run
+// (or a rejected invocation) truly wrote nothing -- not knowledge.jsonl/archive alone, but
+// index.db too, since a real archive rebuilds it unconditionally.
+function snapshotStore(dir: string): { active: string; archive: string; indexDb: string | null } {
+  const p = ensureDir(dir);
+  return {
+    active: existsSync(p.active) ? readFileSync(p.active, "utf8") : "",
+    archive: existsSync(p.archive) ? readFileSync(p.archive, "utf8") : "",
+    indexDb: existsSync(p.indexDb) ? readFileSync(p.indexDb).toString("base64") : null,
+  };
+}
 
 let dir: string;
 beforeEach(() => {
@@ -148,6 +161,230 @@ describe("run (in-process)", () => {
       expect(readArchiveEntries(dir).length).toBe(0);
     }
   });
+
+  // Every help test below passes an explicit *nonexistent* --dir (or checks snapshotStore
+  // for a seeded one): the help check runs before any I/O, so a regression in that ordering
+  // must not silently start writing into a real store -- including the repo's own, since
+  // spawning kb.ts without --dir falls back to process.cwd().
+  test("--help prints usage on stdout, exits 0, and creates nothing (PCO-400 F4)", async () => {
+    const missing = join(dir, "missing");
+    const { code, out } = await cli(["--help", "--dir", missing]);
+    expect(code).toBe(0);
+    expect(out).toContain("usage:");
+    expect(existsSync(missing)).toBe(false);
+  });
+
+  test("archive --help exits 0 even with an otherwise-invalid flag, prints usage, and creates nothing (PCO-400 F4)", async () => {
+    const missing = join(dir, "missing");
+    const { code, out } = await cli(["archive", "--help", "--dir", missing, "--bogus"]);
+    expect(code).toBe(0);
+    expect(out).toContain("usage:");
+    expect(existsSync(missing)).toBe(false);
+  });
+
+  test("archive --help leaves an existing store byte-identical and prints usage (PCO-400 F4)", async () => {
+    const p = ensureDir(dir);
+    writeFileSync(p.active, JSON.stringify({ key: "a", type: "fact", content: "a1", source: "user", tags: [], ts: 1, issue: null, files: [] }) + "\n");
+    const before = snapshotStore(dir);
+    const { code, out } = await cli(["archive", "--dir", dir, "--help"]);
+    expect(code).toBe(0);
+    expect(out).toContain("usage:");
+    expect(snapshotStore(dir)).toEqual(before);
+  });
+
+  test("recall --help hello binds a string to --help and still exits 0 with usage (PCO-400 F3)", async () => {
+    const missing = join(dir, "missing");
+    const { code, out } = await cli(["recall", "--dir", missing, "--help", "hello"]);
+    expect(code).toBe(0);
+    expect(out).toContain("usage:");
+    expect(existsSync(missing)).toBe(false);
+  });
+
+  test("archive --help later binds a string to --help and still exits 0 with usage (PCO-400 F3)", async () => {
+    const missing = join(dir, "missing");
+    const { code, out } = await cli(["archive", "--dir", missing, "--help", "later"]);
+    expect(code).toBe(0);
+    expect(out).toContain("usage:");
+    expect(existsSync(missing)).toBe(false);
+  });
+
+  test("archive --bogus is rejected and leaves the store untouched (PCO-400)", async () => {
+    const p = ensureDir(dir);
+    writeFileSync(p.active, JSON.stringify({ key: "a", type: "fact", content: "a1", source: "user", tags: [], ts: 1, issue: null, files: [] }) + "\n");
+    const before = snapshotStore(dir);
+    expect(await run(["archive", "--dir", dir, "--bogus"])).toBe(1);
+    expect(snapshotStore(dir)).toEqual(before);
+  });
+
+  test("compact --bogus is rejected and leaves the store untouched (PCO-400)", async () => {
+    const p = ensureDir(dir);
+    writeFileSync(p.active, JSON.stringify({ key: "a", type: "fact", content: "a1", source: "user", tags: [], ts: 1, issue: null, files: [] }) + "\n");
+    const before = snapshotStore(dir);
+    expect(await run(["compact", "--dir", dir, "--bogus"])).toBe(1);
+    expect(snapshotStore(dir)).toEqual(before);
+  });
+
+  test("archive --__proto__ x is rejected, names the flag on stderr, and leaves the store untouched (PCO-400 F1)", async () => {
+    const p = ensureDir(dir);
+    writeFileSync(
+      p.active,
+      [
+        JSON.stringify({ key: "a", type: "fact", content: "a1", source: "user", tags: [], ts: 1, issue: null, files: [] }),
+        JSON.stringify({ key: "b", type: "fact", content: "b1", source: "user", tags: [], ts: 2, issue: null, files: [] }),
+      ].join("\n") + "\n",
+    );
+    const before = snapshotStore(dir);
+    const { code, err } = await cli(["archive", "--dir", dir, "--__proto__", "x"]);
+    expect(code).toBe(1);
+    expect(err).toContain("--__proto__");
+    expect(snapshotStore(dir)).toEqual(before);
+  });
+
+  test("archive --__proto__ with no value is rejected, names the flag on stderr, and leaves the store untouched (PCO-400 F1)", async () => {
+    const p = ensureDir(dir);
+    writeFileSync(p.active, JSON.stringify({ key: "a", type: "fact", content: "a1", source: "user", tags: [], ts: 1, issue: null, files: [] }) + "\n");
+    const before = snapshotStore(dir);
+    const { code, err } = await cli(["archive", "--dir", dir, "--__proto__"]);
+    expect(code).toBe(1);
+    expect(err).toContain("--__proto__");
+    expect(snapshotStore(dir)).toEqual(before);
+  });
+
+  test("compact --__proto__ x is rejected, names the flag on stderr, and leaves the store untouched (PCO-400 F1)", async () => {
+    const p = ensureDir(dir);
+    writeFileSync(
+      p.active,
+      [
+        JSON.stringify({ key: "a", type: "fact", content: "a1", source: "user", tags: [], ts: 1, issue: null, files: [] }),
+        JSON.stringify({ key: "a", type: "fact", content: "a2", source: "user", tags: [], ts: 2, issue: null, files: [] }),
+      ].join("\n") + "\n",
+    );
+    const before = snapshotStore(dir);
+    const { code, err } = await cli(["compact", "--dir", dir, "--__proto__", "x"]);
+    expect(code).toBe(1);
+    expect(err).toContain("--__proto__");
+    expect(snapshotStore(dir)).toEqual(before);
+  });
+
+  test("archive --dry-run --bogus: the flag rejection wins (PCO-400)", async () => {
+    const p = ensureDir(dir);
+    writeFileSync(p.active, JSON.stringify({ key: "a", type: "fact", content: "a1", source: "user", tags: [], ts: 1, issue: null, files: [] }) + "\n");
+    const before = snapshotStore(dir);
+    expect(await run(["archive", "--dir", dir, "--dry-run", "--bogus"])).toBe(1);
+    expect(snapshotStore(dir)).toEqual(before);
+  });
+
+  test("compact --dry-run 1 binds a string and is rejected; no compaction runs (PCO-400)", async () => {
+    const p = ensureDir(dir);
+    writeFileSync(
+      p.active,
+      [
+        JSON.stringify({ key: "a", type: "fact", content: "a1", source: "user", tags: [], ts: 1, issue: null, files: [] }),
+        JSON.stringify({ key: "a", type: "fact", content: "a2", source: "user", tags: [], ts: 2, issue: null, files: [] }),
+      ].join("\n") + "\n",
+    );
+    const before = snapshotStore(dir);
+    expect(await run(["compact", "--dir", dir, "--dry-run", "1"])).toBe(1);
+    expect(snapshotStore(dir)).toEqual(before);
+  });
+
+  test("plain compact --dry-run still previews (PCO-400)", async () => {
+    const p = ensureDir(dir);
+    writeFileSync(
+      p.active,
+      [
+        JSON.stringify({ key: "a", type: "fact", content: "a1", source: "user", tags: [], ts: 1, issue: null, files: [] }),
+        JSON.stringify({ key: "a", type: "fact", content: "a2", source: "user", tags: [], ts: 2, issue: null, files: [] }),
+      ].join("\n") + "\n",
+    );
+    expect(await run(["compact", "--dir", dir, "--dry-run"])).toBe(0);
+    expect(readEntries(dir).map((e) => e.content)).toEqual(["a1", "a2"]);
+  });
+
+  test("archive --key archives exactly the requested keys (PCO-400)", async () => {
+    const p = ensureDir(dir);
+    writeFileSync(
+      p.active,
+      [
+        JSON.stringify({ key: "k1", type: "fact", content: "c1", source: "user", tags: [], ts: 1, issue: null, files: [] }),
+        JSON.stringify({ key: "k2", type: "fact", content: "c2", source: "user", tags: [], ts: 2, issue: null, files: [] }),
+        JSON.stringify({ key: "k3", type: "fact", content: "c3", source: "user", tags: [], ts: 3, issue: null, files: [] }),
+      ].join("\n") + "\n",
+    );
+    expect(await run(["archive", "--dir", dir, "--key", "k1", "--key", "k2"])).toBe(0);
+    expect(readEntries(dir).map((e) => e.key)).toEqual(["k3"]);
+    expect(readArchiveEntries(dir).map((e) => e.key).sort()).toEqual(["k1", "k2"]);
+  });
+
+  test("archive --key reports missing keys and archives nothing, fail-closed (PCO-400)", async () => {
+    const p = ensureDir(dir);
+    writeFileSync(p.active, JSON.stringify({ key: "k1", type: "fact", content: "c1", source: "user", tags: [], ts: 1, issue: null, files: [] }) + "\n");
+    expect(await run(["archive", "--dir", dir, "--key", "nope"])).toBe(1);
+    expect(readEntries(dir).length).toBe(1);
+    expect(readArchiveEntries(dir).length).toBe(0);
+  });
+
+  test("archive --key with a mix of present and missing keys archives nothing (PCO-400)", async () => {
+    const p = ensureDir(dir);
+    writeFileSync(
+      p.active,
+      [
+        JSON.stringify({ key: "k1", type: "fact", content: "c1", source: "user", tags: [], ts: 1, issue: null, files: [] }),
+        JSON.stringify({ key: "k2", type: "fact", content: "c2", source: "user", tags: [], ts: 2, issue: null, files: [] }),
+      ].join("\n") + "\n",
+    );
+    expect(await run(["archive", "--dir", dir, "--key", "k1", "--key", "nope"])).toBe(1);
+    expect(readEntries(dir).length).toBe(2);
+    expect(readArchiveEntries(dir).length).toBe(0);
+  });
+
+  test("archive --key '' is rejected (PCO-400)", async () => {
+    const p = ensureDir(dir);
+    writeFileSync(p.active, JSON.stringify({ key: "k1", type: "fact", content: "c1", source: "user", tags: [], ts: 1, issue: null, files: [] }) + "\n");
+    expect(await run(["archive", "--dir", dir, "--key", ""])).toBe(1);
+    expect(readEntries(dir).length).toBe(1);
+  });
+
+  test("archive --key with --days is rejected (PCO-400)", async () => {
+    const p = ensureDir(dir);
+    writeFileSync(p.active, JSON.stringify({ key: "k1", type: "fact", content: "c1", source: "user", tags: [], ts: 1, issue: null, files: [] }) + "\n");
+    expect(await run(["archive", "--dir", dir, "--key", "k1", "--days", "30"])).toBe(1);
+    expect(readEntries(dir).length).toBe(1);
+  });
+
+  test("archive --key archives every row for a duplicated key (PCO-400)", async () => {
+    const p = ensureDir(dir);
+    writeFileSync(
+      p.active,
+      [
+        JSON.stringify({ key: "dup", type: "fact", content: "c1", source: "user", tags: [], ts: 1, issue: null, files: [] }),
+        JSON.stringify({ key: "dup", type: "fact", content: "c2", source: "user", tags: [], ts: 2, issue: null, files: [] }),
+        JSON.stringify({ key: "other", type: "fact", content: "c3", source: "user", tags: [], ts: 3, issue: null, files: [] }),
+      ].join("\n") + "\n",
+    );
+    expect(await run(["archive", "--dir", dir, "--key", "dup"])).toBe(0);
+    expect(readEntries(dir).map((e) => e.key)).toEqual(["other"]);
+    expect(readArchiveEntries(dir).map((e) => e.content)).toEqual(["c1", "c2"]);
+  });
+
+  test("archive --dry-run --key changes nothing on disk, including index.db (PCO-400)", async () => {
+    const p = ensureDir(dir);
+    writeFileSync(p.active, JSON.stringify({ key: "k1", type: "fact", content: "c1", source: "user", tags: [], ts: 1, issue: null, files: [] }) + "\n");
+    buildIndex(dir); // establish a concrete index.db so "unchanged" isn't vacuously true
+    const before = snapshotStore(dir);
+    expect(await run(["archive", "--dir", dir, "--dry-run", "--key", "k1"])).toBe(0);
+    expect(snapshotStore(dir)).toEqual(before);
+  });
+
+  test("archive --dry-run --days changes nothing on disk, including index.db (PCO-400)", async () => {
+    const p = ensureDir(dir);
+    const past = Math.floor(Date.now() / 1000) - 3600;
+    writeFileSync(p.active, JSON.stringify({ key: "k1", type: "fact", content: "c1", source: "user", tags: [], ts: past, issue: null, files: [] }) + "\n");
+    buildIndex(dir); // establish a concrete index.db so "unchanged" isn't vacuously true
+    const before = snapshotStore(dir);
+    expect(await run(["archive", "--dir", dir, "--dry-run", "--days", "0"])).toBe(0);
+    expect(snapshotStore(dir)).toEqual(before);
+  });
 });
 
 describe("cli (subprocess, real stdin)", () => {
@@ -253,6 +490,20 @@ describe("cli (subprocess, real stdin)", () => {
     expect(err).toContain("compact");
   });
 
+  test("kb constructor exits 1 with usage on stderr instead of throwing (PCO-400 F2)", async () => {
+    const { code, err } = await cli(["constructor", "--dir", dir]);
+    expect(code).toBe(1);
+    expect(err).toContain("usage:");
+    expect(err).not.toContain("TypeError");
+  });
+
+  test("kb toString exits 1 with usage on stderr instead of throwing (PCO-400 F2)", async () => {
+    const { code, err } = await cli(["toString", "--dir", dir]);
+    expect(code).toBe(1);
+    expect(err).toContain("usage:");
+    expect(err).not.toContain("TypeError");
+  });
+
   test("archive --days -1 names the flag on stderr (PCO-339)", async () => {
     const { code, err } = await cli(["archive", "--dir", dir, "--days", "-1"]);
     expect(code).toBe(1);
@@ -281,5 +532,95 @@ describe("cli (subprocess, real stdin)", () => {
     const { err } = await cli(["recall", "x", "--dir", dir, "--limit", "2.7"]);
     expect(err).toContain("non-negative integer");
     expect(err).not.toContain("non-negative number");
+  });
+
+  test("archive --help prints the full usage, including --key and --dry-run, and creates nothing (PCO-400 F4)", async () => {
+    const missing = join(dir, "missing");
+    const { code, out } = await cli(["archive", "--help", "--dir", missing]);
+    expect(code).toBe(0);
+    expect(out).toContain("usage:");
+    expect(out).toContain("--key");
+    expect(out).toContain("--dry-run");
+    expect(existsSync(missing)).toBe(false);
+  });
+
+  test("archive --bogus names the flag on stderr (PCO-400)", async () => {
+    const { code, err } = await cli(["archive", "--dir", dir, "--bogus"]);
+    expect(code).toBe(1);
+    expect(err).toContain("--bogus");
+  });
+
+  test("compact --bogus names the flag on stderr (PCO-400)", async () => {
+    const { code, err } = await cli(["compact", "--dir", dir, "--bogus"]);
+    expect(code).toBe(1);
+    expect(err).toContain("--bogus");
+  });
+
+  test("archive --key with --days names both flags on stderr (PCO-400)", async () => {
+    const { code, err } = await cli(["archive", "--dir", dir, "--key", "k1", "--days", "30"]);
+    expect(code).toBe(1);
+    expect(err).toContain("--key");
+    expect(err).toContain("--days");
+  });
+
+  test("archive --key with a missing key reports it on stderr and writes nothing to stdout (PCO-400)", async () => {
+    const { code, out, err } = await cli(["archive", "--dir", dir, "--key", "nope"]);
+    expect(code).toBe(1);
+    expect(err).toContain("nope");
+    expect(out).toBe("");
+  });
+
+  test("archive --key '' names the empty-key message on stderr (PCO-400 F6)", async () => {
+    const p = ensureDir(dir);
+    writeFileSync(p.active, JSON.stringify({ key: "k1", type: "fact", content: "c1", source: "user", tags: [], ts: 1, issue: null, files: [] }) + "\n");
+    const { code, err } = await cli(["archive", "--dir", dir, "--key", ""]);
+    expect(code).toBe(1);
+    expect(err).toContain("--key must not be empty");
+  });
+
+  test("archive --key real run includes the archived keys in JSON (PCO-400 F5)", async () => {
+    const p = ensureDir(dir);
+    writeFileSync(p.active, JSON.stringify({ key: "k1", type: "fact", content: "c1", source: "user", tags: [], ts: 1, issue: null, files: [] }) + "\n");
+    const { code, out } = await cli(["archive", "--dir", dir, "--key", "k1"]);
+    expect(code).toBe(0);
+    expect(JSON.parse(out)).toEqual({ archived: 1, dryRun: false, keys: ["k1"] });
+  });
+
+  test("archive --dry-run --key prints the archived keys in JSON (PCO-400)", async () => {
+    const p = ensureDir(dir);
+    writeFileSync(
+      p.active,
+      [
+        JSON.stringify({ key: "k1", type: "fact", content: "c1", source: "user", tags: [], ts: 1, issue: null, files: [] }),
+        JSON.stringify({ key: "k2", type: "fact", content: "c2", source: "user", tags: [], ts: 2, issue: null, files: [] }),
+      ].join("\n") + "\n",
+    );
+    const { code, out } = await cli(["archive", "--dir", dir, "--dry-run", "--key", "k1"]);
+    expect(code).toBe(0);
+    expect(JSON.parse(out)).toEqual({ archived: 1, dryRun: true, keys: ["k1"] });
+  });
+
+  test("archive --dry-run --days prints the archived keys in JSON (PCO-400)", async () => {
+    const p = ensureDir(dir);
+    const past = Math.floor(Date.now() / 1000) - 3600;
+    writeFileSync(
+      p.active,
+      JSON.stringify({ key: "k1", type: "fact", content: "c1", source: "user", tags: [], ts: past, issue: null, files: [] }) + "\n",
+    );
+    const { code, out } = await cli(["archive", "--dir", dir, "--dry-run", "--days", "0"]);
+    expect(code).toBe(0);
+    expect(JSON.parse(out)).toEqual({ archived: 1, dryRun: true, keys: ["k1"] });
+  });
+
+  test("archive --days real run omits keys, since it could be the whole store (PCO-400)", async () => {
+    const p = ensureDir(dir);
+    const past = Math.floor(Date.now() / 1000) - 3600;
+    writeFileSync(
+      p.active,
+      JSON.stringify({ key: "k1", type: "fact", content: "c1", source: "user", tags: [], ts: past, issue: null, files: [] }) + "\n",
+    );
+    const { code, out } = await cli(["archive", "--dir", dir, "--days", "0"]);
+    expect(code).toBe(0);
+    expect(JSON.parse(out)).toEqual({ archived: 1, dryRun: false });
   });
 });
