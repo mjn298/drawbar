@@ -622,9 +622,9 @@ describe("version reconcile", () => {
   // test rather than a side effect, and gives PCO-397's replay something to check the loaded
   // plugin against: the cache is keyed by plugin.json's version, so a replay run against a stale
   // build would pass confidently while exercising none of the new rules.
-  test("the shipped version is 0.6.0 (Locked means the operator chose it; MUST-CHECK is rare; prose pins retired)", () => {
+  test("the shipped version is 0.6.1 (decision and deviation retired as KB entry types)", () => {
     const pkg = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
-    expect(pkg.version).toBe("0.6.0");
+    expect(pkg.version).toBe("0.6.1");
   });
 });
 

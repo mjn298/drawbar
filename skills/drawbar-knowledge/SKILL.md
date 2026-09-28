@@ -1,6 +1,6 @@
 ---
 name: drawbar-knowledge
-description: How to read from and write to the drawbar knowledge base via the drawbar-kb CLI — the entry schema, the six types, the MUST-CHECK convention, recall, and safe writes. Use when a drawbar command needs to recall prior lessons or record new ones.
+description: How to read from and write to the drawbar knowledge base via the drawbar-kb CLI — the entry schema, the four types, the MUST-CHECK convention, recall, and safe writes. Use when a drawbar command needs to recall prior lessons or record new ones.
 ---
 
 # drawbar knowledge base
@@ -30,14 +30,14 @@ Whether the store is committed is the project's choice: leave `memoryDir` unset 
 
 Required: `key`, `type`, `content`. `source` defaults to `agent`; `tags`/`files` default to `[]`; `issue` defaults to `null`; `ts` defaults to now.
 
-## The six types
+## The four types
 
 - `learned` — a lesson or gotcha. Begin its content with `MUST-CHECK:` only when the mistake cost data, security, or a session.
-- `decision` — a choice and its rationale.
 - `pattern` — a reusable approach.
 - `fact` — a stable constraint about the system.
 - `investigation` — what a dig uncovered.
-- `deviation` — a departure from plan and why.
+
+Decisions about a feature and departures from its plan live in Linear, on the issue and in the PR. The KB holds only what outlives the feature. The CLI still accepts the legacy `decision` and `deviation` types so older stores keep validating; do not write new entries with them.
 
 ## Writing an entry
 
