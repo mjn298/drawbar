@@ -28,11 +28,11 @@ Pull out durable lessons — not transient narration. An entry is at most two se
 
 Use the right type:
 - `learned` — a lesson or gotcha. Begin the content with `MUST-CHECK:` only when the mistake cost data, security, or a session; most lessons are plain `learned`.
-- `decision` — a choice made and why.
 - `pattern` — a reusable approach.
 - `fact` — a stable constraint about the system.
 - `investigation` — what a dig turned up.
-- `deviation` — where you departed from the plan and why.
+
+A decision about the feature, or a departure from its plan, is already recorded in Linear and the PR. Do not copy it here; if it taught something that outlives the feature, write that as a `fact` or `pattern`.
 
 ## 3. Write each entry (safe, deduped)
 

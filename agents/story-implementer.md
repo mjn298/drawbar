@@ -59,10 +59,10 @@ This applies to comments you edit as well as ones you write: if you are already 
 
 ## Capture lessons (inline)
 
-As you hit anything worth remembering (a gotcha, a pattern, a decision, or a mistake), write it to the KB. Pipe a JSON object on stdin (never shell-interpolate content):
+As you hit anything worth remembering (a gotcha, a pattern, or a stable fact about the system), write it to the KB. A decision about this story belongs in your report, not here. Pipe a JSON object on stdin (never shell-interpolate content):
 
 ```bash
-echo '{"key":"<kebab-key>","type":"<learned|decision|pattern|fact|investigation|deviation>","content":"<the lesson>","source":"agent","tags":["..."],"issue":"<issue-id>","files":["<path>"]}' \
+echo '{"key":"<kebab-key>","type":"<learned|pattern|fact|investigation>","content":"<the lesson>","source":"agent","tags":["..."],"issue":"<issue-id>","files":["<path>"]}' \
   | drawbar-kb add --dir "$KB"
 ```
 

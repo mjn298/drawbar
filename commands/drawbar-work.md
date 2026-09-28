@@ -133,7 +133,7 @@ Small, obvious one-line corrections you may apply directly rather than round-tri
 The implementer captures lessons it hits while building. As the lead, add anything **you** learn during verification or the review loop (a review finding worth generalizing, a gotcha the gate caught). Pipe a JSON object on stdin (never shell-interpolate content):
 
 ```bash
-echo '{"key":"<kebab-key>","type":"<learned|decision|pattern|fact|investigation|deviation>","content":"<the lesson>","source":"agent","tags":["..."],"issue":"<issue-id>","files":["<path>"]}' \
+echo '{"key":"<kebab-key>","type":"<learned|pattern|fact|investigation>","content":"<the lesson>","source":"agent","tags":["..."],"issue":"<issue-id>","files":["<path>"]}' \
   | drawbar-kb add --dir "$KB"
 ```
 
