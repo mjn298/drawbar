@@ -24,8 +24,10 @@ Look over the session's diffs, decisions, and dead-ends. If `$ARGUMENTS` is a Li
 
 ## 2. Extract entries
 
-Pull out durable lessons — not transient narration. Use the right type:
-- `learned` — a lesson or gotcha. For a mistake to guard against in future, begin the content with `MUST-CHECK:`.
+Pull out durable lessons — not transient narration. An entry is at most two sentences: the rule, then why. The key names the rule, never a story. If an existing key already covers the lesson, update that key instead of adding a neighbor.
+
+Use the right type:
+- `learned` — a lesson or gotcha. Begin the content with `MUST-CHECK:` only when the mistake cost data, security, or a session; most lessons are plain `learned`.
 - `decision` — a choice made and why.
 - `pattern` — a reusable approach.
 - `fact` — a stable constraint about the system.
