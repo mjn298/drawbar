@@ -32,12 +32,19 @@ Required: `key`, `type`, `content`. `source` defaults to `agent`; `tags`/`files`
 
 ## The six types
 
-- `learned` — a lesson or gotcha. A mistake to guard against begins its content with `MUST-CHECK:`.
+- `learned` — a lesson or gotcha. Begin its content with `MUST-CHECK:` only when the mistake cost data, security, or a session.
 - `decision` — a choice and its rationale.
 - `pattern` — a reusable approach.
 - `fact` — a stable constraint about the system.
 - `investigation` — what a dig uncovered.
 - `deviation` — a departure from plan and why.
+
+## Writing an entry
+
+- **Two sentences at most.** The rule, then why. An incident narrative is not an entry; the rule it taught is.
+- **`MUST-CHECK:` is rare.** It marks a mistake that cost data, security, or a session, and every command treats it as a hard requirement downstream. Most lessons are plain `learned`.
+- **The key names the rule**, never a story id. `never-git-stash-to-compare-branches`, not `pco348-stash-gotcha`.
+- **Update before adding.** If a key already covers the lesson, re-add under that key with the better wording; `add` upserts.
 
 ## Recall (read)
 

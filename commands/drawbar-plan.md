@@ -1,6 +1,6 @@
 ---
 name: drawbar-plan
-description: Decompose a locked design (a Linear parent issue) into good, testable, ordered story sub-issues using the Locked/Discretion template.
+description: Decompose a locked design (a Linear parent issue) into good, testable, ordered story sub-issues.
 argument-hint: "<issue-id of the parent issue> [--project <linear project>]"
 ---
 
@@ -32,49 +32,15 @@ Detect the story's stack from the spec (languages, frameworks). Then:
 drawbar-kb recall "MUST-CHECK <stack keywords>" --dir "$KB" --json
 ```
 
-Every `MUST-CHECK:` entry returned becomes a validation rule the stories must honor.
+A `MUST-CHECK:` that applies to a story goes into that story's `## Locked` section, verbatim. One that does not apply is left out.
 
 ## 3. Decompose into ordered stories
 
 ### Provenance — what you may assert as fact
 
-Before you write a factual claim someone else will act on, ask the one question with a
-mechanical answer:
-
-**Did I read the thing that answers this question, in this session?**
-
-- **Yes** → assert it, and say where — the file and the symbol in it.
-- **No** → do not assert it. Write it as an instruction to check.
-
-**Name the file and the symbol. Never a line number.** Write `BaseRuleSchema` in
-`shared/types/locationGroup.ts` — not `shared/types/locationGroup.ts:74`. Line numbers go stale
-the moment anyone edits above them, and this text outlives the tree it was written against; a
-symbol name still finds the code a month later. (Review findings are the exception: a reviewer
-names a line against the sha it pinned, and reports it the same sitting.)
-
-The test is **per-question, not per-file**. A search that answered one question licenses
-nothing about a different one in the same file: grepping `ruleSets` opens the schema and still
-says nothing about whether a rule carries an `id`. Record what each read *established*, not
-which paths you touched.
-
-**Point at the evidence, not the conclusion.** Instead of "location rules have no `id`, keep
-`key={index}`", write "I have not read the rule schema — check `BaseRuleSchema` in
-`shared/types/locationGroup.ts` and match whichever is correct." The second is shorter, and it
-produces the right result even when your belief is wrong. That is the whole trick: a belief
-written as evidence-plus-instruction is self-correcting, while the same belief written as a
-decision is binding — and an agent told it is a hard requirement will build it faithfully.
-
-**Before instructing a copy or mirror, state what differs between the source's container and
-the destination's container.** One line. If nothing differs, say so. Reading both sides is not
-enough and never was: the one time this failed, both files had been read in full and the
-sentence naming the difference was simply never written, so "match X exactly" shipped a
-component that rendered flush against a panel border. The reference tells you what the code
-says; only the comparison tells you what it will *do* where it lands. A `match X exactly` with
-no difference line beside it is unwriteable.
-
-**Prefer falsification over confirmation.** Search for the counter-example, not the example. If
-a claim cannot be falsified cheaply, downgrade it to an instruction: "check whether X, and match
-accordingly" rather than "X is true, do Y."
+- Assert something about the code only if you read the thing that answers it in this session, and say where: the file and the symbol, never a line number. The test is per question, not per file.
+- Otherwise write it as an instruction to check, pointing at the evidence: "verify `BaseRuleSchema` in `shared/types/locationGroup.ts` and match whichever is correct." A belief written as a decision gets built even when it is wrong.
+- Before telling anyone to copy or mirror something, say in one line what differs between the source's container and the destination's, or that nothing does.
 
 
 A false claim in a ticket outlives a false claim in a brief: nobody re-reads it, and it sits in
@@ -89,8 +55,8 @@ ticket nobody follows.
 - No jargon, no buzzwords, no invented compounds, no metaphors. Say "makes it slower", not
   "introduces latency overhead". Real names of things — `companyId`, oRPC, Zod — are fine;
   the padding around them is not.
-- Say it once. Don't restate the goal in What, then Context, then Validation.
-- Bullets over paragraphs in What, Testing, Validation, Files.
+- Say it once. Don't restate the goal in What, then Context, then Testing.
+- Bullets over paragraphs in What, Testing, Files.
 - Cut any sentence that doesn't change what the implementer does. Motivation, background, and
   "why this matters" belong in the parent spec, not in every child.
 - A section with nothing to say gets one line, or `None`. Don't pad it.
@@ -102,63 +68,40 @@ Break the work into sequential stories (small enough to implement and review ind
 
 ```
 ## What
-[Clear description of what to implement.]
+[What to implement. A paragraph or a short list.]
 
 ## Context
-[Relevant findings, constraints, patterns from the spec and recall. Your own conclusions
-about how the code behaves live here, each naming the file and symbol, and the question it
-answered.]
+[What the implementer needs from the spec and from recall. Nothing that is already in What.]
 
-## Read set
-[One line per read: what it established, and what it did NOT. A claim in this ticket that
-no entry backs is a defect.]
+## Locked
+[Inherited from the parent's Locked decisions, plus any MUST-CHECK that applies. Verbatim. Do not re-debate.]
 
-## Decisions
-### Locked
-[Inherited from the parent — MUST be honored, do not re-debate.]
-### Discretion
-[Where the implementing agent may choose.]
+## Assumptions
+[What you believe about the current code, each naming the file and symbol to verify. Where a read established nothing about a question, say so.]
 
 ## Testing
-[Specific test cases and edge cases — testable.]
-
-## Validation
-[Acceptance criteria.]
+[Specific test cases and edge cases. The acceptance criteria, as testable statements.]
 
 ## Files
-[Specific file paths this story will touch.]
+[Paths this story touches.]
 
 ## Dependencies
-[Earlier stories that must be done first — defines order.]
-
-## References
-[Sources: spec sections, recalled knowledge keys, files.]
+[Earlier stories that must land first.]
 ```
 
-### What may carry the `Locked` label
+### What may be Locked
 
-`Locked` means someone decided this, and an implementing agent is told it is a hard
-requirement rather than a suggestion. That authority has to come from somewhere.
+Only these may be Locked: the parent's Locked decisions, and `MUST-CHECK:` entries recalled from the knowledge base. Both are copied verbatim.
 
-**Only these may be Locked:** operator decisions, decisions inherited from the parent's
-locked spec, design-review outcomes, and `MUST-CHECK:` entries recalled from the knowledge
-base.
-
-**Your own conclusions from reading code this session may NOT be Locked.** They are evidence,
-not decisions — they belong in `## Context`, naming the file and symbol, backed by a
-`## Read set` entry.
-Neither `### Locked` nor `### Discretion` fits them: `Discretion` means the implementer chooses,
-and an observation is not a choice.
-
-This narrows `Locked`; it does not soften it. What still qualifies stays absolute.
+Your own conclusions from reading code this session may NOT be Locked. They are evidence, not decisions, and they go in `## Assumptions` naming the file and symbol. Anything not Locked is the implementer's call; there is no Discretion list to write.
 
 ## 4. Cross-check (warning-only)
 
-Before creating issues, verify each story: all template sections present; acceptance criteria are testable; every recalled `MUST-CHECK:` is covered by a Locked decision; scope is reasonable for one sitting; no code reference anchored to a line number; and the description passes a read-aloud test — plain words, nothing restated, nothing padded. Report any gaps as warnings.
+Before creating issues, verify each story: all template sections present; the tests are specific enough to write; scope is reasonable for one sitting; no code reference anchored to a line number; nothing in `## Locked` that the parent did not lock; and the description passes a read-aloud test — plain words, nothing restated, nothing padded. Report any gaps as warnings.
 
 ## 5. Create the sub-issues
 
-**Gate:** show the user the ordered story list and get confirmation. Then create each as a Linear sub-issue (`save_issue` with `parentId` = the parent, status `Todo`) in dependency order. Log a `DECISION:` comment on the parent noting the plan is ready.
+**Gate:** show the user the ordered story list and get confirmation. Then create each as a Linear sub-issue (`save_issue` with `parentId` = the parent, status `Todo`) in dependency order.
 
 If the Linear MCP is unavailable, present the stories to the user and note they were not written to Linear. Stop here.
 

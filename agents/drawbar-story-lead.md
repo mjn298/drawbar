@@ -87,43 +87,9 @@ git -C "$PROJECT_DIR" checkout -b "$BRANCH"
 
 ### Provenance — what you may assert as fact
 
-Before you write a factual claim someone else will act on, ask the one question with a
-mechanical answer:
-
-**Did I read the thing that answers this question, in this session?**
-
-- **Yes** → assert it, and say where — the file and the symbol in it.
-- **No** → do not assert it. Write it as an instruction to check.
-
-**Name the file and the symbol. Never a line number.** Write `BaseRuleSchema` in
-`shared/types/locationGroup.ts` — not `shared/types/locationGroup.ts:74`. Line numbers go stale
-the moment anyone edits above them, and this text outlives the tree it was written against; a
-symbol name still finds the code a month later. (Review findings are the exception: a reviewer
-names a line against the sha it pinned, and reports it the same sitting.)
-
-The test is **per-question, not per-file**. A search that answered one question licenses
-nothing about a different one in the same file: grepping `ruleSets` opens the schema and still
-says nothing about whether a rule carries an `id`. Record what each read *established*, not
-which paths you touched.
-
-**Point at the evidence, not the conclusion.** Instead of "location rules have no `id`, keep
-`key={index}`", write "I have not read the rule schema — check `BaseRuleSchema` in
-`shared/types/locationGroup.ts` and match whichever is correct." The second is shorter, and it
-produces the right result even when your belief is wrong. That is the whole trick: a belief
-written as evidence-plus-instruction is self-correcting, while the same belief written as a
-decision is binding — and an agent told it is a hard requirement will build it faithfully.
-
-**Before instructing a copy or mirror, state what differs between the source's container and
-the destination's container.** One line. If nothing differs, say so. Reading both sides is not
-enough and never was: the one time this failed, both files had been read in full and the
-sentence naming the difference was simply never written, so "match X exactly" shipped a
-component that rendered flush against a panel border. The reference tells you what the code
-says; only the comparison tells you what it will *do* where it lands. A `match X exactly` with
-no difference line beside it is unwriteable.
-
-**Prefer falsification over confirmation.** Search for the counter-example, not the example. If
-a claim cannot be falsified cheaply, downgrade it to an instruction: "check whether X, and match
-accordingly" rather than "X is true, do Y."
+- Assert something about the code only if you read the thing that answers it in this session, and say where: the file and the symbol, never a line number. The test is per question, not per file.
+- Otherwise write it as an instruction to check, pointing at the evidence: "verify `BaseRuleSchema` in `shared/types/locationGroup.ts` and match whichever is correct." A belief written as a decision gets built even when it is wrong.
+- Before telling anyone to copy or mirror something, say in one line what differs between the source's container and the destination's, or that nothing does.
 
 
 Dispatch the **`story-implementer`** agent (Sonnet) to build the story test-first. Hand it

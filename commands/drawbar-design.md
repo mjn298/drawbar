@@ -59,43 +59,9 @@ Explore purpose, constraints, and success criteria. Investigate the codebase (re
 
 ### Provenance — what you may assert as fact
 
-Before you write a factual claim someone else will act on, ask the one question with a
-mechanical answer:
-
-**Did I read the thing that answers this question, in this session?**
-
-- **Yes** → assert it, and say where — the file and the symbol in it.
-- **No** → do not assert it. Write it as an instruction to check.
-
-**Name the file and the symbol. Never a line number.** Write `BaseRuleSchema` in
-`shared/types/locationGroup.ts` — not `shared/types/locationGroup.ts:74`. Line numbers go stale
-the moment anyone edits above them, and this text outlives the tree it was written against; a
-symbol name still finds the code a month later. (Review findings are the exception: a reviewer
-names a line against the sha it pinned, and reports it the same sitting.)
-
-The test is **per-question, not per-file**. A search that answered one question licenses
-nothing about a different one in the same file: grepping `ruleSets` opens the schema and still
-says nothing about whether a rule carries an `id`. Record what each read *established*, not
-which paths you touched.
-
-**Point at the evidence, not the conclusion.** Instead of "location rules have no `id`, keep
-`key={index}`", write "I have not read the rule schema — check `BaseRuleSchema` in
-`shared/types/locationGroup.ts` and match whichever is correct." The second is shorter, and it
-produces the right result even when your belief is wrong. That is the whole trick: a belief
-written as evidence-plus-instruction is self-correcting, while the same belief written as a
-decision is binding — and an agent told it is a hard requirement will build it faithfully.
-
-**Before instructing a copy or mirror, state what differs between the source's container and
-the destination's container.** One line. If nothing differs, say so. Reading both sides is not
-enough and never was: the one time this failed, both files had been read in full and the
-sentence naming the difference was simply never written, so "match X exactly" shipped a
-component that rendered flush against a panel border. The reference tells you what the code
-says; only the comparison tells you what it will *do* where it lands. A `match X exactly` with
-no difference line beside it is unwriteable.
-
-**Prefer falsification over confirmation.** Search for the counter-example, not the example. If
-a claim cannot be falsified cheaply, downgrade it to an instruction: "check whether X, and match
-accordingly" rather than "X is true, do Y."
+- Assert something about the code only if you read the thing that answers it in this session, and say where: the file and the symbol, never a line number. The test is per question, not per file.
+- Otherwise write it as an instruction to check, pointing at the evidence: "verify `BaseRuleSchema` in `shared/types/locationGroup.ts` and match whichever is correct." A belief written as a decision gets built even when it is wrong.
+- Before telling anyone to copy or mirror something, say in one line what differs between the source's container and the destination's, or that nothing does.
 
 A false claim in a locked spec is the most expensive kind: `/drawbar-plan` decomposes it into stories, and every one of them inherits it. Nobody re-reads a spec the way they re-read a diff.
 
@@ -109,17 +75,21 @@ Dispatch the `design-reviewer` agent with the proposed spec and approach. It che
 
 If a finding **conflicts with a decision the user has explicitly locked**, do not resolve it unilaterally — surface it back to the user as a focused question with the reviewer's evidence and your recommendation, and let them re-decide. Don't silently override the user, and don't silently comply against strong evidence.
 
-> **Design is iterative.** Users add or change constraints after the approach is picked. When that happens: (1) re-thread the spec so all affected sections stay consistent; (2) update any already-logged `DECISION:` comment the change invalidates; (3) re-run or re-notify the `design-reviewer` if the change is material (new surface, new security/PII implication, changed data model). The locked spec is **not** append-only.
+> **Design is iterative.** Users add or change constraints after the approach is picked. When that happens: (1) re-thread the spec so all affected sections stay consistent; (2) re-run the `design-reviewer` if the change is material (new surface, new security/PII implication, changed data model). The locked spec is **not** append-only.
 
 ## 5.5 Consistency check (before locking)
 
-Grep the draft for stragglers before locking: any symbol you renamed mid-session, any decision referenced in prose but missing from `## Locked decisions`, and any `## Locked` entry without a matching acceptance criterion. Fix dangling references so the locked spec is internally consistent.
+Grep the draft for stragglers before locking: any symbol you renamed mid-session, and any `## Locked decisions` entry that is really a claim about the code or a choice the user never made. Move those to `## Assumptions` or delete them. Fix dangling references so the locked spec is internally consistent.
 
 ## 6. Lock the spec to Linear
 
 Author and edit the spec as a **local draft** — a working scratchpad (repo file or scratch buffer). This is a *draft*, **not** a synced mirror: Linear remains the single source of truth; the draft is just the editing surface and is disposable once locked. Push to the Linear issue description only at genuine lock points (post-review, and after any material constraint change). Note that `save_issue` **replaces the description wholesale** — there is no partial update, so don't author by repeated full-description rewrites in Linear.
 
-Write the final spec as the parent issue's description via the Linear MCP (`save_issue` — create a new issue in the team and project resolved in step 1 if this started from free text, else update the existing one). The spec must be detailed enough that implementation makes zero judgment calls: goal, constraints, locked decisions, architecture, and acceptance criteria.
+Write the final spec as the parent issue's description via the Linear MCP (`save_issue` — create a new issue in the team and project resolved in step 1 if this started from free text, else update the existing one). The spec's job is that an implementer can tell what was chosen, what was assumed, and when to stop and ask. Sections: goal, `## Locked decisions`, `## Assumptions`, architecture, acceptance criteria.
+
+- **Locked decisions** are the choices the user made, or accepted from the design review. Five or fewer is normal. Each names the choice and the reason in a sentence or two. A Locked decision reaches every story and every implementer as a hard requirement, so nothing goes here that the user did not actually decide.
+- **Assumptions** are what you believe about the existing code and have not proven, each written as "assumed X; verify at `<file>` `<symbol>`." An assumption that turns out false changes the work. A Locked decision that turns out false gets built anyway.
+- Everything else is the implementer's call. There is no Discretion list to write; anything not locked is discretion.
 
 **Write it plainly.** Complete is not the same as long. Short sentences, one idea each; no
 jargon, no buzzwords, no metaphors dressing up a simple point — say "makes it slower", not
@@ -128,8 +98,6 @@ sentence that doesn't change a decision someone downstream makes. A spec nobody 
 reading gets implemented from its first two sections.
 
 A `## Story decomposition` section — suggested ordering and sequencing constraints (schema-PR isolation, global-surface isolation, dependency order) — is welcome here; it keeps `/drawbar-plan` mechanical. Don't enumerate per-story acceptance criteria, though — that's `/drawbar-plan`'s job. Some overlap is fine and expected.
-
-Log each key decision as a comment (`save_comment`) prefixed `DECISION:`.
 
 If the Linear MCP is unavailable, present the spec to the user and tell them it was not written to Linear (no silent loss). Stop here.
 
