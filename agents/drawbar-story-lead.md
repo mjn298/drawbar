@@ -34,12 +34,17 @@ for it sits idle for good (a lead stalled for two hours on 2026-09-24).
 So, once per story, run `REPORTS=$(mktemp -d)` and put its absolute path in every brief, with
 this instruction: "As your last action, write your full final report to the file `<role>.md` inside
 `$REPORTS` (Write, or a quoted heredoc through Bash), then return the same report as your final message."
-If the `Agent` call returns the report, use it. If it returns an async launch, wait for the file
-inside a Bash call, `timeout 540 zsh -c 'cd "$REPORTS" && until [ -s <role>.md ]; do sleep 15; done'`,
-and repeat that call until the role's time budget runs out. That is a bounded wait inside one
-tool call, not a turn you end. When the budget runs out with no file, read the agent's own
-transcript under `~/.claude/projects/` before you re-dispatch. Do not end your turn to wait for a
-notice, and do not wait on a Monitor.
+If the `Agent` call returns the report, use it. If it returns an async launch, in the SAME message
+that dispatches it also call `await-report "$REPORTS" <role> [budget-seconds]` (a bare command;
+this plugin puts it on your `PATH`) — this is a bounded wait inside one tool call, not a turn you
+end. It polls for the file, and on timeout falls back to the sub-agent's own transcript on disk
+and recovers its final report from there, so you don't have to. It exits 0 and prints the report
+when it found one (by either path), or exits non-zero with nothing found. Re-run it (optionally
+with a smaller budget) until the role's total time budget runs out; only then treat the role as
+truly stalled.
+Do not end your turn to wait for a notice, and do not wait on a Monitor. A `SubagentStop` hook in
+this plugin also blocks you from stopping if it sees an async launch in your own transcript with
+no later `await-report` call — treat that block as a reminder, not a bug, and go run it.
 
 ## What you receive
 
