@@ -274,6 +274,10 @@ describe("ported files carry no private-org identifiers (leak regression)", () =
           // allowlist for a bare `<digit>/<digit>.` shape that could otherwise mask an
           // unrelated leak later.)
           "unparseable/empty",
+          // PCO-393-ish addition (sourceGuardSpecs pre-push gate) — the project-config file
+          // name, referenced for the first time in a DOC_FILES-scanned doc. Not an org/repo
+          // slug: a config-file path, same category as the ship.config.json entries above.
+          ".drawbar/config.json",
         ]);
         for (const line of txt.split("\n")) {
           for (const m of line.match(slugCandidate) ?? []) {
@@ -7259,6 +7263,33 @@ describe("PCO-374/375/376 fix pass: the new rules are closed in place, and nothi
   test("story-lead §6 carries exactly these units and nothing else", () => {
     expect(docUnits(docSection(SL_374, SL6))).toEqual([
       "## 6. Commit and push",
+      "**Before you commit, run the project's source-guard specs, if it has any configured.** " +
+        "Your test selection so far has been built from the story diff, which has no way to " +
+        "notice a repo-wide guard spec exists at all — one that scans the PROJECT'S SOURCE TREE " +
+        "for a forbidden pattern (a vendor string literal where only a dispatch decision belongs, " +
+        "a direct read of a column an import graph says should route through one registry) rather " +
+        "than testing this story's own behavior. Two such misses in one hour on a real run — a " +
+        "vendor-literal guard and an import-graph spec, neither ever selected because neither has " +
+        "anything to do with the story's own diff — are what this step exists to stop happening a " +
+        "third time. A project's list, if it has one, lives in its own `.drawbar/config.json` " +
+        "(`sourceGuardSpecs`, see `scripts/lib/project-config.ts`) and is config, not drawbar text " +
+        "— drawbar has no opinion on which files any given project needs this for.",
+      "```bash SPECS=$(bun run \"$(dirname \"$0\")\"/../scripts/lib/project-config.ts " +
+        "source-guard-specs --dir \"$PROJECT_DIR\" 2>/tmp/source-guard-specs.err) \\ || { echo " +
+        "\"FATAL: could not resolve sourceGuardSpecs — $(cat /tmp/source-guard-specs.err)\"; exit " +
+        "1; } ```",
+      "Resolve the actual invocation path for `project-config.ts` from wherever this plugin is " +
+        "installed rather than trusting the relative guess above verbatim — the point is the CLI " +
+        "call, not the path arithmetic around it. An empty `$SPECS` means the project has no " +
+        "source-guard specs configured, which is the normal case for most projects and not a gate " +
+        "to skip past nervously; a non-empty list means run exactly those files with the project's " +
+        "own named-spec runner from `$PROJECT_DIR` — never guess one, read the project's own test " +
+        "script to find it. A failure here blocks the commit exactly like every other gate in this " +
+        "pipeline, and is carried into the one bounded fix pass above rather than pushed past: send " +
+        "the fix back through `story-implementer`, re-run the gate, then continue. The CLI itself " +
+        "fails closed on a malformed config (a typo, a `..` segment) rather than silently reporting " +
+        "an empty list — treat that refusal as a hard stop needing a human, not something to retry " +
+        "or work around.",
       "```bash git -C \"$PROJECT_DIR\" add -A git -C \"$PROJECT_DIR\" commit -m \"<type>: <summary> " +
         "(<STORY>)\" # hooks run — never --no-verify git -C \"$PROJECT_DIR\" push -u origin " +
         "\"$BRANCH\" ```",
@@ -8150,7 +8181,7 @@ describe("no shipped instruction hardcodes a team, a project, or a per-worktree 
 
   test("the shipped example config documents every key the resolver accepts", () => {
     const example = JSON.parse(readNonEmpty(join(root, ".drawbar/config.example.json"))) as Record<string, unknown>;
-    expect(Object.keys(example).sort()).toEqual(["memoryDir", "project", "team"]);
+    expect(Object.keys(example).sort()).toEqual(["memoryDir", "project", "sourceGuardSpecs", "team"]);
   });
 });
 
