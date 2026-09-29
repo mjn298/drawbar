@@ -1,0 +1,16 @@
+#!/usr/bin/env bun
+// Thin shim so `await-report` is a bare command on the Bash tool's PATH while this plugin is
+// enabled (files under bin/ get that treatment — see the plugin manifest reference's "Standard
+// layout" table). The real logic is in scripts/await-report.ts and scripts/lib/await-report.ts,
+// which stay importable and independently testable from scripts/ like every other module here.
+//
+// IMPORTANT: `${CLAUDE_PLUGIN_ROOT}` is NOT exported into commands the Bash tool runs (it's
+// only exported to hook, MCP, and LSP processes — confirmed against the plugin manifest
+// reference, "Environment variables" section, 2026-09-28) — so a lead invoking this from a
+// Bash tool call cannot resolve the plugin root that way. Putting the real entry point in bin/
+// sidesteps the problem entirely: Claude just runs `await-report ...` as a bare command.
+import { run } from "../scripts/await-report";
+
+if (import.meta.main) {
+  run(process.argv.slice(2)).then((code) => process.exit(code));
+}

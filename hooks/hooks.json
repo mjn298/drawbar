@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "SubagentStop": [
+      {
+        "matcher": "drawbar-story-lead$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bun run \"${CLAUDE_PLUGIN_ROOT}\"/scripts/subagent-stop-guard.ts"
+          }
+        ]
+      }
+    ]
+  }
+}

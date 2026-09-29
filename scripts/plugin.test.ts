@@ -1377,15 +1377,20 @@ describe("PCO-352 S7: blocker gate clauses, Locked-11 halt, Unplanned filing", (
 //   - project-config.ts joins the second set: it is the resolver that replaced the hardcoded
 //     `PCO` team and the per-worktree `$PWD/.drawbar/memory` store path. It is not a blocker
 //     gate and implements no topological sort, which is what Locked 4 forbids.
+//   - OTHER_ADDED covers additions unrelated to the PCO-352 epic entirely: await-report.ts and
+//     await-report-hook.ts (rk-0929) make a drawbar-story-lead's wait for a dispatched
+//     sub-agent's report mechanical instead of prose, and back a SubagentStop hook that blocks
+//     a premature stop. Neither implements a blocker gate or a topological sort.
 // PCO-364 (R1) removed coderabbit.ts and merge-guard.ts from EPIC_ADDED — deleted, not left
 // dormant (Locked E), along with the merge path and CodeRabbit gating they implemented. Never
 // asserting `length === N`: a literal count would be wrong again the moment any future story
 // adds or removes a module — this test instead asserts every module actually on disk is a
-// member of the UNION of the two sets above (readdirSync, never a hardcoded snapshot list),
+// member of the UNION of the sets above (readdirSync, never a hardcoded snapshot list),
 // and separately confirms no blocker-gate/topo-sort-shaped module exists anywhere.
 describe("PCO-352 S7 Locked 4: no blocker-gate/topo-sort module is added; scripts/lib/ stays within its known set", () => {
   const PRE_EXISTING = new Set(["store.ts", "schema.ts", "fts.ts", "migrate.ts"]);
   const EPIC_ADDED = new Set(["ship-config.ts", "run-state.ts", "kb-sync.ts", "stack.ts", "project-config.ts"]);
+  const OTHER_ADDED = new Set(["await-report.ts", "await-report-hook.ts"]);
 
   function libModules(): string[] {
     const { readdirSync } = require("node:fs") as typeof import("node:fs");
@@ -1397,7 +1402,7 @@ describe("PCO-352 S7 Locked 4: no blocker-gate/topo-sort module is added; script
     const modules = libModules();
     expect(modules.length).toBeGreaterThan(0);
     for (const m of modules) {
-      expect(PRE_EXISTING.has(m) || EPIC_ADDED.has(m), `unexpected module scripts/lib/${m} — not in the known set`).toBe(true);
+      expect(PRE_EXISTING.has(m) || EPIC_ADDED.has(m) || OTHER_ADDED.has(m), `unexpected module scripts/lib/${m} — not in the known set`).toBe(true);
     }
   });
 
