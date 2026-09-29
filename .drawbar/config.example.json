@@ -1,5 +1,8 @@
 {
   "team": "<TEAM>",
   "project": "<optional standing Linear project — most repos omit this and pass --project instead>",
-  "memoryDir": "<optional; omit to keep the store at <repo root>/.drawbar/memory where it can be tracked>"
+  "memoryDir": "<optional; omit to keep the store at <repo root>/.drawbar/memory where it can be tracked>",
+  "sourceGuardSpecs": [
+    "<optional; paths to this project's repo-wide guard/census/import-graph specs, relative to its test root — the drawbar-story-lead runs exactly these with the project's named-spec runner before every commit and push, in addition to the story's own tests. Propose the list with `scripts/find-source-guard-specs.ts`.>"
+  ]
 }
