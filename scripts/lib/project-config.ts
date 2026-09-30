@@ -1,3 +1,4 @@
+import { existsSync, readFileSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { CONTROL_CHAR_SHAPE, isCleanAbsolutePath, type Runner } from "./ship-config";
 
@@ -23,13 +24,23 @@ import { CONTROL_CHAR_SHAPE, isCleanAbsolutePath, type Runner } from "./ship-con
 // Every key is OPTIONAL, unlike `ship.config.json` where all six are required. A project that
 // only wants the shared-worktree store writes `{"team":"PAS"}` and nothing else; a project that
 // only wants an out-of-tree store writes `{"memoryDir":"..."}`. An absent file is not an error.
+// `sourceGuardSpecs` is unlike the three string keys above: it names test files that scan the
+// PROJECT'S SOURCE TREE (a vendor-literal guard, an import-graph check, a census of a naming
+// convention) rather than testing a story's own behavior. A story lead builds its test selection
+// from the story diff, so it has no way to notice a repo-wide guard spec exists at all — it only
+// finds out when CI runs one and fails, one round trip after the lead already pushed. Listing
+// them here, once, per project, lets the lead run exactly these files before it pushes, the same
+// way it runs its other pre-push gates. drawbar itself has no opinion on which files those are —
+// see `scripts/find-source-guard-specs.ts` for a heuristic finder that proposes a project's list.
 export interface ProjectConfig {
   team?: string;
   project?: string;
   memoryDir?: string;
+  sourceGuardSpecs?: string[];
 }
 
-const KNOWN_KEYS: readonly string[] = ["team", "project", "memoryDir"];
+const KNOWN_KEYS: readonly string[] = ["team", "project", "memoryDir", "sourceGuardSpecs"];
+const STRING_KEYS: readonly string[] = ["team", "project", "memoryDir"];
 
 export type ConfigParseReason =
   | "invalid_json"
@@ -83,7 +94,7 @@ export function parseProjectConfig(text: string): ConfigParseResult {
   }
 
   const config: ProjectConfig = {};
-  for (const key of KNOWN_KEYS) {
+  for (const key of STRING_KEYS) {
     if (!(key in obj)) continue;
     const value = obj[key];
     if (typeof value !== "string") {
@@ -105,7 +116,35 @@ export function parseProjectConfig(text: string): ConfigParseResult {
       const shape = checkPathShape(key, value);
       if (!shape.ok) return shape;
     }
-    config[key as keyof ProjectConfig] = value;
+    config[key as "team" | "project" | "memoryDir"] = value;
+  }
+
+  if ("sourceGuardSpecs" in obj) {
+    const value = obj.sourceGuardSpecs;
+    if (!Array.isArray(value) || value.length === 0) {
+      return { ok: false, reason: "wrong_type", detail: "sourceGuardSpecs must be a non-empty array of strings" };
+    }
+    const specs: string[] = [];
+    for (const entry of value) {
+      if (typeof entry !== "string") {
+        return { ok: false, reason: "wrong_type", detail: "every sourceGuardSpecs entry must be a string" };
+      }
+      if (entry.trim().length === 0) {
+        return { ok: false, reason: "empty_string", detail: "sourceGuardSpecs entries must not be empty strings" };
+      }
+      if (CONTROL_CHAR_SHAPE.test(entry)) {
+        return { ok: false, reason: "invalid_control_chars", detail: "sourceGuardSpecs entries must not contain control characters" };
+      }
+      // Each entry becomes an argument to the project's named-spec runner (e.g. `tsx bin/test.ts
+      // <entry>`), the same downstream shape as `requiredChecks` in `ship-config.ts`. A `..`
+      // segment is refused for the same reason `memoryDir` refuses one: the list is written once
+      // and read from every worktree, and a traversal segment would mean something different —
+      // or point outside the project entirely — depending on which worktree ran it.
+      const shape = checkPathShape("sourceGuardSpecs", entry);
+      if (!shape.ok) return shape;
+      specs.push(entry);
+    }
+    config.sourceGuardSpecs = specs;
   }
   return { ok: true, config };
 }
@@ -162,6 +201,8 @@ export interface DrawbarContext {
   teamSource: ValueSource | null;
   project: string | null;
   projectSource: ValueSource | null;
+  /** Config-only — no `--flag` or env override exists for this one, unlike the values above. */
+  sourceGuardSpecs: string[];
 }
 
 export type ResolveReason =
@@ -326,6 +367,98 @@ export function resolveContext(input: ResolveInput): ResolveResult {
 
   return {
     ok: true,
-    context: { root, rootSource, configPath, configPresent, memoryDir, memoryDirSource, team, teamSource, project, projectSource },
+    context: {
+      root,
+      rootSource,
+      configPath,
+      configPresent,
+      memoryDir,
+      memoryDirSource,
+      team,
+      teamSource,
+      project,
+      projectSource,
+      sourceGuardSpecs: config.sourceGuardSpecs ?? [],
+    },
   };
+}
+
+// --- CLI entry point ---------------------------------------------------------------------------
+//
+// `bun run project-config.ts source-guard-specs --dir <projectDir>` — the one consumer this
+// exists for is `agents/drawbar-story-lead.md`'s pre-push gate: given the absolute `$PROJECT_DIR`
+// it was handed, print the configured `sourceGuardSpecs`, one path per line, so the lead can
+// run them with the project's own named-spec runner before it commits and pushes. Prints
+// nothing and exits 0 when the project has no config, or a config with no `sourceGuardSpecs` —
+// that is the normal case for most projects, not a refusal. Exits 1, with a named reason on
+// stderr, only when the config itself is malformed — same fail-closed discipline as
+// `resolveContext`: a typo in the list must never be read as "no gates configured".
+
+function makeRealGitRunner(): Runner {
+  return (argv: string[]) => {
+    try {
+      const proc = Bun.spawnSync(["git", ...argv], { stdout: "pipe", stderr: "pipe" });
+      return { code: proc.exitCode ?? 1, stdout: proc.stdout.toString(), stderr: proc.stderr.toString() };
+    } catch (err) {
+      return { code: 127, stdout: "", stderr: err instanceof Error ? err.message : String(err) };
+    }
+  };
+}
+
+export interface CliMainDeps {
+  argv?: string[];
+  cwd?: string;
+  env?: Record<string, string | undefined>;
+  git?: Runner;
+  fs?: { exists: (p: string) => boolean; read: (p: string) => string };
+  writeStdout?: (s: string) => void;
+  writeStderr?: (s: string) => void;
+}
+
+export function parseCliArgs(args: string[]): { ok: true; cmd: string; dir: string | undefined } | { ok: false; error: string } {
+  const [cmd, ...rest] = args;
+  if (cmd !== "source-guard-specs") {
+    return { ok: false, error: "usage: project-config.ts source-guard-specs [--dir <projectDir>]" };
+  }
+  let dir: string | undefined;
+  for (let i = 0; i < rest.length; i++) {
+    if (rest[i] === "--dir") {
+      if (dir !== undefined) return { ok: false, error: "--dir specified more than once" };
+      const next = rest[i + 1];
+      if (next === undefined || next.startsWith("--")) return { ok: false, error: "--dir requires a value" };
+      dir = next;
+      i++;
+    } else {
+      return { ok: false, error: `unknown flag: ${rest[i]}` };
+    }
+  }
+  return { ok: true, cmd, dir };
+}
+
+export function cliMain(deps: CliMainDeps = {}): number {
+  const argv = deps.argv ?? process.argv.slice(2);
+  const cwd = deps.cwd ?? process.cwd();
+  const env = deps.env ?? process.env;
+  const git = deps.git ?? makeRealGitRunner();
+  const fs = deps.fs ?? { exists: (p: string) => existsSync(p), read: (p: string) => readFileSync(p, "utf8") };
+  const writeStdout = deps.writeStdout ?? ((s: string) => { process.stdout.write(s); });
+  const writeStderr = deps.writeStderr ?? ((s: string) => { process.stderr.write(s); });
+
+  const parsed = parseCliArgs(argv);
+  if (!parsed.ok) {
+    writeStderr(`refused: ${parsed.error}\n`);
+    return 1;
+  }
+
+  const result = resolveContext({ cwd: parsed.dir ?? cwd, env, git, fs });
+  if (!result.ok) {
+    writeStderr(`refused: ${result.reason} (${result.detail})\n`);
+    return 1;
+  }
+  for (const spec of result.context.sourceGuardSpecs) writeStdout(`${spec}\n`);
+  return 0;
+}
+
+if (import.meta.main) {
+  process.exit(cliMain());
 }

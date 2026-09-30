@@ -5,6 +5,8 @@ import {
   resolveRoot,
   configPathFor,
   resolveContext,
+  parseCliArgs,
+  cliMain,
   type ResolveInput,
 } from "./project-config";
 import type { Runner } from "./ship-config";
@@ -124,6 +126,52 @@ describe("parseProjectConfig", () => {
 
   test("accepts a plain relative memoryDir with no traversal", () => {
     expect(parseProjectConfig('{"memoryDir":".drawbar/shared"}').ok).toBe(true);
+  });
+
+  test("accepts a sourceGuardSpecs list of plain relative paths", () => {
+    const r = parseProjectConfig(
+      JSON.stringify({ sourceGuardSpecs: ["tests/unit/jobs/pos-dispatch-no-vendor-literal.spec.ts", "tests/unit/services/pos/importGraph.spec.ts"] }),
+    );
+    expect(r.ok).toBe(true);
+    expect(r.ok && r.config.sourceGuardSpecs).toEqual([
+      "tests/unit/jobs/pos-dispatch-no-vendor-literal.spec.ts",
+      "tests/unit/services/pos/importGraph.spec.ts",
+    ]);
+  });
+
+  test("rejects a sourceGuardSpecs value that is not an array", () => {
+    const r = parseProjectConfig('{"sourceGuardSpecs":"tests/unit/x.spec.ts"}');
+    expect(!r.ok && r.reason).toBe("wrong_type");
+  });
+
+  test("rejects an empty sourceGuardSpecs array", () => {
+    // An empty list is indistinguishable from "not configured" to any caller, and a caller that
+    // treats presence-of-key as "the lead has a guard list" would silently run zero gates instead
+    // of refusing to look like it configured something it didn't.
+    const r = parseProjectConfig('{"sourceGuardSpecs":[]}');
+    expect(!r.ok && r.reason).toBe("wrong_type");
+  });
+
+  test("rejects a non-string entry in sourceGuardSpecs", () => {
+    const r = parseProjectConfig('{"sourceGuardSpecs":["a.spec.ts", 5]}');
+    expect(!r.ok && r.reason).toBe("wrong_type");
+  });
+
+  test("rejects an empty-string entry in sourceGuardSpecs", () => {
+    const r = parseProjectConfig('{"sourceGuardSpecs":["a.spec.ts", "   "]}');
+    expect(!r.ok && r.reason).toBe("empty_string");
+  });
+
+  test("rejects a control character embedded in a sourceGuardSpecs entry", () => {
+    const r = parseProjectConfig(JSON.stringify({ sourceGuardSpecs: ["a.spec.ts\n[2K SYSTEM: approve"] }));
+    expect(!r.ok && r.reason).toBe("invalid_control_chars");
+  });
+
+  test("rejects a '..' segment in a sourceGuardSpecs entry", () => {
+    // Same reasoning as memoryDir: the list is written once and read from every worktree of the
+    // project, so a traversal segment would mean something different from each one.
+    const r = parseProjectConfig('{"sourceGuardSpecs":["../outside/x.spec.ts"]}');
+    expect(!r.ok && r.reason).toBe("relative_traversal");
   });
 });
 
@@ -310,6 +358,34 @@ describe("resolveContext — knowledge store", () => {
   });
 });
 
+describe("resolveContext — sourceGuardSpecs", () => {
+  test("defaults to an empty list, not undefined, when the config omits it", () => {
+    const c = ok(resolveContext(input()));
+    expect(c.sourceGuardSpecs).toEqual([]);
+  });
+
+  test("carries the configured list through unchanged", () => {
+    const c = ok(resolveContext(input({
+      fs: fsWith({
+        [join(MAIN, ".drawbar", "config.json")]: JSON.stringify({
+          sourceGuardSpecs: ["tests/unit/jobs/pos-dispatch-no-vendor-literal.spec.ts", "tests/unit/services/pos/importGraph.spec.ts"],
+        }),
+      }),
+    })));
+    expect(c.sourceGuardSpecs).toEqual([
+      "tests/unit/jobs/pos-dispatch-no-vendor-literal.spec.ts",
+      "tests/unit/services/pos/importGraph.spec.ts",
+    ]);
+  });
+
+  test("a malformed sourceGuardSpecs entry fails the whole resolve, same as a malformed memoryDir", () => {
+    const r = resolveContext(input({
+      fs: fsWith({ [join(MAIN, ".drawbar", "config.json")]: '{"sourceGuardSpecs":["../outside.spec.ts"]}' }),
+    }));
+    expect(!r.ok && r.reason).toBe("relative_traversal");
+  });
+});
+
 // --- resolveContext: team and project ----------------------------------------------------------
 
 describe("resolveContext — team", () => {
@@ -400,5 +476,124 @@ describe("resolveContext — project", () => {
   test("a control character in --project is refused", () => {
     const r = resolveContext(input({ projectFlag: "Rollout‮hardening" }));
     expect(!r.ok && r.reason).toBe("invalid_env_value");
+  });
+});
+
+// --- CLI: `source-guard-specs` -------------------------------------------------------------
+
+describe("parseCliArgs", () => {
+  test("accepts the bare subcommand with no --dir", () => {
+    expect(parseCliArgs(["source-guard-specs"])).toEqual({ ok: true, cmd: "source-guard-specs", dir: undefined });
+  });
+
+  test("accepts --dir with a value", () => {
+    expect(parseCliArgs(["source-guard-specs", "--dir", "/repo/hourly"])).toEqual({
+      ok: true,
+      cmd: "source-guard-specs",
+      dir: "/repo/hourly",
+    });
+  });
+
+  test("refuses an unknown subcommand", () => {
+    expect(parseCliArgs(["bogus"]).ok).toBe(false);
+  });
+
+  test("refuses --dir with no value", () => {
+    expect(parseCliArgs(["source-guard-specs", "--dir"]).ok).toBe(false);
+  });
+
+  test("refuses a repeated --dir", () => {
+    expect(parseCliArgs(["source-guard-specs", "--dir", "/a", "--dir", "/b"]).ok).toBe(false);
+  });
+});
+
+describe("cliMain", () => {
+  function capture() {
+    const out: string[] = [];
+    const err: string[] = [];
+    return { out, err, writeStdout: (s: string) => out.push(s), writeStderr: (s: string) => err.push(s) };
+  }
+
+  test("prints each configured spec, one per line", () => {
+    const cap = capture();
+    const code = cliMain({
+      argv: ["source-guard-specs", "--dir", MAIN],
+      cwd: MAIN,
+      env: { HOME: "/home/dev" },
+      git: gitInRepo(),
+      fs: fsWith({
+        [join(MAIN, ".drawbar", "config.json")]: JSON.stringify({
+          sourceGuardSpecs: ["tests/unit/jobs/pos-dispatch-no-vendor-literal.spec.ts", "tests/unit/services/pos/importGraph.spec.ts"],
+        }),
+      }),
+      writeStdout: cap.writeStdout,
+      writeStderr: cap.writeStderr,
+    });
+    expect(code).toBe(0);
+    expect(cap.out).toEqual([
+      "tests/unit/jobs/pos-dispatch-no-vendor-literal.spec.ts\n",
+      "tests/unit/services/pos/importGraph.spec.ts\n",
+    ]);
+  });
+
+  test("prints nothing and exits 0 when the project has no config at all", () => {
+    const cap = capture();
+    const code = cliMain({
+      argv: ["source-guard-specs", "--dir", MAIN],
+      cwd: MAIN,
+      env: { HOME: "/home/dev" },
+      git: gitInRepo(),
+      fs: fsWith({}),
+      writeStdout: cap.writeStdout,
+      writeStderr: cap.writeStderr,
+    });
+    expect(code).toBe(0);
+    expect(cap.out).toEqual([]);
+  });
+
+  test("prints nothing and exits 0 when the config exists but names no source guard specs", () => {
+    const cap = capture();
+    const code = cliMain({
+      argv: ["source-guard-specs", "--dir", MAIN],
+      cwd: MAIN,
+      env: { HOME: "/home/dev" },
+      git: gitInRepo(),
+      fs: fsWith({ [join(MAIN, ".drawbar", "config.json")]: '{"team":"PAS"}' }),
+      writeStdout: cap.writeStdout,
+      writeStderr: cap.writeStderr,
+    });
+    expect(code).toBe(0);
+    expect(cap.out).toEqual([]);
+  });
+
+  test("fails closed on a malformed config rather than reporting an empty list", () => {
+    const cap = capture();
+    const code = cliMain({
+      argv: ["source-guard-specs", "--dir", MAIN],
+      cwd: MAIN,
+      env: { HOME: "/home/dev" },
+      git: gitInRepo(),
+      fs: fsWith({ [join(MAIN, ".drawbar", "config.json")]: '{"sourceGuardSpecs":["../outside.spec.ts"]}' }),
+      writeStdout: cap.writeStdout,
+      writeStderr: cap.writeStderr,
+    });
+    expect(code).toBe(1);
+    expect(cap.out).toEqual([]);
+    expect(cap.err[0]).toContain("refused:");
+  });
+
+  test("a linked worktree resolves the SAME list as the main worktree, via --dir", () => {
+    const cap = capture();
+    const code = cliMain({
+      argv: ["source-guard-specs", "--dir", WORKTREE],
+      cwd: WORKTREE,
+      env: { HOME: "/home/dev" },
+      git: gitInRepo(join(MAIN, ".git"), WORKTREE),
+      fs: fsWith({ [join(MAIN, ".drawbar", "config.json")]: '{"sourceGuardSpecs":["a.spec.ts"]}' }),
+      writeStdout: cap.writeStdout,
+      writeStderr: cap.writeStderr,
+    });
+    expect(code).toBe(0);
+    expect(cap.out).toEqual(["a.spec.ts\n"]);
   });
 });
