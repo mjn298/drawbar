@@ -268,6 +268,8 @@ describe("ported files carry no private-org identifiers (leak regression)", () =
           "unparseable/empty",
           // Linear's GraphQL endpoint, the fallback when the Linear MCP is down. Not a slug.
           "linear.app/graphql",
+          // The project config path, named in the story-lead's source-guard step. Not a slug.
+          ".drawbar/config.json",
         ]);
         for (const line of txt.split("\n")) {
           for (const m of line.match(slugCandidate) ?? []) {
@@ -1526,7 +1528,7 @@ describe("no shipped instruction hardcodes a team, a project, or a per-worktree 
 
   test("the shipped example config documents every key the resolver accepts", () => {
     const example = JSON.parse(readNonEmpty(join(root, ".drawbar/config.example.json"))) as Record<string, unknown>;
-    expect(Object.keys(example).sort()).toEqual(["memoryDir", "project", "team"]);
+    expect(Object.keys(example).sort()).toEqual(["memoryDir", "project", "sourceGuardSpecs", "team"]);
   });
 });
 
