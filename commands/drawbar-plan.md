@@ -101,9 +101,9 @@ Before creating issues, verify each story: all template sections present; the te
 
 ## 5. Create the sub-issues
 
-**Gate:** show the user the ordered story list and get confirmation. Then create each as a Linear sub-issue (`save_issue` with `parentId` = the parent, status `Todo`) in dependency order.
+**Gate:** show the user the ordered story list and get confirmation. Then create each as a Linear sub-issue (`save_issue` with `parentId` = the parent, status `Todo`) in dependency order. Pass each story's `## Dependencies` as `blockedBy` with the ids of the stories already created. `/drawbar-ship` orders a run by Linear relations alone and halts when the section names a blocker Linear lacks.
 
-If the Linear MCP is unavailable, present the stories to the user and note they were not written to Linear. Stop here.
+If the Linear MCP is unavailable, use the `linear` CLI. Write each story to a file, then run `linear issue create --parent <parent> --state Todo --title "<title>" --description-file <file> --no-interactive`, and add each blocker with `linear issue relation add <story> blocked-by <blocker>`. For anything those commands can't do, send GraphQL with `linear api` (`issueCreate`, and `issueRelationCreate` with `type: blocks`, `issueId` = the blocker, `relatedIssueId` = the blocked story). Without the CLI, POST the same GraphQL to `https://api.linear.app/graphql` with `Authorization: $LINEAR_API_KEY`. Only if all of these fail, present the stories to the user, say they were not written to Linear, and stop.
 
 ## 6. Report
 

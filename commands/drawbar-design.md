@@ -99,7 +99,7 @@ reading gets implemented from its first two sections.
 
 A `## Story decomposition` section — suggested ordering and sequencing constraints (schema-PR isolation, global-surface isolation, dependency order) — is welcome here; it keeps `/drawbar-plan` mechanical. Don't enumerate per-story acceptance criteria, though — that's `/drawbar-plan`'s job. Some overlap is fine and expected.
 
-If the Linear MCP is unavailable, present the spec to the user and tell them it was not written to Linear (no silent loss). Stop here.
+If the Linear MCP is unavailable, write the spec to a file and use the `linear` CLI: `linear issue update <parent> --description-file <file>`, or `linear issue create --title "<title>" --description-file <file> --no-interactive` for a new parent. Without the CLI, send `issueUpdate` or `issueCreate` as GraphQL to `https://api.linear.app/graphql` with `Authorization: $LINEAR_API_KEY`. Only if all of these fail, present the spec to the user, say it was not written to Linear, and stop.
 
 ## 7. Report
 

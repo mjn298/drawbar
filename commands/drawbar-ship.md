@@ -245,6 +245,20 @@ The shape of `snapshot`/`invoked_as` depends on what you were invoked with:
   just that id. Record `"invoked_as": "leaf"` so later steps and any resume know not to
   look for siblings.
 
+**Read each member's relations** with `get_issue` and `includeRelations: true`, one call per
+member. `list_issues` does not return relations, so its silence proves nothing. Where the MCP
+tool is not available, use the GraphQL API through the `linear` CLI:
+
+```bash
+linear api 'query($id: String!) { issue(id: $id) { inverseRelations { nodes { type issue { identifier } } } } }' --variable id="$ID"
+```
+
+The member's blockers are the rows with `type: blocks`; `issue` is the blocker. Without the CLI,
+POST the same query to `https://api.linear.app/graphql` with `Authorization: $LINEAR_API_KEY`.
+
+Never use `linear issue relation list`: it shows only the relations an issue set on others, not
+the ones blocking it, so a blocked story reads as free.
+
 **Then topologically sort the snapshot by `blockedBy` relations among its own members**, and
 persist that order. `list_issues` returns creation/update order, not dependency order, so
 without this the run order is whatever the API happens to hand back.
@@ -257,28 +271,24 @@ without this the run order is whatever the API happens to hand back.
 Members with no relation between them keep their `list_issues` order — a stable tiebreak,
 not a judgment call.
 
-**Locked 11 — an empty relation set is not evidence of independence.** Establish each
-member's dependencies from **both** Linear's `blockedBy` relations **and** its own
-`## Dependencies` prose section, never from relations alone: "no edges returned" from the
-relation query is not the same fact as "no edges exist." Independence must be **stated**, not
-inferred from silence: a member counts as independent only when both sources give a positive
-artifact saying so — the relation query actually returned (even an empty result) **and** the
-issue carries a `## Dependencies` section (even one that states "none"). A member with **no**
-`## Dependencies` section at all halts, and a member whose relation query **errored** halts
-too — neither is evidence of independence, both are missing evidence.
+**Locked 11 — Linear relations are the source of truth for dependencies.** A relation read that
+succeeded is proof, even when it returns no relations: that member is independent. A read that
+failed is not proof, and **halts**.
 
-Distinguish the two by the **tool result itself**, not by its contents: a call that returned a
-result object — even one carrying an empty relation list — is a positive artifact; a call that
-raised an error, timed out, or returned no result object at all is a failed read. Record which
-of the two you observed for each member, so the halt condition is something you can actually
-evaluate rather than infer. An unrecordable premise is not a gate. If dependency information
-cannot be established for a snapshot member from either source, **halt and notify**.
+Tell the two apart by the **tool result itself**, not by its contents: a call that returned a
+result object — even one with an empty relation list — succeeded; a call that raised an error,
+timed out, or returned no result object failed. Record which one you saw for each member, so
+the halt is something you can check rather than infer.
 
-This halt applies to a **multi-member** snapshot, where ordering is what is being established.
+A `## Dependencies` section in the description is optional. A missing one never halts. When a
+member has one, check it against the relations: if the section names a blocker that Linear
+holds no `blockedBy` relation for, **halt and notify**. The two sources disagree, and an
+unattended run cannot tell which is right. A section that says "none", or names only blockers
+Linear also holds, adds nothing and passes.
+
+These halts apply to a **multi-member** snapshot, where ordering is what is being established.
 A single-member snapshot (`"invoked_as": "leaf"`) has no ordering to establish and does not
-halt on a missing section. Note the interaction with step 3: sub-issues this command files
-carry no `## Dependencies` section of their own, so step 3 writes one — otherwise a triaged
-finding becomes a `Todo` child, joins the next parent run's snapshot, and halts it.
+halt on them.
 
 If the relations contain a cycle, halt and notify too: that is a planning error no unattended
 run should paper over.
@@ -476,7 +486,7 @@ of scope here, and the PR that surfaced it; status
 triage gate, and this command has no authority to walk a finding through it unattended.
 
 **File one sub-issue for every surviving `findings[]` entry too**, under the same rules —
-status `Unplanned`, label `found-in-review`, a `## Dependencies` section — and record its id
+status `Unplanned`, label `found-in-review` — and record its id
 alongside the `out_of_scope` ones. `findings[]` carries the Critical and Important findings
 that outlived the story-lead's one fix pass, unfixed **security** findings included, and §4's
 `## Unresolved findings` section is allowed to name a finding by sub-issue id and title only:
@@ -492,11 +502,9 @@ exactly those three things there. A title like "path traversal in `scripts/lib/s
 satisfies "name the bug not the symptom" and still announces an unpatched detail to every repo
 watcher; name the bug and its component instead.
 
-**Give every filed sub-issue a `## Dependencies` section**, stating `none — filed from review
-of <PR>` when it has none. Step 0 halts on a snapshot member that carries no such section, and
-a finding filed here becomes exactly that member once a human triages it `Unplanned → Todo`.
-Omitting the section here is a halt on some later night, in a different command, with nothing
-pointing back to this step.
+**If a filed sub-issue depends on another issue, set a `blockedBy` relation on it in Linear.**
+Once a human triages it `Unplanned → Todo`, it joins the next parent run's snapshot, and step 0
+orders it by relations alone. A dependency written only in the description is invisible there.
 
 Not added to the snapshot — they wait for the next run.
 
