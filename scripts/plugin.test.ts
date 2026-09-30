@@ -266,6 +266,8 @@ describe("ported files carry no private-org identifiers (leak regression)", () =
           // allowlist for a bare `<digit>/<digit>.` shape that could otherwise mask an
           // unrelated leak later.)
           "unparseable/empty",
+          // Linear's GraphQL endpoint, the fallback when the Linear MCP is down. Not a slug.
+          "linear.app/graphql",
         ]);
         for (const line of txt.split("\n")) {
           for (const m of line.match(slugCandidate) ?? []) {
